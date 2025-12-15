@@ -14,33 +14,30 @@
 #include <llvm/Support/raw_ostream.h>
 
 #include "Utils.h"
-#include "llvm/IR/PassManager.h"
+#include <llvm/IR/PassManager.h>
 #include <numeric>
 
 using namespace llvm;
 
 namespace easy {
-  struct RegisterLayout : public ModulePass {
-    static char ID;
-
-    RegisterLayout()
-      : ModulePass(ID) {};
-
-    bool runOnModule(Module &M) override {
+  struct RegisterLayoutMixin : public PassInfoMixin<RegisterLayoutMixin> {
+  public:
+    PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
       LLVM_DEBUG(dbgs() << "RegisterLayout run on module " << M.getName() << "\n");
 
       SmallVector<Function*, 8> LayoutFunctions;
       collectLayouts(M, LayoutFunctions);
 
       if(LayoutFunctions.empty())
-        return false;
+        return PreservedAnalyses::all();
 
       Function* Register = declareRegisterLayout(M);
       registerLayouts(LayoutFunctions, Register);
 
-      return true;
+      return PreservedAnalyses::none();
     }
-
+    static bool isRequired() { return true; }
+    
     static void collectLayouts(Module &M, SmallVectorImpl<Function*> &LayoutFunctions) {
       for(Function &F : M)
         if(F.getSection() == LAYOUT_SECTION)
@@ -64,12 +61,13 @@ namespace easy {
       return nullptr;
     }
 
+    //Can this be simplified with emitMalloc ?
     static Function* DeclareMalloc(Module &M) {
       if(Function* Malloc = M.getFunction("malloc"))
         return Malloc;
       Type* IntPtrTy = M.getDataLayout().getIntPtrType(M.getContext());
-      Type* I8PtrTy = Type::getInt8PtrTy(M.getContext());
-      FunctionType* FTy = FunctionType::get(I8PtrTy, {IntPtrTy}, false);
+      Type* OpqPtrTy = PointerType::get(M.getContext(), 0);
+      FunctionType* FTy = FunctionType::get(OpqPtrTy, {IntPtrTy}, false);
       return Function::Create(FTy, Function::ExternalLinkage, "malloc", &M);
     }
 
@@ -80,14 +78,18 @@ namespace easy {
     }
 
     static void SerializeStruct(IRBuilder<> &B, size_t &Offset, DataLayout const & DL,
-                                Value* Buf, Value* ByVal, Type* CurLevelTy, SmallVectorImpl<Value*> &GEPOffset) {
+                                Value* Buf, Value* ByVal, Type* CurLevelTy, Type* RootTy, SmallVectorImpl<Value*> &GEPOffset) {
       StructType* Struct = dyn_cast<StructType>(CurLevelTy);
       if(!Struct) {
-        Value* ArgPtr = B.CreateGEP(Type::getInt8Ty(B.getContext()), ByVal, GEPOffset);
-        Value* Argument = B.CreateLoad(ArgPtr->getType(), ArgPtr);
+        // Compute the address of the current field relative to the root struct
+        Value* ArgPtr = B.CreateGEP(RootTy, ByVal, GEPOffset, "struct.ptr");
+        // Load the field value with the correct type
+        Value* Argument = B.CreateLoad(CurLevelTy, ArgPtr);
 
-        Value* Ptr = B.CreateConstGEP1_32(Type::getInt8Ty(B.getContext()), Buf, Offset);
-        B.CreateStore(Argument, Ptr);
+        // Store the field into the serialization buffer at current byte offset
+        Value* DstI8 = B.CreateConstGEP1_32(Type::getInt8Ty(B.getContext()), Buf, Offset);
+        Value* DstTyped = B.CreatePointerCast(DstI8, PointerType::getUnqual(B.getContext()));
+        B.CreateStore(Argument, DstTyped);
 
         Offset += DL.getTypeStoreSize(Argument->getType());
         return;
@@ -97,7 +99,7 @@ namespace easy {
       GEPOffset.push_back(nullptr);
       for(size_t Arg = 0; Arg != Struct->getNumElements(); Arg++) {
         GEPOffset.back() = ConstantInt::get(I32Ty, Arg);
-        SerializeStruct(B, Offset, DL, Buf, ByVal, Struct->getElementType(Arg), GEPOffset);
+        SerializeStruct(B, Offset, DL, Buf, ByVal, Struct->getElementType(Arg), RootTy, GEPOffset);
       }
       GEPOffset.pop_back();
     }
@@ -108,7 +110,7 @@ namespace easy {
         Type* ArgTy = Argument->getType();
 
         Value* Ptr = B.CreateConstGEP1_32(Type::getInt8Ty(B.getContext()), Buf, Offset);
-        Ptr = B.CreatePointerCast(Ptr, PointerType::getUnqual(ArgTy), Argument->getName() + ".ptr");
+        Ptr = B.CreatePointerCast(Ptr, PointerType::getUnqual(B.getContext()), Argument->getName() + ".ptr");
         B.CreateStore(Argument, Ptr);
 
         LLVM_DEBUG(dbgs() << "Store at " << Offset << "\n");
@@ -128,12 +130,13 @@ namespace easy {
 
       DataLayout const &DL = M.getDataLayout();
 
+      //Why PassedAsAPointer can be decided only by the first argument?
       FunctionType *FTy = F->getFunctionType();
-      StructType *STy = F->arg_begin()->hasByValAttr() ? cast<StructType>(FTy->getParamType(0)->getContainedType(0)) : nullptr;
+      StructType *STy = F->arg_begin()->hasByValAttr() ? cast<StructType>(F->arg_begin()->getParamByValType()) : nullptr;
       bool PassedAsAPointer = STy;
 
       Type* I32 = Type::getInt32Ty(C);
-      Type* I32Ptr = PointerType::getUnqual(I32);
+      Type* OpqPtr = PointerType::getUnqual(C);
       size_t I32Size = DL.getTypeStoreSize(I32);
 
       BasicBlock *BB = BasicBlock::Create(C, "entry", F);
@@ -145,11 +148,13 @@ namespace easy {
 
       LLVM_DEBUG(dbgs() << F->getName() << ": I32Size = " << I32Size << ", ArgSize = " << ArgSize << "\n");
 
+      // buf = malloc(sizeof(int32_t) + ArgSize)
       Value* Buf = B.CreateCall(Malloc, {ConstantInt::get(Malloc->getFunctionType()->getParamType(0), I32Size + ArgSize)}, "buf");
-      B.CreateStore(ConstantInt::get(I32, ArgSize), B.CreatePointerCast(Buf, I32Ptr, "size.ptr"));
+      // *buf = ArgSize
+      B.CreateStore(ConstantInt::get(I32, ArgSize), B.CreatePointerCast(Buf, OpqPtr, "size.ptr"));
 
       SmallVector<Value*, 2> Offset = { ConstantInt::getNullValue(I32) };
-      if(PassedAsAPointer) SerializeStruct(B, I32Size, DL, Buf, F->arg_begin(), STy, Offset);
+      if(PassedAsAPointer) SerializeStruct(B, I32Size, DL, Buf, F->arg_begin(), STy, STy, Offset);
       else SerializeArguments(B, I32Size, DL, Buf, F);
 
       B.CreateRet(Buf);
@@ -185,33 +190,13 @@ namespace easy {
       DataLayout const &DL = M.getDataLayout();
 
       Type* Void = Type::getVoidTy(C);
-      Type* I8Ptr = Type::getInt8PtrTy(C);
+      Type* OpqPtr = PointerType::get(C, 0);
       Type* SizeT = DL.getLargestLegalIntType(C);
 
       FunctionType* FTy =
-          FunctionType::get(Void, {I8Ptr, SizeT}, false);
+          FunctionType::get(Void, {OpqPtr, SizeT}, false);
       return Function::Create(FTy, Function::ExternalLinkage, Name, &M);
-    }
-  };
-
-  char RegisterLayout::ID = 0;
-
-  llvm::Pass* createRegisterLayoutPass() {
-    return new RegisterLayout();
-  }
-  
-
-  struct RegisterLayoutMixin : public PassInfoMixin<RegisterLayoutMixin> {
-  public:
-    RegisterLayoutMixin() : legacyPass(new RegisterLayout) {}
-    PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
-      auto Changed = legacyPass->runOnModule(M);
-      if (Changed) return PreservedAnalyses::none();
-      return PreservedAnalyses::all();
-    }
-    static bool isRequired() { return true; }
-  private:
-    RegisterLayout* legacyPass;
+    }    
   };
 
   void registerLayoutPass(llvm::ModulePassManager &PM) {

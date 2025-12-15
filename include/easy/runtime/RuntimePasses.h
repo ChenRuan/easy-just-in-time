@@ -2,72 +2,57 @@
 #define RUNTIME_PASSES
 
 #include<llvm/Pass.h>
+#include<llvm/IR/PassManager.h>
 #include<llvm/ADT/StringRef.h>
 #include<easy/runtime/Context.h>
 
 namespace easy {
-  struct ContextAnalysis :
-      public llvm::ImmutablePass {
 
-    static char ID;
-
-    ContextAnalysis()
-      : llvm::ImmutablePass(ID), C_(nullptr) {}
-    ContextAnalysis(Context const &C)
-      : llvm::ImmutablePass(ID), C_(&C) {}
-
-    easy::Context const& getContext() const {
-      return *C_;
-    }
-
+  struct ContextAnalysisResult {
     private:
+    easy::Context const *C;
+    public:
+    explicit ContextAnalysisResult(easy::Context const &C);
+    ContextAnalysisResult();
 
-    easy::Context const *C_;
+    easy::Context const &getContext() const { return *C; }
+    bool invalidate(llvm::Module &M, const llvm::PreservedAnalyses &PA, 
+                    llvm::ModuleAnalysisManager::Invalidator &Inv) { return false; }
   };
 
-  struct InlineParameters:
-      public llvm::ModulePass {
+  class ContextAnalysisPass : public llvm::AnalysisInfoMixin<ContextAnalysisPass> {
+    friend llvm::AnalysisInfoMixin<ContextAnalysisPass>;
+    static llvm::AnalysisKey Key;
 
-    static char ID;
-
-    InlineParameters()
-      : llvm::ModulePass(ID) {}
-    InlineParameters(llvm::StringRef TargetName)
-      : llvm::ModulePass(ID), TargetName_(TargetName) {}
-
-    void getAnalysisUsage(llvm::AnalysisUsage &AU) const override {
-      AU.addRequired<ContextAnalysis>();
-    }
-
-    bool runOnModule(llvm::Module &M) override;
-
+    public:
+    explicit ContextAnalysisPass(easy::Context const &C);
+    ContextAnalysisPass();
+    using Result = ContextAnalysisResult;
+    Result run(llvm::Module &M, llvm::ModuleAnalysisManager &MAM);
+      
     private:
-    llvm::StringRef TargetName_;
+    Result Result_;
   };
 
-  struct DevirtualizeConstant :
-      public llvm::FunctionPass {
 
-    static char ID;
-
-    DevirtualizeConstant()
-      : llvm::FunctionPass(ID) {}
-    DevirtualizeConstant(llvm::StringRef TargetName)
-      : llvm::FunctionPass(ID), TargetName_(TargetName) {}
-
-    void getAnalysisUsage(llvm::AnalysisUsage &AU) const override {
-      AU.addRequired<ContextAnalysis>();
-    }
-
-    bool runOnFunction(llvm::Function &F) override;
-
+  class InlineParametersPass : public llvm::PassInfoMixin<InlineParametersPass> {
+    public:
+      explicit InlineParametersPass(llvm::StringRef TargetName);
+      InlineParametersPass();
+      llvm::PreservedAnalyses run(llvm::Module &M, llvm::ModuleAnalysisManager &MAM);
     private:
-    llvm::StringRef TargetName_;
+      llvm::StringRef TargetName_;
+  };
+  
+  class DevirtualizeConstantPass : public llvm::PassInfoMixin<DevirtualizeConstantPass> {
+    public:
+      explicit DevirtualizeConstantPass(llvm::StringRef TargetName);
+      DevirtualizeConstantPass();
+      llvm::PreservedAnalyses run(llvm::Function &F, llvm::FunctionAnalysisManager &FAM);
+    private:
+      llvm::StringRef TargetName_;
   };
 
-  llvm::Pass* createContextAnalysisPass(easy::Context const &C);
-  llvm::Pass* createInlineParametersPass(llvm::StringRef Name);
-  llvm::Pass* createDevirtualizeConstantPass(llvm::StringRef Name);
 }
 
 #endif

@@ -11,13 +11,11 @@
 #include <llvm/Transforms/IPO/StripDeadPrototypes.h>
 #include <llvm/Transforms/IPO/StripSymbols.h>
 
-#include "llvm/IR/PassManager.h"
+#include <llvm/IR/PassInstrumentation.h>
+#include <llvm/IR/PassManager.h>
 
-#include <llvm/IR/LegacyPassManager.h>
+#include <llvm/InitializePasses.h>
 
-#include "llvm/InitializePasses.h"
-
-#include <llvm/Transforms/IPO.h>
 #include <llvm/Transforms/Utils/CtorUtils.h>
 #include <llvm/Transforms/Utils/Cloning.h>
 
@@ -51,13 +49,9 @@ static cl::opt<std::string> RegexString("easy-export",
 
 namespace easy {
 
-  struct RegisterBitcode : public ModulePass {
-    static char ID;
-
-    RegisterBitcode()
-      : ModulePass(ID) {};
-
-    bool runOnModule(Module &M) override {
+  struct RegisterBitcodeMixin : public PassInfoMixin<RegisterBitcodeMixin> {
+  public:
+    PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
       // execute the rest of the easy::jit passes
       LLVM_DEBUG(dbgs() << "RegisterBitcode run on module " << M.getName() << "\n");
       
@@ -66,7 +60,7 @@ namespace easy {
       collectObjectsToJIT(M, ObjectsToJIT);
 
       if(ObjectsToJIT.empty())
-        return false;
+        return PreservedAnalyses::all();
       
       SmallVector<GlobalValue*, 8> LocalVariables;
       collectLocalGlobals(M, LocalVariables);
@@ -80,11 +74,10 @@ namespace easy {
 
       LLVM_DEBUG(WriteIntermediateToFile(M, (M.getName() + "_pass.ll").str()));
 
-      return true;
+      return PreservedAnalyses::none();
     }
-
-    private:
-
+    static bool isRequired() { return true; }
+  private:
 
     static void WriteIntermediateToFile(llvm::Module const &M, std::string const& File) {
       if(File.empty())
@@ -438,7 +431,7 @@ namespace easy {
 
     static void fixLinkages(GlobalValue &Entry, Module &M) {
       for(GlobalValue &GV : M.global_values()) {
-        if(GV.getName().startswith("llvm."))
+        if(GV.getName().starts_with("llvm."))
           continue;
 
         if(GlobalObject* GO = dyn_cast<GlobalObject>(&GV)) {
@@ -525,30 +518,6 @@ namespace easy {
                                 GlobalVariable::PrivateLinkage,
                                 Init, Name + "_name");
     }
-  };
-
-  char RegisterBitcode::ID = 0;
-  static RegisterPass<RegisterBitcode> Register("easy-register-bitcode",
-    "Parse the compilation unit and insert runtime library calls to register "
-    "the bitcode associated to functions marked as \"jit\".",
-                                                false, false);
-
-  llvm::Pass* createRegisterBitcodePass() {
-    return new RegisterBitcode();
-  }
-  
-
-  struct RegisterBitcodeMixin : public PassInfoMixin<RegisterBitcodeMixin> {
-  public:
-    RegisterBitcodeMixin() : legacyPass(new RegisterBitcode) {}
-    PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
-      auto Changed = legacyPass->runOnModule(M);
-      if (Changed) return PreservedAnalyses::none();
-      return PreservedAnalyses::all();
-    }
-    static bool isRequired() { return true; }
-  private:
-    RegisterBitcode* legacyPass;
   };
 
   void registerBitcodePass(llvm::ModulePassManager &PM) {

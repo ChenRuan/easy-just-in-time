@@ -15,12 +15,6 @@
 
 using namespace llvm;
 
-char easy::DevirtualizeConstant::ID = 0;
-
-llvm::Pass* easy::createDevirtualizeConstantPass(llvm::StringRef Name) {
-  return new DevirtualizeConstant(Name);
-}
-
 static ConstantInt* getVTableHostAddress(Value& V) {
     auto* VTable = dyn_cast<LoadInst>(&V);
     if(!VTable)
@@ -117,71 +111,18 @@ bool Devirtualize(IIter it, IIter end) {
   return Changed;
 }
 
-bool CastCallWithPointerCasts(FunctionType* CalledTy, FunctionType* UncastedTy) {
-  if(CalledTy->getReturnType() != UncastedTy->getReturnType())
-    return false;
-  if(CalledTy->getNumParams() != UncastedTy->getNumParams())
-    return false;
-  if(CalledTy->isVarArg() != UncastedTy->isVarArg())
-    return false;
 
-  size_t N = CalledTy->getNumParams();
-  for(size_t i = 0; i != N; ++i) {
-    Type* CArgTy = CalledTy->getParamType(i);
-    Type* UArgTy = UncastedTy->getParamType(i);
-    if(CArgTy != UArgTy) {
-      if(!CArgTy->isPointerTy() || !UArgTy->isPointerTy())
-        return false;
-    }
-  }
-  return true;
-}
-
-template<class IIter>
-void RecastCalls(IIter it, IIter end) {
-  for(;it != end;) {
-    auto *CB = dyn_cast<CallBase>(&*it++);
-    if(!CB)
-        continue;
-
-    Value* Called = CB->getCalledOperand();
-    Value* Uncasted = Called->stripPointerCasts();
-    if(Called == Uncasted)
-      continue;
-
-    FunctionType* CalledTy = cast<FunctionType>(Called->getType()->getContainedType(0));
-    FunctionType* UncastedTy = cast<FunctionType>(Uncasted->getType()->getContainedType(0));
-
-    if(!CastCallWithPointerCasts(CalledTy, UncastedTy))
-      continue;
-
-    Function* CalledFunction = CB->getCalledFunction();
-    CB->setCalledFunction(CalledFunction);
-    CB->mutateFunctionType(UncastedTy);
-
-    // cast every pointer argument to the expected type
-    IRBuilder<> B(CB);
-
-    size_t N = CB->arg_size();
-    for(unsigned i = 0; i != N; ++i) {
-      Value* Arg = CB->getArgOperand(i);
-      Type* ArgTy = Arg->getType();
-      Type* UncTy = UncastedTy->getParamType(i);
-      if(ArgTy->isPointerTy() && ArgTy != UncTy)
-        CB->setArgOperand(i, B.CreatePointerCast(Arg, UncTy, Arg->getName() + ".recast_calls"));
-    }
-  }
-}
-
-bool easy::DevirtualizeConstant::runOnFunction(llvm::Function &F) {
+easy::DevirtualizeConstantPass::DevirtualizeConstantPass(llvm::StringRef Name) : TargetName_(Name) {}
+easy::DevirtualizeConstantPass::DevirtualizeConstantPass() : TargetName_("") {}
+PreservedAnalyses easy::DevirtualizeConstantPass::run(llvm::Function &F, FunctionAnalysisManager &FAM) {
+  const auto &MPMProxy = FAM.getResult<ModuleAnalysisManagerFunctionProxy>(F);
+  
   if(F.getName() != TargetName_)
-    return false;
+    return PreservedAnalyses::all();
 
   if(Devirtualize(inst_begin(F), inst_end(F))) {
-    RecastCalls(inst_begin(F), inst_end(F));
-    return true;
+    return PreservedAnalyses::all();
   }
-  return false;
+  
+  return PreservedAnalyses::none();
 }
-
-static RegisterPass<easy::DevirtualizeConstant> X("","",false, false);

@@ -3,6 +3,7 @@
 #include <easy/code_cache.h>
 #include <numeric>
 #include <algorithm>
+#include <random>
 
 void __attribute__((noinline)) kernel(int n, int m, int * image, int const * mask, int* out) {
   for(int i = 0; i < n - m; ++i)
@@ -113,7 +114,7 @@ static void BM_qsort(benchmark::State& state) {
 
   std::vector<int> vec(n);
   std::iota(vec.begin(), vec.end(), 0);
-  std::random_shuffle(vec.begin(), vec.end());
+  std::shuffle(vec.begin(), vec.end(), std::default_random_engine());
 
   auto my_qsort = easy::jit(Qsort, _1, _2, _3, int_cmp);
   benchmark::ClobberMemory();

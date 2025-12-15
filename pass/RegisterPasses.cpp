@@ -1,27 +1,17 @@
 #include "StaticPasses.h"
 
-#include <llvm/Transforms/IPO/PassManagerBuilder.h>
-#include <llvm/IR/LegacyPassManager.h>
 #include <llvm/Support/raw_ostream.h>
-#include "llvm/Passes/PassBuilder.h"
-#include "llvm/Passes/PassPlugin.h"
-#include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#include <llvm/Passes/PassBuilder.h>
+#include <llvm/Passes/PassPlugin.h>
 
-#include "llvm/PassRegistry.h"
-
-#include <iostream>
+#include <llvm/PassRegistry.h>
+#include <llvm/IR/PassManager.h>
 
 using namespace llvm;
 using namespace easy;
 
-static void callback(const PassManagerBuilder &,
-                     legacy::PassManagerBase &PM) {
-  PM.add(easy::createRegisterBitcodePass());
-}
-
-RegisterStandardPasses Register(PassManagerBuilder::EP_OptimizerLast, callback);
-RegisterStandardPasses RegisterO0(PassManagerBuilder::EP_EnabledOnOptLevel0, callback);
-
+// The old pass manager inserts RegisterBitcodePass after last of optimization.
+//@TODO: figure out the insertion point of these passes.
 llvm::PassPluginLibraryInfo getEasyJitPassPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "RegisterBitcode", LLVM_VERSION_STRING,
           [](PassBuilder &PB) {

@@ -1,4 +1,5 @@
 #include "InlineParametersHelper.h"
+#include "easy/runtime/Utils.h"
 #include <easy/runtime/BitcodeTracker.h>
 
 #include <llvm/Linker/Linker.h>
@@ -13,7 +14,7 @@ HighLevelLayout::HighLevelLayout(easy::Context const& C, llvm::Function &F) {
 
   FunctionType* FTy = F.getFunctionType();
   if(F.arg_begin()->hasStructRetAttr())
-    StructReturn_ = FTy->getParamType(0);
+    StructReturn_ = F.getParamStructRetType(0);
 
   Return_ = FTy->getReturnType();
 
@@ -91,32 +92,104 @@ Constant* easy::GetScalarArgument(ArgumentBase const& Arg, Type* T) {
   }
 }
 
-llvm::Constant* easy::LinkPointerIfPossible(llvm::Module &M, easy::PtrArgument const &Ptr, Type* PtrTy) {
+llvm::StringRef easy::GetGlobalName(llvm::Module &M, easy::PtrArgument const &Ptr) {
   auto &BT = easy::BitcodeTracker::GetTracker();
   void* PtrValue = const_cast<void*>(Ptr.get());
   if(BT.hasGlobalMapping(PtrValue)) {
-    const char* LName = std::get<0>(BT.getNameAndGlobalMapping(PtrValue));
-    std::unique_ptr<Module> LM = BT.getModuleWithContext(PtrValue, M.getContext());
+    return std::get<0>(BT.getNameAndGlobalMapping(PtrValue));
+  }
+  return "";
+}
 
-    if(!Linker::linkModules(M, std::move(LM), Linker::OverrideFromSrc,
-                            [](Module &, const StringSet<> &){}))
-    {
-      GlobalValue *GV = M.getNamedValue(LName);
-      if(GlobalVariable* G = dyn_cast<GlobalVariable>(GV)) {
-        GV->setLinkage(llvm::Function::PrivateLinkage);
-        if(GV->getType() != PtrTy) {
-          return ConstantExpr::getPointerCast(GV, PtrTy);
+static
+void UpdateCallArg(llvm::Value* Call, easy::Context const &C, Value* newArg, size_t argNo) {
+  assert(Call != nullptr && "CallToUpdate is null.");
+  if(auto *CI = dyn_cast<CallInst>(Call)) {
+    CI->setArgOperand(argNo, newArg);
+  }
+  else {
+    report_fatal_error("CallToUpdate is not a call instruction.", true);
+  }
+}
+
+bool easy::LinkAndUpdateSymbol(llvm::Module &M, llvm::StringRef FName, llvm::StringRef WrapperName, llvm::SmallVectorImpl<PostLinkageSymbol> &Symbols, easy::Context const &C, llvm::Value* CallToUpdate) {
+  assert(CallToUpdate != nullptr);
+  assert(llvm::isa<llvm::CallInst>(CallToUpdate) && "CallToUpdate is not a call instruction.");
+
+  auto &BT = easy::BitcodeTracker::GetTracker();
+  SmallVector<std::unique_ptr<llvm::Module>,8> ModulesToLink;
+
+  // Collect modules to link
+  for (auto& Symbol : Symbols) {
+    auto const &Arg = C.getArgumentMapping(Symbol.ArgNo);
+    switch (Arg.kind()) {
+      case easy::ArgumentBase::AK_Ptr: {
+        auto const *Ptr = Arg.as<easy::PtrArgument>();
+        Constant* PtrVal = GetScalarArgument(Arg, PointerType::getUnqual(M.getContext()));
+        void * PtrValue = const_cast<void*>(Ptr->get());
+        if(BT.hasGlobalMapping(PtrValue)) {
+          std::unique_ptr<Module> LM = BT.getModuleWithContext(PtrValue, M.getContext());
+          ModulesToLink.push_back(std::move(LM));
         }
-        return GV;
-      }
-      else if(llvm::Function* F = dyn_cast<llvm::Function>(GV)) {
-        F->setLinkage(llvm::Function::PrivateLinkage);
-        return F;
-      }
-      assert(false && "wtf");
+      } break;
+      case easy::ArgumentBase::AK_Module: {
+        easy::Function const &Function = Arg.as<easy::ModuleArgument>()->get();
+        auto const &Module = Function.getLLVMModule();
+        std::unique_ptr<llvm::Module> LM = 
+          easy::CloneModuleWithContext(Module, M.getContext());
+        assert(LM);
+        easy::UnmarkEntry(*LM);
+        ModulesToLink.push_back(std::move(LM));
+      } break;
+      default:
+        break;
     }
   }
-  return nullptr;
+
+  // Link modules
+  for(auto &LM : ModulesToLink) {
+    if(Linker::linkModules(M, std::move(LM), Linker::OverrideFromSrc,
+                            [](Module &, const StringSet<> &){})) {
+      llvm::report_fatal_error("Failed to link with module!", true);
+    }
+  }
+
+  if (ModulesToLink.empty()) 
+    return false;
+
+  // Look up the symbol
+  for (auto& Symbol : Symbols) {
+    StringRef Name = Symbol.Name;
+    assert(!Name.empty() && "Unnamed symbol shouldn't reach here.");
+    auto Kind = Symbol.Kind;
+    auto *GV = M.getNamedValue(Name);
+    switch (Kind) {
+      case easy::ArgumentBase::AK_Ptr: {
+        if (GlobalVariable *G = dyn_cast<GlobalVariable>(GV)) {
+          GV->setLinkage(llvm::Function::PrivateLinkage);
+          assert(GV->getType()->isPointerTy() && "Global variable passed as ptr arg is not a pointer");
+          UpdateCallArg(CallToUpdate, C, GV, Symbol.ArgNo);
+        }
+        else if (llvm::Function *F = dyn_cast<llvm::Function>(GV)) {
+          F->setLinkage(llvm::Function::PrivateLinkage);
+          UpdateCallArg(CallToUpdate, C, F, Symbol.ArgNo);
+        }
+        else { 
+          report_fatal_error("Global varialbe passed as ptr but is not a pointer nor a function", true);
+        }
+      } break;
+      case easy::ArgumentBase::AK_Module: {
+        llvm::Function* FunctionInM = M.getFunction(Name);
+        FunctionInM->setLinkage(llvm::Function::PrivateLinkage);
+        UpdateCallArg(CallToUpdate, C, FunctionInM, Symbol.ArgNo);
+      } break;
+      default:
+        break;
+    }
+    
+  }
+
+  return true;
 }
 
 std::pair<llvm::Constant*, size_t> easy::GetConstantFromRaw(llvm::DataLayout const& DL,
@@ -164,7 +237,7 @@ size_t StoreStructField(llvm::IRBuilder<> &B,
     Constant* FieldValue;
     std::tie(FieldValue, RawOffset) = easy::GetConstantFromRaw(DL, Ty, (uint8_t const*)Raw);
 
-    Value* FieldPtr = B.CreateGEP(nullptr, Alloc, GEP, "field.gep");
+    Value* FieldPtr = B.CreateGEP(Alloc->getAllocatedType(), Alloc, GEP, "field.gep");
     B.CreateStore(FieldValue, FieldPtr);
   }
   return RawOffset;
@@ -173,8 +246,7 @@ size_t StoreStructField(llvm::IRBuilder<> &B,
 llvm::AllocaInst* easy::GetStructAlloc(llvm::IRBuilder<> &B,
                                        llvm::DataLayout const &DL,
                                        easy::StructArgument const &Struct,
-                                       llvm::Type* StructPtrTy) {
-  Type* StructTy = StructPtrTy->getContainedType(0);
+                                       llvm::Type* StructTy) {
   AllocaInst* Alloc = B.CreateAlloca(StructTy);
 
   SmallVector<Value*, 4> GEP = {B.getInt32(0)};

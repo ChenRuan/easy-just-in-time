@@ -24,6 +24,7 @@ struct HighLevelLayout {
     explicit HighLevelArg() = default;
   };
 
+  //StructReturn_ now is just an indicator of sret, can be opt to bool.
   llvm::Type* StructReturn_;
   llvm::SmallVector<HighLevelArg, 4> Args_;
   llvm::Type* Return_;
@@ -31,13 +32,22 @@ struct HighLevelLayout {
   HighLevelLayout(easy::Context const& C, llvm::Function &F);
 };
 
+struct PostLinkageSymbol {
+  llvm::StringRef Name;
+  ArgumentBase::ArgumentKind Kind;
+  size_t ArgNo;
+};
+
 llvm::SmallVector<llvm::Value*, 4> GetForwardArgs(easy::HighLevelLayout::HighLevelArg &ArgInF, easy::HighLevelLayout &FHLL,
                                                   llvm::Function &Wrapper, easy::HighLevelLayout &WrapperHLL);
 llvm::Constant* GetScalarArgument(easy::ArgumentBase const& Arg, llvm::Type* T);
 
-llvm::Constant* LinkPointerIfPossible(llvm::Module &M, easy::PtrArgument const &Ptr, llvm::Type* PtrTy);
+llvm::StringRef GetGlobalName(llvm::Module &M, easy::PtrArgument const &Ptr);
 
-llvm::AllocaInst* GetStructAlloc(llvm::IRBuilder<> &B, llvm::DataLayout const &DL, easy::StructArgument const &Struct, llvm::Type* StructPtrTy);
+// Return true if any linkage happened
+bool LinkAndUpdateSymbol(llvm::Module &M, llvm::StringRef FName, llvm::StringRef WrapperName, llvm::SmallVectorImpl<PostLinkageSymbol> &Symbols, easy::Context const &C, llvm::Value* CallToUpdate);
+
+llvm::AllocaInst* GetStructAlloc(llvm::IRBuilder<> &B, llvm::DataLayout const &DL, easy::StructArgument const &Struct, llvm::Type* StructTy);
 
 std::pair<llvm::Constant*, size_t> GetConstantFromRaw(llvm::DataLayout const& DL, llvm::Type* T, const uint8_t* Raw);
 

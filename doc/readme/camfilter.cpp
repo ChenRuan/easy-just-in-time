@@ -195,9 +195,9 @@ int main(int argc, char** argv) {
     }
 
     // show the fps, updated every 4 iterations
-    cv::putText(*Out, fps_message.str().c_str(), cvPoint(30,30),
+    cv::putText(*Out, fps_message.str().c_str(), cv::Point(30,30),
                 cv::FONT_HERSHEY_COMPLEX_SMALL, 0.8,
-                cvScalar(200,200,250), 1, CV_AA);
+                cv::Scalar(200,200,250), 1, cv::LINE_AA);
 
     if(!test) {
       cv::imshow("camera", *Out);

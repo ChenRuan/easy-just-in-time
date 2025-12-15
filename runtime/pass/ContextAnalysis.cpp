@@ -3,10 +3,15 @@
 using namespace llvm;
 using namespace easy;
 
-char easy::ContextAnalysis::ID = 0;
+ContextAnalysisResult::ContextAnalysisResult(easy::Context const &C) : C(&C) {}
+ContextAnalysisResult::ContextAnalysisResult() : C(nullptr) {}
 
-llvm::Pass* easy::createContextAnalysisPass(easy::Context const &C) {
-  return new ContextAnalysis(C);
+AnalysisKey ContextAnalysisPass::Key;
+
+ContextAnalysisPass::ContextAnalysisPass(easy::Context const &C) : Result_(C) {}
+ContextAnalysisPass::ContextAnalysisPass() : Result_() {}
+
+ContextAnalysisPass::Result ContextAnalysisPass::run(Module &M, ModuleAnalysisManager &MAM) {
+  return Result_;
 }
 
-static RegisterPass<easy::ContextAnalysis> X("", "", true, true);

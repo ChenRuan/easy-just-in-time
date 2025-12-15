@@ -12,7 +12,7 @@ message("Easy::Jit plugin: " ${EasyJit_PLUGIN})
 include_directories(${EasyJit_INCLUDE_DIRS})
 link_directories(${EasyJit_LIBRARY_DIRS})
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} --std=c++14 -Xclang -disable-O0-optnone -Xclang -load -Xclang ${EasyJit_PLUGIN}")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} --std=c++14 -Xclang -disable-O0-optnone -Xclang -load -Xclang ${EasyJit_PLUGIN} -Xclang -fpass-plugin=${EasyJit_PLUGIN}")
 
 add_executable(InstallTest
   test.cpp

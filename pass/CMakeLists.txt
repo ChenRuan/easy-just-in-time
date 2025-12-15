@@ -5,6 +5,7 @@ add_llvm_pass_plugin(EasyJitPass SHARED
   Layout.cpp
   Utils.cpp
   MayAliasTracer.cpp
+  DEPENDS intrinsics_gen
   )
 
 set(EASY_JIT_PASS ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/EasyJitPass${CMAKE_SHARED_LIBRARY_SUFFIX} PARENT_SCOPE)

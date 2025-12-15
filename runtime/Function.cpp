@@ -7,15 +7,10 @@
 
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/Bitcode/BitcodeReader.h>
-#include <llvm/Transforms/IPO/PassManagerBuilder.h>
-#include <llvm/Transforms/IPO.h>
-#include <llvm/IR/LegacyPassManager.h>
-#include <llvm/Support/Host.h> 
-#include <llvm/Target/TargetMachine.h> 
-#include <llvm/Support/TargetRegistry.h> 
-#include <llvm/Analysis/TargetTransformInfo.h> 
-#include <llvm/Analysis/TargetLibraryInfo.h> 
+#include <llvm/TargetParser/Host.h>
 #include <llvm/Support/FileSystem.h>
+#include <llvm/IR/PassManager.h>
+#include <llvm/Passes/PassBuilder.h>
 
 #ifdef NDEBUG
 #include <llvm/IR/Verifier.h>
@@ -38,34 +33,39 @@ static std::unique_ptr<llvm::TargetMachine> GetHostTargetMachine() {
   return TM;
 }
 
-static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, unsigned OptLevel, unsigned OptSize) {
+static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, llvm::OptimizationLevel OptLevel) {
 
-  llvm::Triple Triple{llvm::sys::getProcessTriple()};
+  llvm::LoopAnalysisManager LAM;
+  llvm::FunctionAnalysisManager FAM;
+  llvm::CGSCCAnalysisManager CGAM;
+  llvm::ModuleAnalysisManager MAM;
 
-  llvm::PassManagerBuilder Builder;
-  Builder.OptLevel = OptLevel;
-  Builder.SizeLevel = OptSize;
-  Builder.LibraryInfo = new llvm::TargetLibraryInfoImpl(Triple);
-  Builder.Inliner = llvm::createFunctionInliningPass(OptLevel, OptSize, false);
+  MAM.registerPass([&C]{return ContextAnalysisPass(C);});
 
   std::unique_ptr<llvm::TargetMachine> TM = GetHostTargetMachine();
   assert(TM);
-  TM->adjustPassManager(Builder);
 
-  llvm::legacy::PassManager MPM;
-  MPM.add(llvm::createTargetTransformInfoWrapperPass(TM->getTargetIRAnalysis()));
-  MPM.add(easy::createContextAnalysisPass(C));
-  MPM.add(easy::createInlineParametersPass(Name));
-  Builder.populateModulePassManager(MPM);
-  MPM.add(easy::createDevirtualizeConstantPass(Name));
+  llvm::PassBuilder PB(TM.get());
+
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+  llvm::ModulePassManager MPM;
+
+  MPM.addPass(easy::InlineParametersPass(Name));
+  MPM.addPass(PB.buildPerModuleDefaultPipeline(OptLevel));
+  MPM.addPass(llvm::createModuleToFunctionPassAdaptor(easy::DevirtualizeConstantPass(Name)));
 
 #ifdef NDEBUG
-  MPM.add(llvm::createVerifierPass());
+  MPM.addPass(llvm::VerifierPass());
 #endif
 
-  Builder.populateModulePassManager(MPM);
+  MPM.addPass(PB.buildPerModuleDefaultPipeline(OptLevel));
 
-  MPM.run(M);
+  MPM.run(M, MAM);
 }
 
 static std::unique_ptr<llvm::ExecutionEngine> GetEngine(std::unique_ptr<llvm::Module> M, const char *Name) {
@@ -75,7 +75,7 @@ static std::unique_ptr<llvm::ExecutionEngine> GetEngine(std::unique_ptr<llvm::Mo
   std::unique_ptr<llvm::ExecutionEngine> EE(ebuilder.setErrorStr(&eeError)
           .setMCPU(llvm::sys::getHostCPUName())
           .setEngineKind(llvm::EngineKind::JIT)
-          .setOptLevel(llvm::CodeGenOpt::Level::Aggressive)
+          .setOptLevel(llvm::CodeGenOptLevel::Aggressive)
           .create());
 
   if(!EE) {
@@ -127,6 +127,29 @@ llvm::Module const& Function::getLLVMModule() const {
   return *static_cast<LLVMHolderImpl const&>(*this->Holder).M_;
 }
 
+static llvm::OptimizationLevel getOptimizationLevel(const std::pair<unsigned, unsigned> & OptLevelPair) {
+  unsigned OptLevel = OptLevelPair.first;
+  unsigned OptSize = OptLevelPair.second;
+  assert(OptLevel <= 3 && "Optimization level for speed should be 0, 1, 2, or 3");
+  assert(OptSize <= 2 && "Optimization level for size should be 0, 1, or 2");
+  assert((OptSize == 0 || OptLevel == 2) && "Optimize for size should be encoded with speedup level == 2");
+  if(OptLevel == 0)
+    return llvm::OptimizationLevel::O0;
+  if(OptLevel == 1)
+    return llvm::OptimizationLevel::O1;
+  if(OptLevel == 2) {
+    if(OptSize == 0)
+      return llvm::OptimizationLevel::O2;
+    else if (OptSize == 1)
+      return llvm::OptimizationLevel::Os;
+    else // OptSize == 2
+      return llvm::OptimizationLevel::Oz;
+  }
+  if(OptLevel == 3)
+    return llvm::OptimizationLevel::O3;
+  return llvm::OptimizationLevel::O3;
+}
+
 std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) {
   // llvm::DebugFlag = true;
   // llvm::setCurrentDebugType("jit");
@@ -141,11 +164,9 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
   std::unique_ptr<llvm::LLVMContext> Ctx;
   std::tie(M, Ctx) = BT.getModule(Addr);
 
-  unsigned OptLevel;
-  unsigned OptSize;
-  std::tie(OptLevel, OptSize) = C.getOptLevel();
+  llvm::OptimizationLevel OptimizationLevel = getOptimizationLevel(C.getOptLevel());
 
-  Optimize(*M, Name, C, OptLevel, OptSize);
+  Optimize(*M, Name, C, OptimizationLevel);
 
   WriteOptimizedToFile(*M, C.getDebugFile());
 

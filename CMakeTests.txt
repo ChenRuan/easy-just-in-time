@@ -1,10 +1,24 @@
-find_python_module(lit REQUIRED)
+# Collect test dependencies that should be built before running lit
+set(EASYJIT_TEST_DEPS
+  EasyJitPass
+  EasyJitRuntime
+)
 
-set(ALL_TESTS tests/)
+# Generate lit.site.cfg files into the binary tree
+configure_lit_site_cfg(
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/lit.cfg.in
+  ${CMAKE_CURRENT_BINARY_DIR}/tests/lit.cfg
+)
+configure_lit_site_cfg(
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/doc/lit.cfg.in
+  ${CMAKE_CURRENT_BINARY_DIR}/tests/doc/lit.cfg
+)
 
-add_custom_target(check
-                  COMMAND ${PYTHON_EXEC} -m lit.main ${ALL_TESTS} -v --shuffle
-                  DEPENDS EasyJitPass EasyJitRuntime)
+# Avoid picking up arbitrary compile flags from parents (optional but common pattern)
+file(TOUCH ${CMAKE_CURRENT_BINARY_DIR}/compile_flags.txt)
 
-configure_file("${CMAKE_CURRENT_SOURCE_DIR}/tests/lit.cfg.in" "${CMAKE_CURRENT_BINARY_DIR}/tests/lit.cfg")
-configure_file("${CMAKE_CURRENT_SOURCE_DIR}/tests/doc/lit.cfg.in" "${CMAKE_CURRENT_BINARY_DIR}/tests/doc/lit.cfg")
+# Define the lit testsuite target; works for both standalone and monorepo builds
+add_lit_testsuite(check-easy-jit "Running EasyJIT tests"
+  ${CMAKE_CURRENT_BINARY_DIR}/tests
+  DEPENDS ${EASYJIT_TEST_DEPS}
+)
