@@ -1,4 +1,4 @@
-// RUN: %not %clangxx %cxxflags %include_flags %ld_flags %s -Xclang -load -Xclang %lib_pass -o %t
+// RUN: %not %clangxx %cxxflags %include_flags %ld_flags %s -Xclang -fpass-plugin=%lib_pass -o %t
 
 #include <easy/jit.h>
 

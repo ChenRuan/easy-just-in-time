@@ -6,6 +6,7 @@
 #include <llvm/IR/InstIterator.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/DebugInfo.h>
+#include <llvm/Pass.h>
 
 #define DEBUG_TYPE "easy-register-layout"
 #include <llvm/Support/Debug.h>
@@ -13,6 +14,7 @@
 #include <llvm/Support/raw_ostream.h>
 
 #include "Utils.h"
+#include "llvm/IR/PassManager.h"
 #include <numeric>
 
 using namespace llvm;
@@ -25,6 +27,7 @@ namespace easy {
       : ModulePass(ID) {};
 
     bool runOnModule(Module &M) override {
+      LLVM_DEBUG(dbgs() << "RegisterLayout run on module " << M.getName() << "\n");
 
       SmallVector<Function*, 8> LayoutFunctions;
       collectLayouts(M, LayoutFunctions);
@@ -80,10 +83,10 @@ namespace easy {
                                 Value* Buf, Value* ByVal, Type* CurLevelTy, SmallVectorImpl<Value*> &GEPOffset) {
       StructType* Struct = dyn_cast<StructType>(CurLevelTy);
       if(!Struct) {
-        Value* ArgPtr = B.CreateGEP(ByVal, GEPOffset);
-        Value* Argument = B.CreateLoad(ArgPtr);
+        Value* ArgPtr = B.CreateGEP(Type::getInt8Ty(B.getContext()), ByVal, GEPOffset);
+        Value* Argument = B.CreateLoad(ArgPtr->getType(), ArgPtr);
 
-        Value* Ptr = B.CreateConstGEP1_32(Buf, Offset);
+        Value* Ptr = B.CreateConstGEP1_32(Type::getInt8Ty(B.getContext()), Buf, Offset);
         B.CreateStore(Argument, Ptr);
 
         Offset += DL.getTypeStoreSize(Argument->getType());
@@ -104,9 +107,11 @@ namespace easy {
         Value *Argument = F->arg_begin()+Arg;
         Type* ArgTy = Argument->getType();
 
-        Value* Ptr = B.CreateConstGEP1_32(Buf, Offset);
+        Value* Ptr = B.CreateConstGEP1_32(Type::getInt8Ty(B.getContext()), Buf, Offset);
         Ptr = B.CreatePointerCast(Ptr, PointerType::getUnqual(ArgTy), Argument->getName() + ".ptr");
         B.CreateStore(Argument, Ptr);
+
+        LLVM_DEBUG(dbgs() << "Store at " << Offset << "\n");
 
         Offset += DL.getTypeStoreSize(Argument->getType());
       }
@@ -137,6 +142,8 @@ namespace easy {
       size_t ArgSize;
       if(PassedAsAPointer) ArgSize = GetStructSize(STy->element_begin(), STy->element_end(), DL);
       else ArgSize = GetStructSize(FTy->param_begin(), FTy->param_end(), DL);
+
+      LLVM_DEBUG(dbgs() << F->getName() << ": I32Size = " << I32Size << ", ArgSize = " << ArgSize << "\n");
 
       Value* Buf = B.CreateCall(Malloc, {ConstantInt::get(Malloc->getFunctionType()->getParamType(0), I32Size + ArgSize)}, "buf");
       B.CreateStore(ConstantInt::get(I32, ArgSize), B.CreatePointerCast(Buf, I32Ptr, "size.ptr"));
@@ -191,5 +198,23 @@ namespace easy {
 
   llvm::Pass* createRegisterLayoutPass() {
     return new RegisterLayout();
+  }
+  
+
+  struct RegisterLayoutMixin : public PassInfoMixin<RegisterLayoutMixin> {
+  public:
+    RegisterLayoutMixin() : legacyPass(new RegisterLayout) {}
+    PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
+      auto Changed = legacyPass->runOnModule(M);
+      if (Changed) return PreservedAnalyses::none();
+      return PreservedAnalyses::all();
+    }
+    static bool isRequired() { return true; }
+  private:
+    RegisterLayout* legacyPass;
+  };
+
+  void registerLayoutPass(llvm::ModulePassManager &PM) {
+    PM.addPass(RegisterLayoutMixin());
   }
 }

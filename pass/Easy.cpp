@@ -5,6 +5,13 @@
 #include <llvm/IR/InstIterator.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/DebugInfo.h>
+#include <llvm/IR/AbstractCallSite.h>
+
+#include <llvm/Transforms/IPO/GlobalDCE.h>
+#include <llvm/Transforms/IPO/StripDeadPrototypes.h>
+#include <llvm/Transforms/IPO/StripSymbols.h>
+
+#include "llvm/IR/PassManager.h"
 
 #include <llvm/IR/LegacyPassManager.h>
 
@@ -25,12 +32,16 @@
 #include <llvm/Support/Regex.h>
 
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/Support/FileSystem.h>
+#include <easy/exceptions.h>
 
 #include <memory>
 
 #include "MayAliasTracer.h"
 #include "StaticPasses.h"
 #include "Utils.h"
+
+#include <iostream>
 
 using namespace llvm;
 
@@ -39,6 +50,7 @@ static cl::opt<std::string> RegexString("easy-export",
                                         cl::init(""));
 
 namespace easy {
+
   struct RegisterBitcode : public ModulePass {
     static char ID;
 
@@ -46,19 +58,16 @@ namespace easy {
       : ModulePass(ID) {};
 
     bool runOnModule(Module &M) override {
-
       // execute the rest of the easy::jit passes
-      legacy::PassManager Passes;
-      Passes.add(easy::createRegisterLayoutPass());
-      bool Changed = Passes.run(M);
-
+      LLVM_DEBUG(dbgs() << "RegisterBitcode run on module " << M.getName() << "\n");
+      
       SmallVector<GlobalObject*, 8> ObjectsToJIT;
 
       collectObjectsToJIT(M, ObjectsToJIT);
 
       if(ObjectsToJIT.empty())
-        return Changed;
-
+        return false;
+      
       SmallVector<GlobalValue*, 8> LocalVariables;
       collectLocalGlobals(M, LocalVariables);
       nameGlobals(LocalVariables, "unnamed_local_global");
@@ -69,10 +78,28 @@ namespace easy {
       Function* RegisterBitcodeFun = declareRegisterBitcode(M, GlobalMapping);
       registerBitcode(M, ObjectsToJIT, Bitcode, GlobalMapping, RegisterBitcodeFun);
 
-      return Changed;
+      LLVM_DEBUG(WriteIntermediateToFile(M, (M.getName() + "_pass.ll").str()));
+
+      return true;
     }
 
     private:
+
+
+    static void WriteIntermediateToFile(llvm::Module const &M, std::string const& File) {
+      if(File.empty())
+        return;
+      std::error_code Error;
+      llvm::raw_fd_ostream Out(File, Error, llvm::sys::fs::OF_None);
+
+      if(Error) {
+        dbgs() << "WHAT\n";
+        return;
+      }
+
+      Out << M;
+      llvm::dbgs() << "Wrote to " << File << "\n";
+    }
 
     static bool canExtractBitcode(GlobalObject &GO, std::string &Reason) {
       if(GO.isDeclaration()) {
@@ -145,10 +172,10 @@ namespace easy {
 
         std::string Reason;
         if(!canExtractBitcode(GO, Reason)) {
-          DEBUG(dbgs() << "Could not extract global '" << GO.getName() << "'. " << Reason << "\n");
+          LLVM_DEBUG(dbgs() << "Could not extract global '" << GO.getName() << "'. " << Reason << "\n");
           continue;
         }
-        DEBUG(dbgs() << "Global '" << GO.getName() << "' marked for extraction.\n");
+        LLVM_DEBUG(dbgs() << "Global '" << GO.getName() << "' marked for extraction.\n");
 
         ObjectsToJIT.push_back(&GO);
       }
@@ -172,15 +199,28 @@ namespace easy {
         if(F.getSection() != JIT_SECTION)
           continue;
         for(auto& I : instructions(F)) {
-          auto* LI = dyn_cast<LoadInst>(&I);
-          if(!LI)
+          auto* CI = dyn_cast<CallInst>(&I);
+          if(!CI)
+            continue;
+          
+          if (CI->getCalledFunction()) continue;
+
+          auto* LI = dyn_cast<LoadInst>(CI->getCalledOperand());
+          if (!LI)
+            continue;
+          auto* LLI = dyn_cast<LoadInst>(LI->getOperand(0));
+          if (!LLI)
             continue;
 
-          MDNode *Tag = I.getMetadata(LLVMContext::MD_tbaa);
+          MDNode *Tag = LLI->getMetadata(LLVMContext::MD_tbaa);
           if(!Tag || !Tag->isTBAAVtableAccess())
             continue;
 
-          VirtualMethodTys.insert(cast<PointerType>(cast<PointerType>(LI->getType())->getElementType())->getElementType());
+          llvm::dbgs() << "Found virtual: " << *CI << " from " << *LI << " from " << *LLI << ", type = " << *CI->getFunctionType() << "\n";
+          dbgs() << "--------------------\n";
+          dbgs() << F;
+          dbgs() << "--------------------\n";
+          VirtualMethodTys.insert(CI->getFunctionType());
         }
       }
 
@@ -228,10 +268,11 @@ namespace easy {
 
     void deduceObjectsToJIT(Module &M) {
       for(Function &EasyJitFun : compilerInterface(M)) {
-        for(User* U : EasyJitFun.users()) {
-          if(CallSite CS{U}) {
-            for(Value* O : CS.args()) {
-              O = O->stripPointerCastsNoFollowAliases();
+        for(Use& U : EasyJitFun.uses()) {
+          if(AbstractCallSite CS{&U}) {
+            for (int i = 0; i < CS.getNumArgOperands(); i++) {
+              Value* O = CS.getCallArgOperand(i);
+              O = O->stripPointerCasts();
               MayAliasTracer Tracer(O);
               for(GlobalObject& GO: M.global_objects()) {
                 if(isConstant(GO) and Tracer.count(GO)) {
@@ -255,8 +296,10 @@ namespace easy {
 
     static void collectLocalGlobals(Module &M, SmallVectorImpl<GlobalValue*> &Globals) {
       for(GlobalVariable &GV : M.globals())
-        if(GV.hasLocalLinkage())
+        if(GV.hasLocalLinkage()) {
+          LLVM_DEBUG(dbgs() << "Found local global: " << GV << "\n");
           Globals.push_back(&GV);
+        }
     }
 
     static void nameGlobals(SmallVectorImpl<GlobalValue*> &Globals, Twine Name) {
@@ -270,7 +313,7 @@ namespace easy {
       LLVMContext &C = M.getContext();
       SmallVector<Constant*, 8> Entries;
 
-      Type* PtrTy = Type::getInt8PtrTy(C);
+      Type* PtrTy = PointerType::get(C, 0);
       StructType *EntryTy = StructType::get(C, {PtrTy, PtrTy}, true);
 
       for(GlobalValue* GV : Globals) {
@@ -285,6 +328,7 @@ namespace easy {
       Entries.push_back(Constant::getNullValue(EntryTy));
 
       Constant* Init = ConstantArray::get(ArrayType::get(EntryTy, Entries.size()), Entries);
+      LLVM_DEBUG(dbgs() << "Global mapping: " << *Init << "\n");
       return new GlobalVariable(M, Init->getType(), true,
                                 GlobalVariable::PrivateLinkage,
                                 Init, "global_mapping");
@@ -293,13 +337,15 @@ namespace easy {
     static SmallVector<GlobalVariable*, 8>
     embedBitcode(Module &M, SmallVectorImpl<GlobalObject*> &Objs) {
       SmallVector<GlobalVariable*, 8> Bitcode(Objs.size());
-      for(size_t i = 0, n = Objs.size(); i != n; ++i)
+      for(size_t i = 0, n = Objs.size(); i != n; ++i) {
+        LLVM_DEBUG(dbgs() << "Embedding bitcode for " << Objs[i]->getName() << "\n");
         Bitcode[i] = embedBitcode(M, *Objs[i]);
+      }
       return Bitcode;
     }
 
     static GlobalVariable* embedBitcode(Module &M, GlobalObject& GO) {
-      std::unique_ptr<Module> Embed = CloneModule(&M);
+      std::unique_ptr<Module> Embed = CloneModule(M);
 
       GlobalValue *FEmbed = Embed->getNamedValue(GO.getName());
       assert(FEmbed && "global value with that name exists");
@@ -314,7 +360,7 @@ namespace easy {
     static std::string moduleToString(Module &M) {
       std::string s;
       raw_string_ostream so(s);
-      WriteBitcodeToFile(&M, so);
+      WriteBitcodeToFile(M, so);
       so.flush();
       return s;
     }
@@ -333,6 +379,8 @@ namespace easy {
 
       bool ForFunction = isa<Function>(Entry);
 
+      LLVM_DEBUG(dbgs() << "Cleaning module" << M.getName() << " for " << Entry.getName() << ", ForFunction = " << ForFunction << "\n");
+
       auto Referenced = getReferencedFromEntry(Entry);
       Referenced.push_back(&Entry);
 
@@ -341,12 +389,14 @@ namespace easy {
       }
 
       //clean the cloned module
-      legacy::PassManager Passes;
-      Passes.add(createGVExtractionPass(Referenced));
-      Passes.add(createGlobalDCEPass());
-      Passes.add(createStripDeadDebugInfoPass());
-      Passes.add(createStripDeadPrototypesPass());
-      Passes.run(M);
+
+      ModulePassManager PM;
+      ModuleAnalysisManager AM;
+      AM.registerPass([]() { return PassInstrumentationAnalysis(); });
+      PM.addPass(GlobalDCEPass());
+      PM.addPass(StripDeadDebugInfoPass());
+      PM.addPass(StripDeadPrototypesPass());
+      PM.run(M, AM);
 
       if(ForFunction) {
         fixLinkages(Entry, M);
@@ -396,10 +446,12 @@ namespace easy {
         }
 
         if(auto* GVar = dyn_cast<GlobalVariable>(&GV)) {
-          // gv becomes a declaration
-          GVar->setInitializer(nullptr);
-          GVar->setVisibility(GlobalValue::DefaultVisibility);
-          GVar->setLinkage(GlobalValue::ExternalLinkage);
+          if (!GVar->isConstant()) {
+            GVar->setInitializer(nullptr);
+            GVar->setVisibility(GlobalValue::DefaultVisibility);
+            GVar->setLinkage(GlobalValue::ExternalLinkage);
+            LLVM_DEBUG(dbgs() << "fix bitcode var linkage for " << *GVar << "\n");
+          }
         } else if(auto* F = dyn_cast<Function>(&GV)) {
           // f becomes private
           F->removeFnAttr(Attribute::NoInline);
@@ -425,7 +477,7 @@ namespace easy {
       DataLayout const &DL = M.getDataLayout();
 
       Type* Void = Type::getVoidTy(C);
-      Type* I8Ptr = Type::getInt8PtrTy(C);
+      Type* I8Ptr = PointerType::get(C, 0);
       Type* GMTy = GlobalMapping->getType();
       Type* SizeT = DL.getLargestLegalIntType(C);
 
@@ -461,8 +513,9 @@ namespace easy {
         Value* BitcodeSize = ConstantInt::get(SizeTy, Size, false);
 
         // fun, name, gm, bitcode, bitcode size
-        B.CreateCall(RegisterBitcodeFun,
+        auto* CI = B.CreateCall(RegisterBitcodeFun,
                      {Fun, NameCast, GlobalMapping, Bitcode, BitcodeSize}, "");
+        LLVM_DEBUG(dbgs() << "Call:::: " << *CI << "\n");
       }
     }
 
@@ -482,5 +535,23 @@ namespace easy {
 
   llvm::Pass* createRegisterBitcodePass() {
     return new RegisterBitcode();
+  }
+  
+
+  struct RegisterBitcodeMixin : public PassInfoMixin<RegisterBitcodeMixin> {
+  public:
+    RegisterBitcodeMixin() : legacyPass(new RegisterBitcode) {}
+    PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
+      auto Changed = legacyPass->runOnModule(M);
+      if (Changed) return PreservedAnalyses::none();
+      return PreservedAnalyses::all();
+    }
+    static bool isRequired() { return true; }
+  private:
+    RegisterBitcode* legacyPass;
+  };
+
+  void registerBitcodePass(llvm::ModulePassManager &PM) {
+    PM.addPass(RegisterBitcodeMixin());
   }
 }

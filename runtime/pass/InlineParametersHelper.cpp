@@ -37,6 +37,7 @@ HighLevelLayout::HighLevelLayout(easy::Context const& C, llvm::Function &F) {
       Type* ParamTy = FTy->getParamType(ParamIdx);
       Arg.Types_.push_back(ParamTy);
       Arg.StructByPointer_ = ParamTy->isPointerTy();
+      Arg.StructByArray_ = ParamTy->isArrayTy();
       ++ParamIdx;
       ++ArgIdx;
     } else {

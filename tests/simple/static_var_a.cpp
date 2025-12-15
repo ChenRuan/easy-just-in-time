@@ -1,5 +1,5 @@
-// RUN: %clangxx %cxxflags %include_flags %ld_flags %s -Xclang -load -Xclang %lib_pass -o %t
-// RUN: %t > %t.out
+// RUN: %clangxx %cxxflags %include_flags %ld_flags %s -Xclang -fpass-plugin=%lib_pass -o %t
+// RUN: %t "%t.ll" > %t.out
 // RUN: %FileCheck %s < %t.out
 
 #include <easy/jit.h>
@@ -13,8 +13,8 @@ void add (int a, int b) {
   printf("inc(%d) is %d\n", a, a+b);
 }
 
-int main() {
-  easy::FunctionWrapper<void(int)> inc = easy::jit(add, _1, 1);
+int main(int argc, char** argv) {
+  easy::FunctionWrapper<void(int)> inc = easy::jit(add, _1, 1, easy::options::dump_ir(argv[1]));
 
   // CHECK: inc(4) is 5
   // CHECK: inc(5) is 6

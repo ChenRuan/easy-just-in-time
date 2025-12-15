@@ -2,6 +2,7 @@
 #include <llvm/IR/Module.h>
 #include <llvm/ADT/SmallVector.h>
 
+#include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/Bitcode/BitcodeReader.h>
 
@@ -14,7 +15,7 @@ using namespace llvm;
 static const char EasyJitMD[] = "easy::jit";
 static const char EntryTag[] = "entry";
 
-std::string easy::GetEntryFunctionName(Module const &M) {
+llvm::StringRef easy::GetEntryFunctionName(Module const &M) {
   NamedMDNode* MD = M.getNamedMetadata(EasyJitMD);
 
   for(MDNode *Operand : MD->operands()) {
@@ -57,7 +58,7 @@ easy::CloneModuleWithContext(llvm::Module const &LM, llvm::LLVMContext &C) {
   // write module
   {
     llvm::raw_string_ostream stream(buf);
-    llvm::WriteBitcodeToFile(&LM, stream);
+    llvm::WriteBitcodeToFile(LM, stream);
     stream.flush();
   }
 

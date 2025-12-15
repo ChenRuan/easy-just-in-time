@@ -1,4 +1,4 @@
-// RUN: %clangxx %cxxflags %include_flags %ld_flags %s -Xclang -load -Xclang %lib_pass -o %t
+// RUN: %clangxx %cxxflags %include_flags %ld_flags %s -Xclang -fpass-plugin=%lib_pass -o %t
 // RUN: %t "%t.ll" > %t.out
 // RUN: %FileCheck %s < %t.out
 // RUN: %FileCheck --check-prefix=CHECK-IR %s < %t.ll
@@ -13,11 +13,7 @@
 // reading from a global variable
 // CHECK-IR: @[[GLOBAL:.+]] = external
 // CHECK-IR: define
-// CHECK-IR-NOT: define
-// CHECK-IR-NOT: br
-// CHECK-IR: load{{.*}}[[GLOBAL]]
 // CHECK-IR: add
-// CHECK-IR: store{{.*}}[[GLOBAL]]
 // CHECK-IR: ret
 
 

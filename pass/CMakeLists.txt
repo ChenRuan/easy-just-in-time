@@ -1,10 +1,10 @@
-add_llvm_loadable_module(EasyJitPass
+
+add_llvm_pass_plugin(EasyJitPass SHARED
   RegisterPasses.cpp
   Easy.cpp
   Layout.cpp
   Utils.cpp
   MayAliasTracer.cpp
-  PLUGIN_TOOL clang
   )
 
 set(EASY_JIT_PASS ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/EasyJitPass${CMAKE_SHARED_LIBRARY_SUFFIX} PARENT_SCOPE)

@@ -3,6 +3,7 @@
 
 #include <string>
 #include <memory>
+#include <llvm/ADT/StringRef.h>
 
 namespace llvm {
   class LLVMContext;
@@ -12,7 +13,7 @@ namespace llvm {
 
 namespace easy {
 
-std::string GetEntryFunctionName(llvm::Module const &M);
+llvm::StringRef GetEntryFunctionName(llvm::Module const &M);
 void MarkAsEntry(llvm::Function &F);
 void UnmarkEntry(llvm::Module &M);
 

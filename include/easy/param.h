@@ -13,7 +13,7 @@ namespace layout {
 
   // the address of this function is used as id :)
   template<class Arg>
-  char* serialize_arg(Arg);
+  char* serialize_arg(Arg a);
 
   template<class Arg>
   layout_id  __attribute__((noinline)) EASY_JIT_LAYOUT get_layout() {

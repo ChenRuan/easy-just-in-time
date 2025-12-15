@@ -10,3 +10,6 @@
 */.ninja_log
 */__pycache__
 *.py[cod]
+build/
+.vscode
+.venv

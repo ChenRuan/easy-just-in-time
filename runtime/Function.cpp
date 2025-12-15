@@ -89,13 +89,15 @@ static void MapGlobals(llvm::ExecutionEngine& EE, GlobalMapping* Globals) {
   for(GlobalMapping *GM = Globals; GM->Name; ++GM) {
     EE.addGlobalMapping(GM->Name, (uint64_t)GM->Address);
   }
+  EE.addGlobalMapping("__dso_handle", (uint64_t)&EE);
+  EE.finalizeObject();
 }
 
 static void WriteOptimizedToFile(llvm::Module const &M, std::string const& File) {
   if(File.empty())
     return;
   std::error_code Error;
-  llvm::raw_fd_ostream Out(File, Error, llvm::sys::fs::F_None);
+  llvm::raw_fd_ostream Out(File, Error, llvm::sys::fs::OF_None);
 
   if(Error)
     throw CouldNotOpenFile(Error.message());
@@ -126,6 +128,8 @@ llvm::Module const& Function::getLLVMModule() const {
 }
 
 std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) {
+  // llvm::DebugFlag = true;
+  // llvm::setCurrentDebugType("jit");
 
   auto &BT = BitcodeTracker::GetTracker();
 
@@ -153,7 +157,7 @@ void easy::Function::serialize(std::ostream& os) const {
   llvm::raw_string_ostream stream(buf);
 
   LLVMHolderImpl const *H = reinterpret_cast<LLVMHolderImpl const*>(Holder.get());
-  llvm::WriteBitcodeToFile(H->M_, stream);
+  llvm::WriteBitcodeToFile(*H->M_, stream);
   stream.flush();
 
   os << buf;
@@ -174,7 +178,7 @@ std::unique_ptr<easy::Function> easy::Function::deserialize(std::istream& is) {
 
   auto M = std::move(ModuleOrError.get());
 
-  std::string FunName = easy::GetEntryFunctionName(*M);
+  std::string FunName = easy::GetEntryFunctionName(*M).str();
 
   GlobalMapping* Globals = nullptr;
   if(void* OrigFunPtr = BT.getAddress(FunName)) {

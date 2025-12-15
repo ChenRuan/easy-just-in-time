@@ -1,9 +1,9 @@
 #ifndef NOINLINE
 #define NOINLINE
 
-#define CI_SECTION "compiler-interface"
-#define JIT_SECTION "easy-jit"
-#define LAYOUT_SECTION "layout"
+#define CI_SECTION "segment,compiler-if"
+#define JIT_SECTION "segment,easy-jit"
+#define LAYOUT_SECTION "segment,layout"
 
 // mark functions in the easy::jit interface as no inline.
 // it's easier for the pass to find the original functions to be jitted.

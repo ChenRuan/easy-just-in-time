@@ -4,6 +4,7 @@
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Constant.h>
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/AbstractCallSite.h>
 #include <llvm/IR/InstIterator.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/Linker/Linker.h>
@@ -71,41 +72,47 @@ static Function* findFunctionAndLinkModules(Module& M, void* HostValue) {
 template<class IIter>
 bool Devirtualize(IIter it, IIter end) {
   bool Changed = false;
-  for(; it != end; ++it) {
+
+  // We are trying to match %1 from CallInsts like %3
+  // Matching %1 means we are doing a virtualized call in %3.
+
+  // %1 = load ptr, ptr inttoptr (i64 187650338298944 to ptr), align 64, !tbaa !9
+  // %2 = load ptr, ptr %1, align 8
+  // %3 = tail call noundef i32 %2(ptr noundef nonnull align 8 dereferenceable(8) inttoptr (i64 187650338298944 to ptr))
+  for (; it != end; ++it) {
     Instruction &I = *it;
-    auto* VTable = getVTableHostAddress(I);
+    CallInst* CI = dyn_cast<CallInst>(&I); // %3
+    if(!CI)
+      continue;
+
+    // Try to take us to where we load the VTable
+    // This only happens when we are calling a temp, not a function
+    if (CI->getCalledFunction())
+      continue;
+    LoadInst* LI = dyn_cast<LoadInst>(CI->getCalledOperand()); // %2
+
+    // must come from a pointer load
+    if (!LI)
+      continue;
+    
+    LoadInst* LLI = dyn_cast<LoadInst>(LI->getOperand(0)); // %1
+    if (!LLI)
+      continue;
+    
+    auto* VTable = getVTableHostAddress(*LLI);
     if(!VTable)
       continue;
 
     void** RuntimeLoadedValue = *(void***)(uintptr_t)(VTable->getZExtValue());
 
     void* CalledPtrHostValue = *RuntimeLoadedValue;
-    llvm::Function* F = findFunctionAndLinkModules(*I.getParent()->getParent()->getParent(), CalledPtrHostValue);
+    llvm::Function* F = findFunctionAndLinkModules(*LLI->getParent()->getParent()->getParent(), CalledPtrHostValue);
     if(!F)
       continue;
 
+    LI->replaceAllUsesWith(F);
+
     Changed = true;
-
-    // that's generally the load from the table
-    for(User* U : VTable->users()) {
-      ConstantExpr* Int2Ptr = dyn_cast<ConstantExpr>(U->stripPointerCasts());
-      if(!Int2Ptr)
-        continue;
-
-      for(User* UU : Int2Ptr->users()) {
-        auto* CalledPtr = dyn_cast<LoadInst>(UU);
-        if(!CalledPtr)
-          continue;
-
-        Type* ExpectedTy = CalledPtr->getType()->getContainedType(0);
-        Constant* Called = ConstantExpr::getPointerCast(F, ExpectedTy);
-
-        SmallVector<User*, 4> Users{CalledPtr->user_begin(), CalledPtr->user_end()};
-        for(User* UUU : Users)
-          if(auto* LI = dyn_cast<LoadInst>(UUU))
-            LI->replaceAllUsesWith(Called);
-      }
-    }
   }
   return Changed;
 }
@@ -133,11 +140,11 @@ bool CastCallWithPointerCasts(FunctionType* CalledTy, FunctionType* UncastedTy) 
 template<class IIter>
 void RecastCalls(IIter it, IIter end) {
   for(;it != end;) {
-    CallSite CS{&*it++};
-    if(!CS)
-      continue;
+    auto *CB = dyn_cast<CallBase>(&*it++);
+    if(!CB)
+        continue;
 
-    Value* Called = CS.getCalledValue();
+    Value* Called = CB->getCalledOperand();
     Value* Uncasted = Called->stripPointerCasts();
     if(Called == Uncasted)
       continue;
@@ -148,25 +155,25 @@ void RecastCalls(IIter it, IIter end) {
     if(!CastCallWithPointerCasts(CalledTy, UncastedTy))
       continue;
 
-    CS.setCalledFunction(Uncasted);
-    CS.mutateFunctionType(UncastedTy);
+    Function* CalledFunction = CB->getCalledFunction();
+    CB->setCalledFunction(CalledFunction);
+    CB->mutateFunctionType(UncastedTy);
 
     // cast every pointer argument to the expected type
-    IRBuilder<> B(CS.getInstruction());
+    IRBuilder<> B(CB);
 
-    size_t N = CS.getNumArgOperands();
+    size_t N = CB->arg_size();
     for(unsigned i = 0; i != N; ++i) {
-      Value* Arg = CS.getArgOperand(i);
+      Value* Arg = CB->getArgOperand(i);
       Type* ArgTy = Arg->getType();
       Type* UncTy = UncastedTy->getParamType(i);
       if(ArgTy->isPointerTy() && ArgTy != UncTy)
-        CS.setArgument(i, B.CreatePointerCast(Arg, UncTy, Arg->getName() + ".recast_calls"));
+        CB->setArgOperand(i, B.CreatePointerCast(Arg, UncTy, Arg->getName() + ".recast_calls"));
     }
   }
 }
 
 bool easy::DevirtualizeConstant::runOnFunction(llvm::Function &F) {
-
   if(F.getName() != TargetName_)
     return false;
 
@@ -177,4 +184,4 @@ bool easy::DevirtualizeConstant::runOnFunction(llvm::Function &F) {
   return false;
 }
 
-static RegisterPass<easy::InlineParameters> X("","",false, false);
+static RegisterPass<easy::DevirtualizeConstant> X("","",false, false);

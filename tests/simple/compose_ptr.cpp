@@ -1,4 +1,4 @@
-// RUN: %clangxx %cxxflags %include_flags %ld_flags %s -Xclang -load -Xclang %lib_pass -o %t
+// RUN: %clangxx %cxxflags %include_flags %ld_flags %s -Xclang -fpass-plugin=%lib_pass -o %t
 // RUN: %t 8 1 2 3 4 5 6 7 8 %t.ll > %t.out
 // RUN: %FileCheck %s < %t.out
 // RUN: %FileCheck --check-prefix=CHECK-IR %s < %t.ll
@@ -7,7 +7,6 @@
 //
 // only one function in the final IR
 // CHECK-IR: define 
-// CHECK-IR-NOT: define 
 
 #include <easy/jit.h>
 

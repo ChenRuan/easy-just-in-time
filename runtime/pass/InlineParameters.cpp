@@ -109,6 +109,26 @@ void GetInlineArgs(easy::Context const &C,
           // struct is passed trough a pointer
           AllocaInst* ParamAlloc = easy::GetStructAlloc(B, DL, *Struct, ArgInF.Types_[0]);
           Args.push_back(ParamAlloc);
+        } else if (ArgInF.StructByArray_) {
+          // struct is passed as an array
+          Type* ArrayTy = ArgInF.Types_[0];
+          size_t N = ArrayTy->getArrayNumElements();
+          Type* FieldTy = ArrayTy->getArrayElementType();
+          SmallVector<Constant*, 8> ArrayValues;
+
+          for(size_t ParamIdx = 0, RawOffset = 0; ParamIdx != N; ++ParamIdx) {
+            const char* RawField = &Struct->get()[RawOffset];
+
+            Constant* FieldValue;
+            size_t RawSize;
+            std::tie(FieldValue, RawSize) = easy::GetConstantFromRaw(DL, FieldTy, (uint8_t const*)RawField);
+
+            ArrayValues.push_back(FieldValue);
+            RawOffset += RawSize;
+          }
+
+          Constant* ArrayConst = ConstantArray::get(cast<ArrayType>(ArrayTy), ArrayValues);
+          Args.push_back(ArrayConst);
         } else {
           // struct is passed by value (may be many values)
           size_t N = ArgInF.Types_.size();
@@ -161,7 +181,7 @@ void GetInlineArgs(easy::Context const &C,
 void RemapAttributes(Function const &F, HighLevelLayout const& HLL, Function &Wrapper, HighLevelLayout const& NewHLL) {
   auto FAttributes = F.getAttributes();
 
-  auto FunAttrs = FAttributes.getFnAttributes();
+  auto FunAttrs = FAttributes.getFnAttrs();
   for(Attribute Attr : FunAttrs)
     Wrapper.addFnAttr(Attr);
 
@@ -171,7 +191,7 @@ void RemapAttributes(Function const &F, HighLevelLayout const& HLL, Function &Wr
 
     for(size_t field = 0; field != NewArg.Types_.size(); ++field) {
       Wrapper.addParamAttrs(field + NewArg.FirstParamIdx_,
-                             FAttributes.getParamAttributes(field + OrgArg.FirstParamIdx_));
+                             AttrBuilder(F.getContext(), FAttributes.getParamAttrs(field + OrgArg.FirstParamIdx_)));
     }
   }
 }

@@ -17,6 +17,7 @@ struct HighLevelLayout {
     size_t FirstParamIdx_;
     llvm::SmallVector<llvm::Type*, 1> Types_;
     bool StructByPointer_ = false;
+    bool StructByArray_ = false;
 
     HighLevelArg(size_t Pos, size_t FirstParamIdx) :
       Position_(Pos), FirstParamIdx_(FirstParamIdx) { }
@@ -37,6 +38,8 @@ llvm::Constant* GetScalarArgument(easy::ArgumentBase const& Arg, llvm::Type* T);
 llvm::Constant* LinkPointerIfPossible(llvm::Module &M, easy::PtrArgument const &Ptr, llvm::Type* PtrTy);
 
 llvm::AllocaInst* GetStructAlloc(llvm::IRBuilder<> &B, llvm::DataLayout const &DL, easy::StructArgument const &Struct, llvm::Type* StructPtrTy);
+
+std::pair<llvm::Constant*, size_t> GetConstantFromRaw(llvm::DataLayout const& DL, llvm::Type* T, const uint8_t* Raw);
 
 std::pair<llvm::Constant*, size_t> GetConstantFromRaw(llvm::DataLayout const& DL, llvm::Type* T, const uint8_t* Raw);
 
