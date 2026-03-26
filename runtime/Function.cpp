@@ -16,6 +16,7 @@
 #include <llvm/Analysis/TargetTransformInfo.h> 
 #include <llvm/Analysis/TargetLibraryInfo.h> 
 #include <llvm/Support/FileSystem.h>
+#include <llvm/Support/Path.h>
 
 #ifdef NDEBUG
 #include <llvm/IR/Verifier.h>
@@ -72,7 +73,7 @@ static std::unique_ptr<llvm::ExecutionEngine> GetEngine(std::unique_ptr<llvm::Mo
   llvm::EngineBuilder ebuilder(std::move(M));
   std::string eeError;
 
-  std::unique_ptr<llvm::ExecutionEngine> EE(ebuilder.setErrorStr(&eeError)
+std::unique_ptr<llvm::ExecutionEngine> EE(ebuilder.setErrorStr(&eeError)
           .setMCPU(llvm::sys::getHostCPUName())
           .setEngineKind(llvm::EngineKind::JIT)
           .setOptLevel(llvm::CodeGenOpt::Level::Aggressive)
@@ -103,6 +104,40 @@ static void WriteOptimizedToFile(llvm::Module const &M, std::string const& File)
     throw CouldNotOpenFile(Error.message());
 
   Out << M;
+}
+
+static std::string GetDumpFileWithSuffix(std::string File, llvm::StringRef Suffix) {
+  if(File.empty())
+    return File;
+  llvm::SmallString<256> Path(File);
+  llvm::StringRef Extension = llvm::sys::path::extension(Path);
+  if(Extension.empty()) {
+    Path += Suffix;
+  } else {
+    llvm::SmallString<256> Stem(Path);
+    Stem.resize(Stem.size() - Extension.size());
+    Stem += Suffix;
+    Stem += Extension;
+    Path = Stem;
+  }
+  return std::string(Path.str());
+}
+
+static std::string GetDumpFileWithSuffix(std::string File, llvm::StringRef Suffix) {
+  if(File.empty())
+    return File;
+  llvm::SmallString<256> Path(File);
+  llvm::StringRef Extension = llvm::sys::path::extension(Path);
+  if(Extension.empty()) {
+    Path += Suffix;
+  } else {
+    llvm::SmallString<256> Stem(Path);
+    Stem.resize(Stem.size() - Extension.size());
+    Stem += Suffix;
+    Stem += Extension;
+    Path = Stem;
+  }
+  return std::string(Path.str());
 }
 
 std::unique_ptr<Function>
@@ -145,9 +180,12 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
   unsigned OptSize;
   std::tie(OptLevel, OptSize) = C.getOptLevel();
 
+  WriteOptimizedToFile(*M, GetDumpFileWithSuffix(C.getDebugFile(), ".before"));
+
   Optimize(*M, Name, C, OptLevel, OptSize);
 
   WriteOptimizedToFile(*M, C.getDebugFile());
+  WriteOptimizedToFile(*M, GetDumpFileWithSuffix(C.getDebugFile(), ".after"));
 
   return CompileAndWrap(Name, Globals, std::move(Ctx), std::move(M));
 }

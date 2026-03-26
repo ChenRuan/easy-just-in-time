@@ -32,7 +32,8 @@ namespace options{
     }
   };
 
-  // option used for writing the ir to a file, useful for debugging
+  // option used for writing the optimized IR to a file and
+  // the pre/post-optimize IR to sibling "*.before.*" / "*.after.*" files.
   EASY_NEW_OPTION_STRUCT(dump_ir) {
     dump_ir(std::string const &file)
                : file_(file) {}

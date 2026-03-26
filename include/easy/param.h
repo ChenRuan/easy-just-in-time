@@ -6,6 +6,8 @@
 #include <easy/options.h>
 #include <easy/meta.h>
 #include <easy/attributes.h>
+#include <easy/snapshot.h>
+#include <cassert>
 
 namespace easy {
 
@@ -107,7 +109,12 @@ struct set_parameter_helper<false> {
   template<class Param, class Arg>
   static void set_param(Context &C,
                         _if<std::is_class<Param>::value, Arg> &&arg) {
-    C.setParameterStruct(layout::serialize_arg<Param>(arg));
+    // Use direct memcpy-based serialization to avoid ABI-dependent
+    // LLVM-generated serialize_arg (broken on aarch64 for indirect struct passing).
+    static_assert(std::is_trivially_copyable<Param>::value,
+                  "struct parameters must be trivially copyable");
+    Param arg_as_param = arg;
+    C.setParameterStruct(serialized_arg(&arg_as_param, sizeof(Param)));
   }
 };
 
@@ -120,6 +127,62 @@ struct set_parameter {
 
   using help = set_parameter_helper<is_special>;
 };
+
+template<class Param, class SnapshotType>
+struct snapshot_parameter {
+  using ValueType = typename SnapshotType::value_type;
+
+  static void apply(Context &C, SnapshotType const& arg) {
+    layout::set_layout<ValueType>(C);
+    // Use direct memcpy-based serialization to avoid ABI-dependent
+    // LLVM-generated serialize_arg (broken on aarch64 for indirect struct passing).
+    static_assert(std::is_trivially_copyable<ValueType>::value,
+                  "snapshot requires trivially copyable types");
+    assert(arg.ptr != nullptr && "easy::snapshot does not accept null pointers");
+    C.setParameterStruct(serialized_arg(arg.ptr, sizeof(ValueType)));
+  }
+};
+
+template<class Param, class T>
+struct snapshot_array_parameter {
+  static void apply(Context &C, easy::snapshot_array_value<T> const& arg) {
+    using ValueType = typename easy::snapshot_array_value<T>::value_type;
+    static_assert(std::is_pointer<Param>::value,
+                  "easy::snapshot_array can only bind to pointer parameters");
+    assert((arg.data != nullptr || arg.count == 0) &&
+           "easy::snapshot_array does not accept null data with non-zero count");
+    layout::set_layout<Param>(C);
+    easy::serialized_array<ValueType> serialized(arg.data, arg.count);
+    C.setParameterArray(std::move(serialized.buf), serialized.count, sizeof(ValueType));
+  }
+};
+
+template<class Param, class Arg>
+void set_parameter_dispatch(std::false_type,
+                            std::false_type,
+                            Context &C,
+                            Arg &&arg) {
+  layout::set_layout<Param>(C);
+  set_parameter<Param, Arg>::help::template set_param<Param, Arg>(C, std::forward<Arg>(arg));
+}
+
+template<class Param, class Arg>
+void set_parameter_dispatch(std::true_type,
+                            std::false_type,
+                            Context &C,
+                            Arg &&arg) {
+  using ArgDecay = std::decay_t<Arg>;
+  snapshot_parameter<Param, ArgDecay>::apply(C, arg);
+}
+
+template<class Param, class Arg>
+void set_parameter_dispatch(std::false_type,
+                            std::true_type,
+                            Context &C,
+                            Arg &&arg) {
+  using ArgDecay = std::decay_t<Arg>;
+  snapshot_array_parameter<Param, typename ArgDecay::value_type>::apply(C, arg);
+}
 
 }
 
@@ -152,8 +215,12 @@ set_parameters(ParameterList,
   using Param0 = typename ParameterList::head;
   using ParametersTail = typename ParameterList::tail;
 
-  layout::set_layout<Param0>(C);
-  set_parameter<Param0, Arg0>::help::template set_param<Param0, Arg0>(C, std::forward<Arg0>(arg0));
+  using Arg0Decay = std::decay_t<Arg0>;
+  set_parameter_dispatch<Param0>(
+      typename easy::is_snapshot_value<Arg0Decay>::type(),
+      typename easy::is_snapshot_array_value<Arg0Decay>::type(),
+      C,
+      std::forward<Arg0>(arg0));
   set_parameters<ParametersTail, Args&&...>(ParametersTail(), C, std::forward<Args>(args)...);
 }
 
