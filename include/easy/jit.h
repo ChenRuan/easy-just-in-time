@@ -4,6 +4,7 @@
 #include <easy/runtime/Context.h>
 #include <easy/attributes.h>
 #include <easy/param.h>
+#include <easy/snapshot.h>
 #include <easy/function_wrapper.h>
 
 #include <memory>

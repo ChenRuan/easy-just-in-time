@@ -3,9 +3,11 @@
 
 #include <vector>
 #include <memory>
+#include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <type_traits>
 #include <string>
 
 #include <easy/runtime/Function.h>
@@ -22,6 +24,29 @@ struct serialized_arg {
 
     free(serialized);
   }
+
+  // Direct construction from raw memory (bypasses LLVM-generated serialization)
+  serialized_arg(const void* data, size_t size) {
+    assert((data != nullptr || size == 0) && "serialized_arg received null data with non-zero size");
+    buf.resize(size);
+    if (size != 0)
+      std::memcpy(buf.data(), data, size);
+  }
+};
+
+template<class T>
+struct serialized_array {
+  std::vector<char> buf;
+  size_t count;
+
+  serialized_array(const T* data, size_t n) : count(n) {
+    static_assert(std::is_trivially_copyable<T>::value,
+                  "easy::snapshot_array requires trivially copyable elements");
+    assert((data != nullptr || n == 0) && "serialized_array received null data with non-zero count");
+    buf.resize(sizeof(T) * n);
+    if (n != 0)
+      std::memcpy(buf.data(), data, sizeof(T) * n);
+  }
 };
 
 typedef void* layout_id;
@@ -34,6 +59,7 @@ struct ArgumentBase {
     AK_Float,
     AK_Ptr,
     AK_Struct,
+    AK_Array,
     AK_Module,
   };
 
@@ -117,6 +143,37 @@ class StructArgument
   }
 };
 
+class ArrayArgument
+    : public ArgumentBase {
+  std::vector<char> Data_;
+  size_t Count_;
+  size_t ElementSize_;
+
+  public:
+  ArrayArgument(std::vector<char> data, size_t count, size_t elementSize)
+    : ArgumentBase(), Data_(std::move(data)), Count_(count), ElementSize_(elementSize) {}
+  virtual ~ArrayArgument() override = default;
+  std::vector<char> const & get() const { return Data_; }
+  size_t getCount() const { return Count_; }
+  size_t getElementSize() const { return ElementSize_; }
+  static constexpr ArgumentKind Kind = AK_Array;
+  ArgumentKind kind() const noexcept override  { return Kind; }
+
+  protected:
+  bool compareWithSameType(ArgumentBase const& Other) const override {
+    auto const &OtherCast = static_cast<ArrayArgument const&>(Other);
+    return Count_ == OtherCast.Count_ && ElementSize_ == OtherCast.ElementSize_ && Data_ == OtherCast.Data_;
+  }
+
+  size_t hash() const noexcept override {
+    std::hash<int64_t> hash{};
+    size_t R = hash(static_cast<int64_t>(Count_)) ^ hash(static_cast<int64_t>(ElementSize_));
+    for (char c : Data_)
+      R ^= hash(c);
+    return R;
+  }
+};
+
 // class that holds information about the just-in-time context
 class Context {
 
@@ -147,6 +204,7 @@ class Context {
   Context& setParameterFloat(double);
   Context& setParameterPointer(void const*);
   Context& setParameterStruct(serialized_arg);
+  Context& setParameterArray(std::vector<char>, size_t Count, size_t ElementSize);
   Context& setParameterModule(easy::Function const&);
 
   Context& setArgumentLayout(layout_id id) {

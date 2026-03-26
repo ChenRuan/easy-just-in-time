@@ -9,6 +9,7 @@
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/TargetParser/Host.h>
 #include <llvm/Support/FileSystem.h>
+#include <llvm/Support/Path.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/Passes/PassBuilder.h>
 
@@ -105,6 +106,23 @@ static void WriteOptimizedToFile(llvm::Module const &M, std::string const& File)
   Out << M;
 }
 
+static std::string GetDumpFileWithSuffix(std::string File, llvm::StringRef Suffix) {
+  if(File.empty())
+    return File;
+  llvm::SmallString<256> Path(File);
+  llvm::StringRef Extension = llvm::sys::path::extension(Path);
+  if(Extension.empty()) {
+    Path += Suffix;
+  } else {
+    llvm::SmallString<256> Stem(Path);
+    Stem.resize(Stem.size() - Extension.size());
+    Stem += Suffix;
+    Stem += Extension;
+    Path = Stem;
+  }
+  return std::string(Path.str());
+}
+
 std::unique_ptr<Function>
 CompileAndWrap(const char*Name, GlobalMapping* Globals,
                std::unique_ptr<llvm::LLVMContext> Ctx,
@@ -164,11 +182,14 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
   std::unique_ptr<llvm::LLVMContext> Ctx;
   std::tie(M, Ctx) = BT.getModule(Addr);
 
+  WriteOptimizedToFile(*M, GetDumpFileWithSuffix(C.getDebugFile(), ".before"));
+
   llvm::OptimizationLevel OptimizationLevel = getOptimizationLevel(C.getOptLevel());
 
   Optimize(*M, Name, C, OptimizationLevel);
 
   WriteOptimizedToFile(*M, C.getDebugFile());
+  WriteOptimizedToFile(*M, GetDumpFileWithSuffix(C.getDebugFile(), ".after"));
 
   return CompileAndWrap(Name, Globals, std::move(Ctx), std::move(M));
 }

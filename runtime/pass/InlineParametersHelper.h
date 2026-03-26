@@ -6,6 +6,7 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/ADT/SmallVector.h>
+#include <llvm/IR/InstIterator.h>
 
 #include <easy/runtime/Context.h>
 
@@ -48,10 +49,17 @@ llvm::StringRef GetGlobalName(llvm::Module &M, easy::PtrArgument const &Ptr);
 bool LinkAndUpdateSymbol(llvm::Module &M, llvm::StringRef FName, llvm::StringRef WrapperName, llvm::SmallVectorImpl<PostLinkageSymbol> &Symbols, easy::Context const &C, llvm::Value* CallToUpdate);
 
 llvm::AllocaInst* GetStructAlloc(llvm::IRBuilder<> &B, llvm::DataLayout const &DL, easy::StructArgument const &Struct, llvm::Type* StructTy);
+llvm::Constant* GetArrayConstant(llvm::DataLayout const &DL, easy::ArrayArgument const &Array, llvm::Type* PointeeTy);
 
 std::pair<llvm::Constant*, size_t> GetConstantFromRaw(llvm::DataLayout const& DL, llvm::Type* T, const uint8_t* Raw);
 
-std::pair<llvm::Constant*, size_t> GetConstantFromRaw(llvm::DataLayout const& DL, llvm::Type* T, const uint8_t* Raw);
+/// Discover the struct type a pointer argument points to by scanning
+/// GEP / load / store instructions in the function body.
+llvm::Type* FindPointeeStructType(llvm::Function &F, unsigned ArgIdx);
+
+/// Discover the element type a pointer argument points to by scanning
+/// GEP instructions in the function body.
+llvm::Type* FindPointeeElementType(llvm::Function &F, unsigned ArgIdx);
 
 }
 

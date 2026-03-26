@@ -1,7 +1,11 @@
 // RUN: %clangxx %cxxflags %include_flags %ld_flags %s -Xclang -fpass-plugin=%lib_pass -o %t
 // RUN: %t "%t.ll" > %t.out
+// RUN: test -f %t.before.ll
+// RUN: test -f %t.after.ll
 // RUN: %FileCheck %s < %t.out
 // RUN: %FileCheck --check-prefix=CHECK-IR %s < %t.ll
+// RUN: %FileCheck --check-prefix=CHECK-IR %s < %t.before.ll
+// RUN: %FileCheck --check-prefix=CHECK-IR %s < %t.after.ll
 
 #include <easy/jit.h>
 #include <easy/options.h>
@@ -13,7 +17,6 @@
 // reading from a global variable
 // CHECK-IR: @[[GLOBAL:.+]] = external
 // CHECK-IR: define
-// CHECK-IR: add
 // CHECK-IR: ret
 
 

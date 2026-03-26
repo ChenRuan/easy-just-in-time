@@ -3,6 +3,9 @@
 #include <easy/runtime/BitcodeTracker.h>
 
 #include <llvm/Linker/Linker.h>
+#include <llvm/IR/InstIterator.h>
+#include <llvm/ADT/SmallSet.h>
+#include <llvm/ADT/SmallVector.h>
 
 #include <llvm/Support/raw_ostream.h>
 
@@ -215,6 +218,29 @@ std::pair<llvm::Constant*, size_t> easy::GetConstantFromRaw(llvm::DataLayout con
   return {DataAsT, Size};
 }
 
+llvm::Constant* easy::GetArrayConstant(llvm::DataLayout const &DL,
+                                       easy::ArrayArgument const &Array,
+                                       llvm::Type* PointeeTy) {
+  size_t Count = Array.getCount();
+  size_t ElemSize = Array.getElementSize();
+  assert(Array.get().size() == Count * ElemSize &&
+         "snapshot array buffer size does not match element count");
+  SmallVector<Constant*, 8> Elements;
+  Elements.reserve(Count);
+
+  for (size_t I = 0; I != Count; ++I) {
+    auto const *ElemRaw = reinterpret_cast<uint8_t const*>(Array.get().data() + I * ElemSize);
+    Constant* ElemConst;
+    size_t RawSize;
+    std::tie(ElemConst, RawSize) = easy::GetConstantFromRaw(DL, PointeeTy, ElemRaw);
+    assert(RawSize == ElemSize &&
+           "snapshot array element size does not match inferred pointee type");
+    Elements.push_back(ElemConst);
+  }
+
+  return ConstantArray::get(ArrayType::get(PointeeTy, Count), Elements);
+}
+
 static
 size_t StoreStructField(llvm::IRBuilder<> &B,
                         llvm::DataLayout const &DL,
@@ -223,24 +249,34 @@ size_t StoreStructField(llvm::IRBuilder<> &B,
                         AllocaInst* Alloc, SmallVectorImpl<Value*> &GEP) {
 
   StructType* STy = dyn_cast<StructType>(Ty);
-  size_t RawOffset = 0;
   if(STy) {
-    errs() << "struct " << *STy << "\n";
+    const StructLayout *SL = DL.getStructLayout(STy);
     size_t Fields = STy->getNumContainedTypes();
     for(size_t Field = 0; Field != Fields; ++Field) {
       GEP.push_back(B.getInt32(Field));
-      size_t Size = StoreStructField(B, DL, STy->getElementType(Field), Raw+RawOffset, Alloc, GEP);
-      RawOffset += Size;
+      size_t FieldOffset = SL->getElementOffset(Field);
+      StoreStructField(B, DL, STy->getElementType(Field), Raw + FieldOffset, Alloc, GEP);
       GEP.pop_back();
     }
+    return DL.getTypeAllocSize(STy);
+  } else if (ArrayType* ATy = dyn_cast<ArrayType>(Ty)) {
+    size_t ElemCount = ATy->getNumElements();
+    size_t ElemAllocSize = DL.getTypeAllocSize(ATy->getElementType());
+    for (size_t Index = 0; Index != ElemCount; ++Index) {
+      GEP.push_back(B.getInt32(Index));
+      StoreStructField(B, DL, ATy->getElementType(), Raw + Index * ElemAllocSize, Alloc, GEP);
+      GEP.pop_back();
+    }
+    return DL.getTypeAllocSize(ATy);
   } else {
     Constant* FieldValue;
-    std::tie(FieldValue, RawOffset) = easy::GetConstantFromRaw(DL, Ty, (uint8_t const*)Raw);
+    size_t StoreSize;
+    std::tie(FieldValue, StoreSize) = easy::GetConstantFromRaw(DL, Ty, (uint8_t const*)Raw);
 
     Value* FieldPtr = B.CreateGEP(Alloc->getAllocatedType(), Alloc, GEP, "field.gep");
     B.CreateStore(FieldValue, FieldPtr);
+    return StoreSize;
   }
-  return RawOffset;
 }
 
 llvm::AllocaInst* easy::GetStructAlloc(llvm::IRBuilder<> &B,
@@ -248,13 +284,115 @@ llvm::AllocaInst* easy::GetStructAlloc(llvm::IRBuilder<> &B,
                                        easy::StructArgument const &Struct,
                                        llvm::Type* StructTy) {
   AllocaInst* Alloc = B.CreateAlloca(StructTy);
+  B.CreateStore(Constant::getNullValue(StructTy), Alloc);
 
   SmallVector<Value*, 4> GEP = {B.getInt32(0)};
 
-  // TODO: Data points to the data structure or holds the data structure itself ?
-  // Check that size matches the .data()
+  auto const &Data = Struct.get();
+  size_t ExpectedSize = DL.getTypeAllocSize(StructTy);
+  if (Data.size() != ExpectedSize) {
+    errs() << "WARNING: GetStructAlloc: raw data size (" << Data.size()
+           << ") != LLVM struct alloc size (" << ExpectedSize << ")\n";
+  }
 
-  size_t Size = StoreStructField(B, DL, StructTy, (uint8_t const*)Struct.get().data(), Alloc, GEP);
+  StoreStructField(B, DL, StructTy, (uint8_t const*)Data.data(), Alloc, GEP);
 
   return Alloc;
+}
+
+/// Discover the struct type a pointer argument points to by scanning
+/// GEP / load / store instructions in the function body.
+/// Returns nullptr if no struct type can be found.
+llvm::Type* easy::FindPointeeStructType(llvm::Function &F, unsigned ArgIdx) {
+  Argument *Arg = F.getArg(ArgIdx);
+
+  // First, check for byval attribute
+  if (Arg->hasByValAttr()) {
+    Type *T = Arg->getParamByValType();
+    if (T && isa<StructType>(T))
+      return T;
+  }
+
+  // Collect all values that hold the pointer (including loads from allocas
+  // where the arg was stored – the typical -O0 pattern).
+  SmallVector<Value*, 8> Worklist;
+  SmallSet<Value*, 8> Visited;
+  Worklist.push_back(Arg);
+
+  while (!Worklist.empty()) {
+    Value *V = Worklist.pop_back_val();
+    if (!Visited.insert(V).second)
+      continue;
+
+    for (User *U : V->users()) {
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+        Type *SrcTy = GEP->getSourceElementType();
+        if (isa<StructType>(SrcTy))
+          return SrcTy;
+      }
+      if (auto *LI = dyn_cast<LoadInst>(U)) {
+        Type *LoadedTy = LI->getType();
+        if (isa<StructType>(LoadedTy))
+          return LoadedTy;
+      }
+      // arg → store to alloca → load from alloca → GEP
+      if (auto *SI = dyn_cast<StoreInst>(U)) {
+        if (SI->getValueOperand() == V) {
+          Value *Ptr = SI->getPointerOperand();
+          if (auto *AI = dyn_cast<AllocaInst>(Ptr)) {
+            for (User *AU : AI->users()) {
+              if (auto *LI = dyn_cast<LoadInst>(AU))
+                Worklist.push_back(LI);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return nullptr;
+}
+
+/// Discover the element type a pointer argument points to by scanning
+/// GEP / load instructions in the function body.
+/// Returns nullptr if no element type can be found.
+llvm::Type* easy::FindPointeeElementType(llvm::Function &F, unsigned ArgIdx) {
+  Argument *Arg = F.getArg(ArgIdx);
+
+  // Collect all values that hold the pointer (including loads from allocas
+  // where the arg was stored – the typical -O0 pattern).
+  SmallVector<Value*, 8> Worklist;
+  SmallSet<Value*, 8> Visited;
+  Worklist.push_back(Arg);
+
+  while (!Worklist.empty()) {
+    Value *V = Worklist.pop_back_val();
+    if (!Visited.insert(V).second)
+      continue;
+
+    for (User *U : V->users()) {
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+        return GEP->getSourceElementType();
+      }
+      if (auto *LI = dyn_cast<LoadInst>(U)) {
+        // If the loaded type is not a pointer, it's the element type
+        if (!LI->getType()->isPointerTy())
+          return LI->getType();
+      }
+      // arg → store to alloca → load from alloca → GEP / load
+      if (auto *SI = dyn_cast<StoreInst>(U)) {
+        if (SI->getValueOperand() == V) {
+          Value *Ptr = SI->getPointerOperand();
+          if (auto *AI = dyn_cast<AllocaInst>(Ptr)) {
+            for (User *AU : AI->users()) {
+              if (auto *LI = dyn_cast<LoadInst>(AU))
+                Worklist.push_back(LI);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return nullptr;
 }

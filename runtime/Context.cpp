@@ -22,6 +22,10 @@ Context& Context::setParameterStruct(serialized_arg arg) {
   return setArg<StructArgument>(std::move(arg));
 }
 
+Context& Context::setParameterArray(std::vector<char> data, size_t Count, size_t ElementSize) {
+  return setArg<ArrayArgument>(std::move(data), Count, ElementSize);
+}
+
 Context& Context::setParameterModule(easy::Function const &F) {
   return setArg<ModuleArgument>(F);
 }

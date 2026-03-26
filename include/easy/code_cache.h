@@ -2,6 +2,7 @@
 #define CACHE
 
 #include <easy/jit.h>
+#include <tuple>
 #include <unordered_map>
 
 namespace easy {
@@ -41,13 +42,31 @@ class Cache : public CacheBase<Key> {
 
   template<class T, class ... Args>
   auto const& EASY_JIT_COMPILER_INTERFACE jit(Key const &K, T &&Fun, Args&& ... args) {
-    auto CacheEntry = CacheBase<Key>::Cache_.emplace(K, FunctionWrapperBase());
+    auto CacheIter = CacheBase<Key>::Cache_.find(K);
+    std::pair<typename CacheBase<Key>::iterator, bool> CacheEntry;
+    if(CacheIter != CacheBase<Key>::Cache_.end()) {
+      CacheEntry = std::make_pair(CacheIter, false);
+    } else {
+      CacheEntry = CacheBase<Key>::Cache_.emplace(
+          std::piecewise_construct,
+          std::forward_as_tuple(K),
+          std::forward_as_tuple());
+    }
     return CacheBase<Key>::compile_if_not_in_cache(CacheEntry, std::forward<T>(Fun), std::forward<Args>(args)...);
   }
 
   template<class T, class ... Args>
   auto const& EASY_JIT_COMPILER_INTERFACE jit(Key &&K, T &&Fun, Args&& ... args) {
-    auto CacheEntry = CacheBase<Key>::Cache_.emplace(K, FunctionWrapperBase());
+    auto CacheIter = CacheBase<Key>::Cache_.find(K);
+    std::pair<typename CacheBase<Key>::iterator, bool> CacheEntry;
+    if(CacheIter != CacheBase<Key>::Cache_.end()) {
+      CacheEntry = std::make_pair(CacheIter, false);
+    } else {
+      CacheEntry = CacheBase<Key>::Cache_.emplace(
+          std::piecewise_construct,
+          std::forward_as_tuple(std::move(K)),
+          std::forward_as_tuple());
+    }
     return CacheBase<Key>::compile_if_not_in_cache(CacheEntry, std::forward<T>(Fun), std::forward<Args>(args)...);
   }
 
@@ -65,10 +84,17 @@ class Cache<AutoKey> : public CacheBase<AutoKey> {
   template<class T, class ... Args>
   auto const& EASY_JIT_COMPILER_INTERFACE jit(T &&Fun, Args&& ... args) {
     void* FunPtr = reinterpret_cast<void*>(meta::get_as_pointer(Fun));
-    auto CacheEntry =
-        CacheBase<Key>::Cache_.emplace(
-          Key(FunPtr, get_context_for<T, Args...>(std::forward<Args>(args)...)),
-          FunctionWrapperBase());
+    Key CacheKey(FunPtr, get_context_for<T, Args...>(std::forward<Args>(args)...));
+    auto CacheIter = CacheBase<Key>::Cache_.find(CacheKey);
+    std::pair<typename CacheBase<Key>::iterator, bool> CacheEntry;
+    if(CacheIter != CacheBase<Key>::Cache_.end()) {
+      CacheEntry = std::make_pair(CacheIter, false);
+    } else {
+      CacheEntry = CacheBase<Key>::Cache_.emplace(
+          std::piecewise_construct,
+          std::forward_as_tuple(std::move(CacheKey)),
+          std::forward_as_tuple());
+    }
     return CacheBase<Key>::compile_if_not_in_cache(CacheEntry, std::forward<T>(Fun), std::forward<Args>(args)...);
   }
 

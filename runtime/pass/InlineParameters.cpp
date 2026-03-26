@@ -102,14 +102,35 @@ void GetInlineArgs(easy::Context const &C,
         Args.push_back(PtrVal);
       } break;
 
+      case easy::ArgumentBase::AK_Array: {
+        auto const *Array = Arg.as<easy::ArrayArgument>();
+        Type* PtrTy = FHLL.Args_[i].Types_[0];
+        // With opaque pointers, discover element type from function body
+        unsigned ParamIdx = ArgInF.FirstParamIdx_ + (FHLL.StructReturn_ ? 1 : 0);
+        Type* PointeeTy = easy::FindPointeeElementType(F, ParamIdx);
+        assert(PointeeTy && "Cannot discover array element type from function body");
+        Constant* ArrayConst = easy::GetArrayConstant(DL, *Array, PointeeTy);
+        auto *GV = new GlobalVariable(*Wrapper.getParent(), ArrayConst->getType(), true,
+                                      GlobalValue::PrivateLinkage, ArrayConst,
+                                      "__easy_snapshot_array");
+        Constant* Zero = ConstantInt::get(Type::getInt32Ty(Ctx), 0);
+        Constant* Indices[] = {Zero, Zero};
+        Constant* PtrVal = ConstantExpr::getInBoundsGetElementPtr(ArrayConst->getType(), GV, Indices);
+        Args.push_back(PtrVal);
+      } break;
+
       case easy::ArgumentBase::AK_Struct: {
         auto const *Struct = Arg.as<easy::StructArgument>();
         auto &ArgInF = FHLL.Args_[i];
 
         if(ArgInF.StructByPointer_) {
-          // struct is passed trough a pointer
-          // StructType should be extracted from origin Function.
-          Type* StructType = F.getParamByValType(ArgInF.FirstParamIdx_);
+          // struct/reference is passed through a pointer-like carrier.
+          // With opaque pointers we cannot get the pointee type from the
+          // pointer type itself, so we first try byval, then scan the
+          // function body for GEP instructions that reveal the struct type.
+          unsigned ParamIdx = ArgInF.FirstParamIdx_ + (FHLL.StructReturn_ ? 1 : 0);
+          Type* StructType = easy::FindPointeeStructType(F, ParamIdx);
+          assert(StructType && "Cannot discover struct type for pointer/reference parameter");
           AllocaInst* ParamAlloc = easy::GetStructAlloc(B, DL, *Struct, StructType);
           Args.push_back(ParamAlloc);
         } else if (ArgInF.StructByArray_) {
@@ -176,8 +197,14 @@ void RemapAttributes(Function const &F, HighLevelLayout const& HLL, Function &Wr
   auto FAttributes = F.getAttributes();
 
   auto FunAttrs = FAttributes.getFnAttrs();
-  for(Attribute Attr : FunAttrs)
+  for(Attribute Attr : FunAttrs) {
+    if(Attr.getKindAsEnum() == Attribute::OptimizeNone)
+      continue;
     Wrapper.addFnAttr(Attr);
+  }
+
+  if(F.hasFnAttribute(Attribute::OptimizeNone))
+    Wrapper.addFnAttr(Attribute::NoInline);
 
   for(size_t new_arg = 0; new_arg != NewHLL.Args_.size(); ++new_arg) {
     auto const &NewArg = NewHLL.Args_[new_arg];
