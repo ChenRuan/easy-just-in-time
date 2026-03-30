@@ -1,5 +1,6 @@
-#include <easy/runtime/RuntimePasses.h>
-#include <easy/runtime/Utils.h>
+#include "internal/RuntimePassesInternal.h"
+#include "internal/UtilsInternal.h"
+#include <easy/runtime/LLVMHolderImpl.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Constant.h>
@@ -176,7 +177,8 @@ void GetInlineArgs(easy::Context const &C,
         assert(ArgInF.Types_.size() == 1);
 
         easy::Function const &Function = Arg.as<easy::ModuleArgument>()->get();
-        llvm::Module const& FunctionModule = Function.getLLVMModule();
+        auto const *HI = static_cast<easy::LLVMHolderImpl const*>(Function.getHolder());
+        llvm::Module const& FunctionModule = *HI->M_;
         auto FunctionName = easy::GetEntryFunctionName(FunctionModule);
         
         // Linking is postponed after creation of WrapperFun.

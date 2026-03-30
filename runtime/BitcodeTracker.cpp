@@ -1,6 +1,8 @@
 #include <easy/runtime/BitcodeTracker.h>
+#include "internal/BitcodeTrackerInternal.h"
 
 #include <llvm/Bitcode/BitcodeReader.h>
+#include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include <easy/exceptions.h>
@@ -45,30 +47,28 @@ std::tuple<const char*, GlobalMapping*> BitcodeTracker::getNameAndGlobalMapping(
   return std::make_tuple(InfoPtr->second.Name, InfoPtr->second.Globals);
 }
 
-std::unique_ptr<llvm::Module> BitcodeTracker::getModuleWithContext(void* FPtr, llvm::LLVMContext &C) {
-  auto InfoPtr = Functions.find(FPtr);
-  if(InfoPtr == Functions.end()) {
+// Free functions for LLVM-dependent module retrieval
+std::unique_ptr<llvm::Module> easy::BT_getModuleWithContext(BitcodeTracker& BT, void* FPtr, llvm::LLVMContext &C) {
+  auto const* Info = BT.getFunctionInfo(FPtr);
+  if(!Info) {
     throw easy::BitcodeNotRegistered();
   }
 
-  auto &Info = InfoPtr->second;
-
-  llvm::StringRef BytecodeStr(Info.Bitcode, Info.BitcodeLen);
+  llvm::StringRef BytecodeStr(Info->Bitcode, Info->BitcodeLen);
   std::unique_ptr<llvm::MemoryBuffer> Buf(llvm::MemoryBuffer::getMemBuffer(BytecodeStr));
   auto ModuleOrErr =
       llvm::parseBitcodeFile(Buf->getMemBufferRef(), C);
 
   if (ModuleOrErr.takeError()) {
-    throw easy::BitcodeParseError(Info.Name);
+    throw easy::BitcodeParseError(Info->Name);
   }
 
   return std::move(ModuleOrErr.get());
 }
 
-BitcodeTracker::ModuleContextPair BitcodeTracker::getModule(void* FPtr) {
-
+easy::ModuleContextPair easy::BT_getModule(BitcodeTracker& BT, void* FPtr) {
   std::unique_ptr<llvm::LLVMContext> Context(new llvm::LLVMContext());
-  auto Module = getModuleWithContext(FPtr, *Context);
+  auto Module = easy::BT_getModuleWithContext(BT, FPtr, *Context);
   return ModuleContextPair(std::move(Module), std::move(Context));
 }
 

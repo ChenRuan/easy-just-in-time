@@ -8,7 +8,7 @@
 
 #include <string>
 
-#include <easy/runtime/Utils.h>
+#include "internal/UtilsInternal.h"
 
 using namespace llvm;
 

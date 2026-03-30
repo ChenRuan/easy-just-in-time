@@ -1,4 +1,4 @@
-#include <easy/runtime/RuntimePasses.h>
+#include "internal/RuntimePassesInternal.h"
 
 using namespace llvm;
 using namespace easy;

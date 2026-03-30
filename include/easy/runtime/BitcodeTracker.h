@@ -1,14 +1,13 @@
 #ifndef BITCODETRACKER
 #define BITCODETRACKER
 
-#include <llvm/IR/LLVMContext.h>
-#include <llvm/IR/Module.h>
-#include <llvm/ExecutionEngine/ExecutionEngine.h>
-
 #include <easy/param.h>
 
 #include <unordered_map>
 #include <memory>
+#include <tuple>
+#include <string>
+#include <cstddef>
 
 namespace easy {
 
@@ -44,7 +43,6 @@ class BitcodeTracker {
   public:
 
   void registerFunction(void* FPtr, const char* Name, GlobalMapping* Globals, const char* Bitcode, size_t BitcodeLen) {
-    // llvm::dbgs() << "[RUNTIME] " __FILE__ ":" << __LINE__<< " Register function " << Name << "\n";
     Functions.emplace(FPtr, FunctionInfo{Name, Globals, Bitcode, BitcodeLen});
     NameToAddress.emplace(Name, FPtr);
   }
@@ -58,9 +56,11 @@ class BitcodeTracker {
   bool hasGlobalMapping(void* FPtr) const;
   LayoutInfo const & getLayoutInfo(easy::layout_id id) const;
 
-  using ModuleContextPair = std::pair<std::unique_ptr<llvm::Module>, std::unique_ptr<llvm::LLVMContext>>;
-  ModuleContextPair getModule(void* FPtr);
-  std::unique_ptr<llvm::Module> getModuleWithContext(void* FPtr, llvm::LLVMContext &C);
+  FunctionInfo const* getFunctionInfo(void* FPtr) const {
+    auto it = Functions.find(FPtr);
+    if (it == Functions.end()) return nullptr;
+    return &it->second;
+  }
 
   // get the singleton object
   static BitcodeTracker& GetTracker();

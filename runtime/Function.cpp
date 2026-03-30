@@ -1,8 +1,9 @@
 #include <easy/runtime/BitcodeTracker.h>
 #include <easy/runtime/Function.h>
-#include <easy/runtime/RuntimePasses.h>
+#include "internal/RuntimePassesInternal.h"
 #include <easy/runtime/LLVMHolderImpl.h>
-#include <easy/runtime/Utils.h>
+#include "internal/UtilsInternal.h"
+#include "internal/BitcodeTrackerInternal.h"
 #include <easy/exceptions.h>
 
 #include <llvm/Bitcode/BitcodeWriter.h>
@@ -141,10 +142,6 @@ CompileAndWrap(const char*Name, GlobalMapping* Globals,
   return std::unique_ptr<Function>(new Function(Address, std::move(Holder)));
 }
 
-llvm::Module const& Function::getLLVMModule() const {
-  return *static_cast<LLVMHolderImpl const&>(*this->Holder).M_;
-}
-
 static llvm::OptimizationLevel getOptimizationLevel(const std::pair<unsigned, unsigned> & OptLevelPair) {
   unsigned OptLevel = OptLevelPair.first;
   unsigned OptSize = OptLevelPair.second;
@@ -180,7 +177,9 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
 
   std::unique_ptr<llvm::Module> M;
   std::unique_ptr<llvm::LLVMContext> Ctx;
-  std::tie(M, Ctx) = BT.getModule(Addr);
+  auto pair = BT_getModule(BT, Addr);
+  M = std::move(pair.first);
+  Ctx = std::move(pair.second);
 
   WriteOptimizedToFile(*M, GetDumpFileWithSuffix(C.getDebugFile(), ".before"));
 

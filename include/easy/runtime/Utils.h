@@ -3,22 +3,12 @@
 
 #include <string>
 #include <memory>
-#include <llvm/ADT/StringRef.h>
-
-namespace llvm {
-  class LLVMContext;
-  class Module;
-  class Function;
-}
 
 namespace easy {
 
-llvm::StringRef GetEntryFunctionName(llvm::Module const &M);
-void MarkAsEntry(llvm::Function &F);
-void UnmarkEntry(llvm::Module &M);
-
-std::unique_ptr<llvm::Module>
-CloneModuleWithContext(llvm::Module const &LM, llvm::LLVMContext &C);
+// Internal function name retrieval — used only by libeasyjit_llvm internals.
+// Declared here for convenience but requires LLVM headers to call.
+std::string GetEntryFunctionNameStr(void const* ModulePtr);
 
 }
 

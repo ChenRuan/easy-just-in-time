@@ -3,6 +3,9 @@
 #  EasyJit_LIBRARY_DIRS - library directory needed to use easy::jit 
 #  EasyJit_LIBRARY      - library needed to use easy::jit 
 #  EasyJit_PLUGIN       - compiler plugin 
+#
+# Users only need to link -lEasyJitRuntime. LLVM is statically embedded
+# and its symbols are hidden from the public API.
 
 set(EasyJit_INCLUDE_DIRS "@CMAKE_INSTALL_PREFIX@/include")
 set(EasyJit_LIBRARY_DIRS "@CMAKE_INSTALL_PREFIX@/lib")

@@ -62,7 +62,11 @@ add_definitions(${LLVM_DEFINITIONS})
 include_directories(${LLVM_INCLUDE_DIRS})
 link_directories(${LLVM_LIBRARY_DIRS})
 include_directories(include)
-add_compile_options(-fno-rtti)
+
+# Match LLVM's RTTI setting
+if(NOT LLVM_ENABLE_RTTI)
+  add_compile_options(-fno-rtti)
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

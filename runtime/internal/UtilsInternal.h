@@ -1,0 +1,25 @@
+#ifndef UTILS_INTERNAL_H
+#define UTILS_INTERNAL_H
+
+#include <string>
+#include <memory>
+#include <llvm/ADT/StringRef.h>
+
+namespace llvm {
+  class LLVMContext;
+  class Module;
+  class Function;
+}
+
+namespace easy {
+
+llvm::StringRef GetEntryFunctionName(llvm::Module const &M);
+void MarkAsEntry(llvm::Function &F);
+void UnmarkEntry(llvm::Module &M);
+
+std::unique_ptr<llvm::Module>
+CloneModuleWithContext(llvm::Module const &LM, llvm::LLVMContext &C);
+
+}
+
+#endif

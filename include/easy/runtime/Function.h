@@ -8,10 +8,6 @@ namespace easy {
   class Function;
 }
 
-namespace llvm {
-  class Module;
-}
-
 namespace std {
   template<> struct hash<easy::Function>
   {
@@ -45,7 +41,8 @@ class Function {
 
   bool operator==(easy::Function const&) const;
 
-  llvm::Module const& getLLVMModule() const;
+  // Access to internal LLVMHolder (for internal use by libeasyjit_llvm)
+  LLVMHolder* getHolder() const { return Holder.get(); }
 
   static std::unique_ptr<Function> Compile(void *Addr, easy::Context const &C);
 

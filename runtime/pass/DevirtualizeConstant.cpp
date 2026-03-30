@@ -1,5 +1,6 @@
-#include <easy/runtime/RuntimePasses.h>
+#include "internal/RuntimePassesInternal.h"
 #include <easy/runtime/BitcodeTracker.h>
+#include "internal/BitcodeTrackerInternal.h"
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Constant.h>
@@ -46,7 +47,7 @@ static Function* findFunctionAndLinkModules(Module& M, void* HostValue) {
     if(!FName)
       return nullptr;
 
-    std::unique_ptr<Module> LM = BT.getModuleWithContext(HostValue, M.getContext());
+    std::unique_ptr<Module> LM = easy::BT_getModuleWithContext(BT, HostValue, M.getContext());
 
     if(!Linker::linkModules(M, std::move(LM), Linker::OverrideFromSrc,
                             [](Module &, const StringSet<> &){}))

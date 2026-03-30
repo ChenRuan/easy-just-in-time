@@ -1,6 +1,8 @@
 #include "InlineParametersHelper.h"
-#include "easy/runtime/Utils.h"
+#include "internal/UtilsInternal.h"
 #include <easy/runtime/BitcodeTracker.h>
+#include "internal/BitcodeTrackerInternal.h"
+#include <easy/runtime/LLVMHolderImpl.h>
 
 #include <llvm/Linker/Linker.h>
 #include <llvm/IR/InstIterator.h>
@@ -131,15 +133,16 @@ bool easy::LinkAndUpdateSymbol(llvm::Module &M, llvm::StringRef FName, llvm::Str
         Constant* PtrVal = GetScalarArgument(Arg, PointerType::getUnqual(M.getContext()));
         void * PtrValue = const_cast<void*>(Ptr->get());
         if(BT.hasGlobalMapping(PtrValue)) {
-          std::unique_ptr<Module> LM = BT.getModuleWithContext(PtrValue, M.getContext());
+          std::unique_ptr<Module> LM = easy::BT_getModuleWithContext(BT, PtrValue, M.getContext());
           ModulesToLink.push_back(std::move(LM));
         }
       } break;
       case easy::ArgumentBase::AK_Module: {
         easy::Function const &Function = Arg.as<easy::ModuleArgument>()->get();
-        auto const &Module = Function.getLLVMModule();
+        auto const *HI = static_cast<easy::LLVMHolderImpl const*>(Function.getHolder());
+        llvm::Module const &FunctionModule = *HI->M_;
         std::unique_ptr<llvm::Module> LM = 
-          easy::CloneModuleWithContext(Module, M.getContext());
+          easy::CloneModuleWithContext(FunctionModule, M.getContext());
         assert(LM);
         easy::UnmarkEntry(*LM);
         ModulesToLink.push_back(std::move(LM));
