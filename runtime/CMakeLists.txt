@@ -44,6 +44,7 @@ file(WRITE ${VERSION_SCRIPT} "{
   global:
     easy_register;
     easy_register_layout;
+    easyjit_*;
     extern \"C++\" {
       easy::Function::*;
       easy::Context::*;

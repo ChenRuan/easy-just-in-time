@@ -195,6 +195,16 @@ easyjit_error_t easyjit_context_set_struct(easyjit_context_t ctx,
 }
 
 extern "C"
+easyjit_error_t easyjit_context_set_snapshot(easyjit_context_t ctx,
+                                              const void* data,
+                                              size_t size) {
+    /* Snapshot is semantically identical to set_struct — the struct bytes
+     * are serialized into the context and become compile-time constants.
+     * This naming matches the C++ easy::snapshot() API. */
+    return easyjit_context_set_struct(ctx, data, size);
+}
+
+extern "C"
 easyjit_error_t easyjit_context_set_opt_level(easyjit_context_t ctx,
                                                unsigned opt_level,
                                                unsigned opt_size) {
