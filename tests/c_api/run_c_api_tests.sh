@@ -10,6 +10,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 EASYJIT_SRC="${SCRIPT_DIR}/../.."
+INCLUDE_BENCHMARKS="${INCLUDE_BENCHMARKS:-0}"
 
 # Default paths — adjust if your layout differs
 LLVM_BUILD="${1:-${EASYJIT_SRC}/../build}"
@@ -43,6 +44,20 @@ fi
 OUTDIR="${SCRIPT_DIR}/output"
 mkdir -p "${OUTDIR}"
 
+should_skip() {
+    local src="$1"
+    local base
+    base="$(basename "$src")"
+    case "$base" in
+        config_process_base.c|config_process_easyjit.c)
+            [ "$INCLUDE_BENCHMARKS" = "1" ] && return 1 || return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 run_test() {
     local src="$1"
     local name="$(basename "$src" .c)"
@@ -63,6 +78,10 @@ run_test() {
 
 for src in "${SCRIPT_DIR}"/*.c; do
     if [ -f "$src" ]; then
+        if should_skip "$src"; then
+            echo "--- Skipping $(basename "$src") (set INCLUDE_BENCHMARKS=1 to include) ---"
+            continue
+        fi
         run_test "$src"
     fi
 done

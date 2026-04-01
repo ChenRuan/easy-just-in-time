@@ -13,6 +13,8 @@
 | `easy-jit/tests/c_api/add_int.c` | Minimal test: specialize `add(a,b)` → `inc(a)` |
 | `easy-jit/tests/c_api/cache_example.c` | Cache test: compile-once, reuse on repeated keys |
 | `easy-jit/tests/c_api/wireless_beamform.c` | Wireless-style test: beamforming kernel with n_ant/n_sub specialized |
+| `easy-jit/tests/c_api/config_process_base.c` | Baseline C benchmark for a config-processing loop |
+| `easy-jit/tests/c_api/config_process_easyjit.c` | Best-path C API benchmark using snapshot + raw function pointers |
 | `easy-jit/tests/c_api/run_c_api_tests.sh` | One-command build & run script for all C API tests |
 
 ### Modified files
@@ -111,3 +113,12 @@ The user-side C code needs only:
 5. **Symbol export control**: Currently all C API symbols are exported simply because they have `extern "C"` linkage and the shared library doesn't use a version script. For production, a `.map` file or `__attribute__((visibility("default")))` should be used.
 
 6. **wireless/ integration**: Once the actual `wireless/` directory exists with real examples, they should be adaptable using the pattern demonstrated in `wireless_beamform.c` — mark kernels with `EASY_JIT_EXPOSE`, create contexts, bind parameters, and compile.
+
+## Benchmark note
+
+`config_process_base.c` and `config_process_easyjit.c` are larger performance examples.
+They are intentionally skipped by `run_c_api_tests.sh` unless you set:
+
+```bash
+INCLUDE_BENCHMARKS=1 ./run_c_api_tests.sh <LLVM_BUILD_DIR> <EASYJIT_BUILD_DIR>
+```
