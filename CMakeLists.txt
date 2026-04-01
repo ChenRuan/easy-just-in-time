@@ -36,7 +36,7 @@ endif()
 
 if(EASY_JIT_STANDALONE_BUILD)
   # We need a pre-built/installed version of LLVM.
-  find_package(LLVM 19.1 REQUIRED HINTS ${LLVM_DIR})
+  find_package(LLVM REQUIRED HINTS ${LLVM_DIR})
   message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
   message(STATUS "Using LLVMConfig.cmake in ${LLVM_DIR}")
   message(STATUS "LLVM Root: ${LLVM_TOOLS_BINARY_DIR}")

@@ -16,7 +16,8 @@ llvm::PassPluginLibraryInfo getEasyJitPassPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "RegisterBitcode", LLVM_VERSION_STRING,
           [](PassBuilder &PB) {
             PB.registerPipelineEarlySimplificationEPCallback(
-                [](llvm::ModulePassManager &PM, llvm::OptimizationLevel) {
+                [](llvm::ModulePassManager &PM, llvm::OptimizationLevel,
+                   llvm::ThinOrFullLTOPhase) {
                   easy::registerLayoutPass(PM);
                   easy::registerBitcodePass(PM);
                 });

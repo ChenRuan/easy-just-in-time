@@ -13,6 +13,8 @@
 #include <llvm/Support/Path.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/Passes/PassBuilder.h>
+#include <llvm/ExecutionEngine/Orc/LLJIT.h>
+#include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
 
 #ifdef NDEBUG
 #include <llvm/IR/Verifier.h>
@@ -31,8 +33,18 @@ Function::Function(void* Addr, std::unique_ptr<LLVMHolder> H)
 }
 
 static std::unique_ptr<llvm::TargetMachine> GetHostTargetMachine() {
-  std::unique_ptr<llvm::TargetMachine> TM(llvm::EngineBuilder().selectTarget());
-  return TM;
+  auto JTMB = llvm::orc::JITTargetMachineBuilder::detectHost();
+  if (!JTMB) {
+    llvm::consumeError(JTMB.takeError());
+    return nullptr;
+  }
+  JTMB->setCodeGenOptLevel(llvm::CodeGenOptLevel::Aggressive);
+  auto TM = JTMB->createTargetMachine();
+  if (!TM) {
+    llvm::consumeError(TM.takeError());
+    return nullptr;
+  }
+  return std::move(*TM);
 }
 
 static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, llvm::OptimizationLevel OptLevel) {
@@ -70,29 +82,37 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
   MPM.run(M, MAM);
 }
 
-static std::unique_ptr<llvm::ExecutionEngine> GetEngine(std::unique_ptr<llvm::Module> M, const char *Name) {
-  llvm::EngineBuilder ebuilder(std::move(M));
-  std::string eeError;
-
-  std::unique_ptr<llvm::ExecutionEngine> EE(ebuilder.setErrorStr(&eeError)
-          .setMCPU(llvm::sys::getHostCPUName())
-          .setEngineKind(llvm::EngineKind::JIT)
-          .setOptLevel(llvm::CodeGenOptLevel::Aggressive)
-          .create());
-
-  if(!EE) {
-    throw easy::ExecutionEngineCreateError(Name);
+static std::unique_ptr<llvm::orc::LLJIT> CreateLLJIT() {
+  auto Builder = llvm::orc::LLJITBuilder();
+  auto JIT = Builder.create();
+  if (!JIT) {
+    llvm::consumeError(JIT.takeError());
+    return nullptr;
   }
-
-  return EE;
+  return std::move(*JIT);
 }
 
-static void MapGlobals(llvm::ExecutionEngine& EE, GlobalMapping* Globals) {
+static void MapGlobals(llvm::orc::LLJIT& JIT, GlobalMapping* Globals) {
+  llvm::orc::SymbolMap SymMap;
+  auto &ES = JIT.getExecutionSession();
   for(GlobalMapping *GM = Globals; GM->Name; ++GM) {
-    EE.addGlobalMapping(GM->Name, (uint64_t)GM->Address);
+    SymMap[ES.intern(GM->Name)] = {
+      llvm::orc::ExecutorAddr::fromPtr((void*)GM->Address),
+      llvm::JITSymbolFlags::Exported
+    };
   }
-  EE.addGlobalMapping("__dso_handle", (uint64_t)&EE);
-  EE.finalizeObject();
+  // Also map __dso_handle
+  SymMap[ES.intern("__dso_handle")] = {
+    llvm::orc::ExecutorAddr::fromPtr((void*)&JIT),
+    llvm::JITSymbolFlags::Exported
+  };
+
+  if (!SymMap.empty()) {
+    if (auto Err = JIT.getMainJITDylib().define(
+            llvm::orc::absoluteSymbols(std::move(SymMap)))) {
+      llvm::consumeError(std::move(Err));
+    }
+  }
 }
 
 static void WriteOptimizedToFile(llvm::Module const &M, std::string const& File) {
@@ -129,16 +149,57 @@ CompileAndWrap(const char*Name, GlobalMapping* Globals,
                std::unique_ptr<llvm::LLVMContext> Ctx,
                std::unique_ptr<llvm::Module> M) {
 
-  llvm::Module* MPtr = M.get();
-  std::unique_ptr<llvm::ExecutionEngine> EE = GetEngine(std::move(M), Name);
+  // Snapshot the optimized bitcode before ORC takes ownership of the Module
+  std::string BitcodeBuf;
+  {
+    llvm::raw_string_ostream BOS(BitcodeBuf);
+    llvm::WriteBitcodeToFile(*M, BOS);
+  }
+  uintptr_t ModuleId = reinterpret_cast<uintptr_t>(M.get());
 
-  if(Globals) {
-    MapGlobals(*EE, Globals);
+  auto JIT = CreateLLJIT();
+  if (!JIT) {
+    throw easy::ExecutionEngineCreateError(Name);
   }
 
-  void *Address = (void*)EE->getFunctionAddress(Name);
+  // Register process symbols so JIT'd code can call back into the host
+  auto &ES = JIT->getExecutionSession();
+  auto &DL = JIT->getDataLayout();
+  auto ProcessSymbolsGenerator =
+      llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+          DL.getGlobalPrefix());
+  if (ProcessSymbolsGenerator) {
+    JIT->getMainJITDylib().addGenerator(std::move(*ProcessSymbolsGenerator));
+  } else {
+    llvm::consumeError(ProcessSymbolsGenerator.takeError());
+  }
 
-  std::unique_ptr<LLVMHolder> Holder(new easy::LLVMHolderImpl{std::move(EE), std::move(Ctx), MPtr});
+  if(Globals) {
+    MapGlobals(*JIT, Globals);
+  }
+
+  // Wrap module + context in ThreadSafeModule and add to JIT
+  auto TSM = llvm::orc::ThreadSafeModule(std::move(M), std::move(Ctx));
+  if (auto Err = JIT->addIRModule(std::move(TSM))) {
+    llvm::consumeError(std::move(Err));
+    throw easy::ExecutionEngineCreateError(Name);
+  }
+
+  // Look up the compiled function
+  auto Sym = JIT->lookup(Name);
+  if (!Sym) {
+    llvm::consumeError(Sym.takeError());
+    throw easy::ExecutionEngineCreateError(Name);
+  }
+
+  void *Address = Sym->toPtr<void*>();
+
+  // Create a new context for the holder (the original was consumed by ThreadSafeModule)
+  std::unique_ptr<llvm::LLVMContext> HolderCtx(new llvm::LLVMContext());
+
+  std::unique_ptr<LLVMHolder> Holder(new easy::LLVMHolderImpl{
+      std::move(JIT), std::move(HolderCtx),
+      std::move(BitcodeBuf), ModuleId});
   return std::unique_ptr<Function>(new Function(Address, std::move(Holder)));
 }
 
@@ -194,14 +255,8 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
 }
 
 void easy::Function::serialize(std::ostream& os) const {
-  std::string buf;
-  llvm::raw_string_ostream stream(buf);
-
   LLVMHolderImpl const *H = reinterpret_cast<LLVMHolderImpl const*>(Holder.get());
-  llvm::WriteBitcodeToFile(*H->M_, stream);
-  stream.flush();
-
-  os << buf;
+  os << H->SerializedBitcode_;
 }
 
 std::unique_ptr<easy::Function> easy::Function::deserialize(std::istream& is) {
@@ -232,11 +287,11 @@ std::unique_ptr<easy::Function> easy::Function::deserialize(std::istream& is) {
 bool Function::operator==(easy::Function const& other) const {
   LLVMHolderImpl& This = static_cast<LLVMHolderImpl&>(*this->Holder);
   LLVMHolderImpl& Other = static_cast<LLVMHolderImpl&>(*other.Holder);
-  return This.M_ == Other.M_;
+  return This.ModuleId_ == Other.ModuleId_;
 }
 
 std::hash<easy::Function>::result_type
 std::hash<easy::Function>::operator()(argument_type const& F) const noexcept {
   LLVMHolderImpl& This = static_cast<LLVMHolderImpl&>(*F.Holder);
-  return std::hash<llvm::Module*>{}(This.M_);
+  return std::hash<uintptr_t>{}(This.ModuleId_);
 }

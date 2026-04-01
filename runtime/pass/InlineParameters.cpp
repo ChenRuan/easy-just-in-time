@@ -178,7 +178,11 @@ void GetInlineArgs(easy::Context const &C,
 
         easy::Function const &Function = Arg.as<easy::ModuleArgument>()->get();
         auto const *HI = static_cast<easy::LLVMHolderImpl const*>(Function.getHolder());
-        llvm::Module const& FunctionModule = *HI->M_;
+        // Reconstruct Module from cached bitcode (ORC consumed the original)
+        auto TmpCtx = std::make_unique<llvm::LLVMContext>();
+        auto FunctionModulePtr = HI->getModuleFromBitcode(*TmpCtx);
+        assert(FunctionModulePtr && "Failed to reconstruct module from bitcode");
+        llvm::Module const& FunctionModule = *FunctionModulePtr;
         auto FunctionName = easy::GetEntryFunctionName(FunctionModule);
         
         // Linking is postponed after creation of WrapperFun.

@@ -3,12 +3,13 @@
 
 # Map LLVM component names to library targets
 llvm_map_components_to_libnames(LLVM_LIBS
-  core codegen interpreter support mcjit native
+  core codegen interpreter support native
   executionengine passes objcarcopts
   linker bitreader bitwriter ipo
   asmparser asmprinter
   selectiondag
   target
+  orcjit orcshared orctargetprocess
 )
 
 # Build the single user-facing library

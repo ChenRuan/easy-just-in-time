@@ -140,9 +140,11 @@ bool easy::LinkAndUpdateSymbol(llvm::Module &M, llvm::StringRef FName, llvm::Str
       case easy::ArgumentBase::AK_Module: {
         easy::Function const &Function = Arg.as<easy::ModuleArgument>()->get();
         auto const *HI = static_cast<easy::LLVMHolderImpl const*>(Function.getHolder());
-        llvm::Module const &FunctionModule = *HI->M_;
+        // Reconstruct Module from cached bitcode using M's context for linking
+        auto ReconstructedModule = HI->getModuleFromBitcode(M.getContext());
+        assert(ReconstructedModule && "Failed to reconstruct module from bitcode");
         std::unique_ptr<llvm::Module> LM = 
-          easy::CloneModuleWithContext(FunctionModule, M.getContext());
+          easy::CloneModuleWithContext(*ReconstructedModule, M.getContext());
         assert(LM);
         easy::UnmarkEntry(*LM);
         ModulesToLink.push_back(std::move(LM));
