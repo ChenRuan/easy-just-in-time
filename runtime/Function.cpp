@@ -12,7 +12,7 @@
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/Support/Host.h> 
 #include <llvm/Target/TargetMachine.h> 
-#include <llvm/Support/TargetRegistry.h> 
+#include <llvm/MC/TargetRegistry.h>
 #include <llvm/Analysis/TargetTransformInfo.h> 
 #include <llvm/Analysis/TargetLibraryInfo.h> 
 #include <llvm/Support/FileSystem.h>
@@ -104,23 +104,6 @@ static void WriteOptimizedToFile(llvm::Module const &M, std::string const& File)
     throw CouldNotOpenFile(Error.message());
 
   Out << M;
-}
-
-static std::string GetDumpFileWithSuffix(std::string File, llvm::StringRef Suffix) {
-  if(File.empty())
-    return File;
-  llvm::SmallString<256> Path(File);
-  llvm::StringRef Extension = llvm::sys::path::extension(Path);
-  if(Extension.empty()) {
-    Path += Suffix;
-  } else {
-    llvm::SmallString<256> Stem(Path);
-    Stem.resize(Stem.size() - Extension.size());
-    Stem += Suffix;
-    Stem += Extension;
-    Path = Stem;
-  }
-  return std::string(Path.str());
 }
 
 static std::string GetDumpFileWithSuffix(std::string File, llvm::StringRef Suffix) {

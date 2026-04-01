@@ -6,6 +6,10 @@
 #include <easy/runtime/Function.h>
 #include <easy/meta.h>
 
+#ifndef _MSC_VER
+#define __cdecl
+#endif
+
 namespace easy {
 
 class FunctionWrapperBase {

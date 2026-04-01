@@ -123,15 +123,10 @@ void GetInlineArgs(easy::Context const &C,
         auto &ArgInF = FHLL.Args_[i];
 
         if(ArgInF.StructByPointer_) {
-          // Prefer the direct pointee type on LLVM 15, but fall back to
-          // instruction scanning so the same code also works for ref-like cases.
-          Type* StructType = nullptr;
-          if (ArgInF.Types_[0]->isPointerTy())
-            StructType = ArgInF.Types_[0]->getPointerElementType();
-          if (!StructType) {
-            unsigned ParamIdx = ArgInF.FirstParamIdx_ + (FHLL.StructReturn_ ? 1 : 0);
-            StructType = easy::FindPointeeStructType(F, ParamIdx);
-          }
+          // For reference/pointer carriers, infer the pointee struct from the
+          // function body instead of relying on pointer element types.
+          unsigned ParamIdx = ArgInF.FirstParamIdx_ + (FHLL.StructReturn_ ? 1 : 0);
+          Type* StructType = easy::FindPointeeStructType(F, ParamIdx);
           assert(StructType && "Cannot discover struct type for pointer/reference parameter");
           AllocaInst* ParamAlloc = easy::GetStructAlloc(B, DL, *Struct, StructType);
           Args.push_back(ParamAlloc);

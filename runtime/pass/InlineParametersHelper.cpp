@@ -200,7 +200,7 @@ size_t StoreStructField(llvm::IRBuilder<> &B,
     size_t StoreSize;
     std::tie(FieldValue, StoreSize) = easy::GetConstantFromRaw(DL, Ty, (uint8_t const*)Raw);
 
-    Value* FieldPtr = B.CreateGEP(nullptr, Alloc, GEP, "field.gep");
+    Value* FieldPtr = B.CreateGEP(Alloc->getAllocatedType(), Alloc, GEP, "field.gep");
     B.CreateStore(FieldValue, FieldPtr);
     return StoreSize;
   }
@@ -209,8 +209,7 @@ size_t StoreStructField(llvm::IRBuilder<> &B,
 llvm::AllocaInst* easy::GetStructAlloc(llvm::IRBuilder<> &B,
                                        llvm::DataLayout const &DL,
                                        easy::StructArgument const &Struct,
-                                       llvm::Type* StructPtrTy) {
-  Type* StructTy = StructPtrTy->getContainedType(0);
+                                       llvm::Type* StructTy) {
   AllocaInst* Alloc = B.CreateAlloca(StructTy);
   B.CreateStore(Constant::getNullValue(StructTy), Alloc);
 

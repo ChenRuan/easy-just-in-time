@@ -32,6 +32,12 @@ struct HighLevelLayout {
   HighLevelLayout(easy::Context const& C, llvm::Function &F);
 };
 
+struct PostLinkageSymbol {
+  llvm::StringRef Name;
+  ArgumentBase::ArgumentKind Kind;
+  size_t ArgNo;
+};
+
 llvm::SmallVector<llvm::Value*, 4> GetForwardArgs(easy::HighLevelLayout::HighLevelArg &ArgInF, easy::HighLevelLayout &FHLL,
                                                   llvm::Function &Wrapper, easy::HighLevelLayout &WrapperHLL);
 llvm::Constant* GetScalarArgument(easy::ArgumentBase const& Arg, llvm::Type* T);
