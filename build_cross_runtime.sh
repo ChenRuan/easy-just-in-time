@@ -27,7 +27,7 @@ Builds target-side libEasyJitRuntime.so.
 Required:
   --target <triple>          Target triple, e.g. aarch64_be-linux-gnu
   --sysroot <path>           Target sysroot
-  --target-llvm-dir <path>   Target LLVM CMake dir
+  --target-llvm-dir <path>   Target LLVM CMake dir, or an LLVM install/build root
   --host-llvm-build <path>   Host LLVM build dir containing clang/clang++
 
 Optional:
@@ -41,7 +41,7 @@ Example:
   ./build_cross_runtime.sh \
     --target aarch64_be-linux-gnu \
     --sysroot /opt/sdk/sysroot \
-    --target-llvm-dir /opt/llvm15-aarch64be/lib/cmake/llvm \
+    --target-llvm-dir /opt/llvm15-aarch64be \
     --host-llvm-build /opt/llvm15-host/build-host
 EOF
 }
@@ -49,6 +49,30 @@ EOF
 die() {
   echo "error: $*" >&2
   exit 1
+}
+
+resolve_llvm_dir() {
+  local candidate="$1"
+  if [[ -z "$candidate" ]]; then
+    return 1
+  fi
+
+  if [[ -f "$candidate/LLVMConfig.cmake" ]]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  if [[ -f "$candidate/lib/cmake/llvm/LLVMConfig.cmake" ]]; then
+    printf '%s\n' "$candidate/lib/cmake/llvm"
+    return 0
+  fi
+
+  if [[ -f "$candidate/lib64/cmake/llvm/LLVMConfig.cmake" ]]; then
+    printf '%s\n' "$candidate/lib64/cmake/llvm"
+    return 0
+  fi
+
+  return 1
 }
 
 while [[ $# -gt 0 ]]; do
@@ -75,8 +99,10 @@ HOST_CLANG="$HOST_LLVM_BUILD/bin/clang"
 HOST_CLANGXX="$HOST_LLVM_BUILD/bin/clang++"
 [[ -x "$HOST_CLANG" ]] || die "host clang not found: $HOST_CLANG"
 [[ -x "$HOST_CLANGXX" ]] || die "host clang++ not found: $HOST_CLANGXX"
-[[ -d "$TARGET_LLVM_DIR" ]] || die "target LLVM_DIR not found: $TARGET_LLVM_DIR"
 [[ -d "$SYSROOT" ]] || die "sysroot not found: $SYSROOT"
+
+TARGET_LLVM_DIR=$(resolve_llvm_dir "$TARGET_LLVM_DIR" || true)
+[[ -n "$TARGET_LLVM_DIR" ]] || die "could not resolve target LLVM dir; pass a directory containing LLVMConfig.cmake, or an LLVM root with lib/cmake/llvm or lib64/cmake/llvm"
 
 if [[ -z "$BUILD_DIR" ]]; then
   SANITIZED_TARGET=${TARGET_TRIPLE//[^A-Za-z0-9._-]/_}
