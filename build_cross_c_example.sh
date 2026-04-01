@@ -14,6 +14,8 @@ TARGET_CPU=""
 GCC_TOOLCHAIN=""
 EXTRA_CFLAGS=""
 EXTRA_LDFLAGS=""
+GCC_BIN_DIR=""
+GCC_LIB_DIR=""
 
 usage() {
   cat <<'EOF'
@@ -40,7 +42,9 @@ Required:
 
 Optional:
   --target-cpu <cpu>         Optional -mcpu
-  --gcc-toolchain <path>     GCC toolchain root for crt objects and libgcc
+  --gcc-toolchain <path>     GCC toolchain root; script derives bin/lib paths
+  --gcc-bin-dir <path>       Explicit GCC bin dir for -B
+  --gcc-lib-dir <path>       Explicit GCC libgcc dir for -L/-B
   --extra-cflags <flags>     Extra target C compiler flags
   --extra-ldflags <flags>    Extra target linker flags
   -h, --help                 Show this help
@@ -63,6 +67,32 @@ die() {
   exit 1
 }
 
+resolve_gcc_bin_dir() {
+  local root="$1"
+  local target="$2"
+  local candidate
+  for candidate in "$root/bin" "$root/usr/bin"; do
+    if [[ -x "$candidate/${target}-gcc" ]] || [[ -x "$candidate/${target}-ld" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+resolve_gcc_lib_dir() {
+  local root="$1"
+  local target="$2"
+  local candidate
+  while IFS= read -r candidate; do
+    if [[ -f "$candidate/libgcc.a" ]] || [[ -f "$candidate/libgcc_s.so" ]] || [[ -f "$candidate/crtbeginS.o" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done < <(find "$root" -type d \( -path "*/lib/gcc/$target/*" -o -path "*/lib64/gcc/$target/*" \) 2>/dev/null | sort)
+  return 1
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --target) TARGET_TRIPLE="$2"; shift 2 ;;
@@ -74,6 +104,8 @@ while [[ $# -gt 0 ]]; do
     --output) OUTPUT_FILE="$2"; shift 2 ;;
     --target-cpu) TARGET_CPU="$2"; shift 2 ;;
     --gcc-toolchain) GCC_TOOLCHAIN="$2"; shift 2 ;;
+    --gcc-bin-dir) GCC_BIN_DIR="$2"; shift 2 ;;
+    --gcc-lib-dir) GCC_LIB_DIR="$2"; shift 2 ;;
     --extra-cflags) EXTRA_CFLAGS="$2"; shift 2 ;;
     --extra-ldflags) EXTRA_LDFLAGS="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -123,7 +155,18 @@ if [[ -n "$TARGET_CPU" ]]; then
   COMMON_FLAGS+=("-mcpu=$TARGET_CPU")
 fi
 if [[ -n "$GCC_TOOLCHAIN" ]]; then
-  COMMON_FLAGS+=("--gcc-toolchain=$GCC_TOOLCHAIN")
+  if [[ -z "$GCC_BIN_DIR" ]]; then
+    GCC_BIN_DIR="$(resolve_gcc_bin_dir "$GCC_TOOLCHAIN" "$TARGET_TRIPLE" || true)"
+  fi
+  if [[ -z "$GCC_LIB_DIR" ]]; then
+    GCC_LIB_DIR="$(resolve_gcc_lib_dir "$GCC_TOOLCHAIN" "$TARGET_TRIPLE" || true)"
+  fi
+fi
+if [[ -n "$GCC_BIN_DIR" ]]; then
+  COMMON_FLAGS+=("-B$GCC_BIN_DIR")
+fi
+if [[ -n "$GCC_LIB_DIR" ]]; then
+  COMMON_FLAGS+=("-B$GCC_LIB_DIR" "-L$GCC_LIB_DIR")
 fi
 if [[ -n "$EXTRA_CFLAGS" ]]; then
   # shellcheck disable=SC2206
@@ -144,6 +187,12 @@ echo "  host_llvm_build = $HOST_LLVM_BUILD"
 echo "  host_easyjit    = $HOST_EASYJIT_DIR"
 if [[ -n "$GCC_TOOLCHAIN" ]]; then
   echo "  gcc_toolchain   = $GCC_TOOLCHAIN"
+fi
+if [[ -n "$GCC_BIN_DIR" ]]; then
+  echo "  gcc_bin_dir     = $GCC_BIN_DIR"
+fi
+if [[ -n "$GCC_LIB_DIR" ]]; then
+  echo "  gcc_lib_dir     = $GCC_LIB_DIR"
 fi
 echo "  runtime_so      = $RUNTIME_SO"
 echo "  source          = $SOURCE_FILE"

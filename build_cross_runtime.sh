@@ -15,6 +15,8 @@ GCC_TOOLCHAIN=""
 EXTRA_CFLAGS=""
 EXTRA_CXXFLAGS=""
 EXTRA_LDFLAGS=""
+GCC_BIN_DIR=""
+GCC_LIB_DIR=""
 
 usage() {
   cat <<'EOF'
@@ -37,7 +39,9 @@ Required:
 Optional:
   --build-dir <path>         Output build dir, default: ./build-cross-runtime-<sanitized-target>
   --target-cpu <cpu>         Optional -mcpu
-  --gcc-toolchain <path>     GCC toolchain root for crt objects and libgcc
+  --gcc-toolchain <path>     GCC toolchain root; script derives bin/lib paths
+  --gcc-bin-dir <path>       Explicit GCC bin dir for -B
+  --gcc-lib-dir <path>       Explicit GCC libgcc dir for -L/-B
   --extra-cflags <flags>     Extra target C compiler flags
   --extra-cxxflags <flags>   Extra target C++ compiler flags
   --extra-ldflags <flags>    Extra target linker flags
@@ -58,6 +62,32 @@ EOF
 die() {
   echo "error: $*" >&2
   exit 1
+}
+
+resolve_gcc_bin_dir() {
+  local root="$1"
+  local target="$2"
+  local candidate
+  for candidate in "$root/bin" "$root/usr/bin"; do
+    if [[ -x "$candidate/${target}-gcc" ]] || [[ -x "$candidate/${target}-ld" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+resolve_gcc_lib_dir() {
+  local root="$1"
+  local target="$2"
+  local candidate
+  while IFS= read -r candidate; do
+    if [[ -f "$candidate/libgcc.a" ]] || [[ -f "$candidate/libgcc_s.so" ]] || [[ -f "$candidate/crtbeginS.o" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done < <(find "$root" -type d \( -path "*/lib/gcc/$target/*" -o -path "*/lib64/gcc/$target/*" \) 2>/dev/null | sort)
+  return 1
 }
 
 resolve_llvm_dir() {
@@ -93,6 +123,8 @@ while [[ $# -gt 0 ]]; do
     --build-dir) BUILD_DIR="$2"; shift 2 ;;
     --target-cpu) TARGET_CPU="$2"; shift 2 ;;
     --gcc-toolchain) GCC_TOOLCHAIN="$2"; shift 2 ;;
+    --gcc-bin-dir) GCC_BIN_DIR="$2"; shift 2 ;;
+    --gcc-lib-dir) GCC_LIB_DIR="$2"; shift 2 ;;
     --extra-cflags) EXTRA_CFLAGS="$2"; shift 2 ;;
     --extra-cxxflags) EXTRA_CXXFLAGS="$2"; shift 2 ;;
     --extra-ldflags) EXTRA_LDFLAGS="$2"; shift 2 ;;
@@ -133,6 +165,12 @@ echo "  host_llvm_build = $HOST_LLVM_BUILD"
 if [[ -n "$GCC_TOOLCHAIN" ]]; then
   echo "  gcc_toolchain   = $GCC_TOOLCHAIN"
 fi
+if [[ -n "$GCC_BIN_DIR" ]]; then
+  echo "  gcc_bin_dir     = $GCC_BIN_DIR"
+fi
+if [[ -n "$GCC_LIB_DIR" ]]; then
+  echo "  gcc_lib_dir     = $GCC_LIB_DIR"
+fi
 echo "  build_dir       = $BUILD_DIR"
 echo
 
@@ -146,10 +184,22 @@ if [[ -n "$TARGET_CPU" ]]; then
   CXX_FLAGS="-mcpu=$TARGET_CPU"
 fi
 if [[ -n "$GCC_TOOLCHAIN" ]]; then
-  C_FLAGS="${C_FLAGS:+$C_FLAGS }--gcc-toolchain=$GCC_TOOLCHAIN"
-  CXX_FLAGS="${CXX_FLAGS:+$CXX_FLAGS }--gcc-toolchain=$GCC_TOOLCHAIN"
-  EXE_LINKER_FLAGS="${EXE_LINKER_FLAGS:+$EXE_LINKER_FLAGS }--gcc-toolchain=$GCC_TOOLCHAIN"
-  SHARED_LINKER_FLAGS="${SHARED_LINKER_FLAGS:+$SHARED_LINKER_FLAGS }--gcc-toolchain=$GCC_TOOLCHAIN"
+  if [[ -z "$GCC_BIN_DIR" ]]; then
+    GCC_BIN_DIR="$(resolve_gcc_bin_dir "$GCC_TOOLCHAIN" "$TARGET_TRIPLE" || true)"
+  fi
+  if [[ -z "$GCC_LIB_DIR" ]]; then
+    GCC_LIB_DIR="$(resolve_gcc_lib_dir "$GCC_TOOLCHAIN" "$TARGET_TRIPLE" || true)"
+  fi
+fi
+if [[ -n "$GCC_BIN_DIR" ]]; then
+  EXE_LINKER_FLAGS="${EXE_LINKER_FLAGS:+$EXE_LINKER_FLAGS }-B$GCC_BIN_DIR"
+  SHARED_LINKER_FLAGS="${SHARED_LINKER_FLAGS:+$SHARED_LINKER_FLAGS }-B$GCC_BIN_DIR"
+fi
+if [[ -n "$GCC_LIB_DIR" ]]; then
+  C_FLAGS="${C_FLAGS:+$C_FLAGS }-B$GCC_LIB_DIR"
+  CXX_FLAGS="${CXX_FLAGS:+$CXX_FLAGS }-B$GCC_LIB_DIR"
+  EXE_LINKER_FLAGS="${EXE_LINKER_FLAGS:+$EXE_LINKER_FLAGS }-B$GCC_LIB_DIR -L$GCC_LIB_DIR"
+  SHARED_LINKER_FLAGS="${SHARED_LINKER_FLAGS:+$SHARED_LINKER_FLAGS }-B$GCC_LIB_DIR -L$GCC_LIB_DIR"
 fi
 if [[ -n "$EXTRA_CFLAGS" ]]; then
   C_FLAGS="${C_FLAGS:+$C_FLAGS }$EXTRA_CFLAGS"
