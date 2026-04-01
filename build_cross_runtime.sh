@@ -11,6 +11,10 @@ BUILD_DIR=""
 CMAKE_BUILD_TYPE="Release"
 JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)}"
 TARGET_CPU=""
+GCC_TOOLCHAIN=""
+EXTRA_CFLAGS=""
+EXTRA_CXXFLAGS=""
+EXTRA_LDFLAGS=""
 
 usage() {
   cat <<'EOF'
@@ -33,6 +37,10 @@ Required:
 Optional:
   --build-dir <path>         Output build dir, default: ./build-cross-runtime-<sanitized-target>
   --target-cpu <cpu>         Optional -mcpu
+  --gcc-toolchain <path>     GCC toolchain root for crt objects and libgcc
+  --extra-cflags <flags>     Extra target C compiler flags
+  --extra-cxxflags <flags>   Extra target C++ compiler flags
+  --extra-ldflags <flags>    Extra target linker flags
   --build-type <type>        CMake build type, default: Release
   --jobs <n>                 Parallel jobs
   -h, --help                 Show this help
@@ -42,7 +50,8 @@ Example:
     --target aarch64_be-linux-gnu \
     --sysroot /opt/sdk/sysroot \
     --target-llvm-dir /opt/llvm15-aarch64be \
-    --host-llvm-build /opt/llvm15-host/build-host
+    --host-llvm-build /opt/llvm15-host/build-host \
+    --gcc-toolchain /opt/gcc-aarch64be
 EOF
 }
 
@@ -83,6 +92,10 @@ while [[ $# -gt 0 ]]; do
     --host-llvm-build) HOST_LLVM_BUILD="$2"; shift 2 ;;
     --build-dir) BUILD_DIR="$2"; shift 2 ;;
     --target-cpu) TARGET_CPU="$2"; shift 2 ;;
+    --gcc-toolchain) GCC_TOOLCHAIN="$2"; shift 2 ;;
+    --extra-cflags) EXTRA_CFLAGS="$2"; shift 2 ;;
+    --extra-cxxflags) EXTRA_CXXFLAGS="$2"; shift 2 ;;
+    --extra-ldflags) EXTRA_LDFLAGS="$2"; shift 2 ;;
     --build-type) CMAKE_BUILD_TYPE="$2"; shift 2 ;;
     --jobs) JOBS="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -117,8 +130,37 @@ echo "  target_cpu      = ${TARGET_CPU:-<default>}"
 echo "  sysroot         = $SYSROOT"
 echo "  target_llvm_dir = $TARGET_LLVM_DIR"
 echo "  host_llvm_build = $HOST_LLVM_BUILD"
+if [[ -n "$GCC_TOOLCHAIN" ]]; then
+  echo "  gcc_toolchain   = $GCC_TOOLCHAIN"
+fi
 echo "  build_dir       = $BUILD_DIR"
 echo
+
+C_FLAGS=""
+CXX_FLAGS=""
+EXE_LINKER_FLAGS=""
+SHARED_LINKER_FLAGS=""
+
+if [[ -n "$TARGET_CPU" ]]; then
+  C_FLAGS="-mcpu=$TARGET_CPU"
+  CXX_FLAGS="-mcpu=$TARGET_CPU"
+fi
+if [[ -n "$GCC_TOOLCHAIN" ]]; then
+  C_FLAGS="${C_FLAGS:+$C_FLAGS }--gcc-toolchain=$GCC_TOOLCHAIN"
+  CXX_FLAGS="${CXX_FLAGS:+$CXX_FLAGS }--gcc-toolchain=$GCC_TOOLCHAIN"
+  EXE_LINKER_FLAGS="${EXE_LINKER_FLAGS:+$EXE_LINKER_FLAGS }--gcc-toolchain=$GCC_TOOLCHAIN"
+  SHARED_LINKER_FLAGS="${SHARED_LINKER_FLAGS:+$SHARED_LINKER_FLAGS }--gcc-toolchain=$GCC_TOOLCHAIN"
+fi
+if [[ -n "$EXTRA_CFLAGS" ]]; then
+  C_FLAGS="${C_FLAGS:+$C_FLAGS }$EXTRA_CFLAGS"
+fi
+if [[ -n "$EXTRA_CXXFLAGS" ]]; then
+  CXX_FLAGS="${CXX_FLAGS:+$CXX_FLAGS }$EXTRA_CXXFLAGS"
+fi
+if [[ -n "$EXTRA_LDFLAGS" ]]; then
+  EXE_LINKER_FLAGS="${EXE_LINKER_FLAGS:+$EXE_LINKER_FLAGS }$EXTRA_LDFLAGS"
+  SHARED_LINKER_FLAGS="${SHARED_LINKER_FLAGS:+$SHARED_LINKER_FLAGS }$EXTRA_LDFLAGS"
+fi
 
 CMAKE_ARGS=(
   -DLLVM_DIR="$TARGET_LLVM_DIR"
@@ -130,11 +172,11 @@ CMAKE_ARGS=(
   -DCMAKE_C_COMPILER_TARGET="$TARGET_TRIPLE"
   -DCMAKE_CXX_COMPILER_TARGET="$TARGET_TRIPLE"
   -DCMAKE_SYSROOT="$SYSROOT"
+  -DCMAKE_C_FLAGS="$C_FLAGS"
+  -DCMAKE_CXX_FLAGS="$CXX_FLAGS"
+  -DCMAKE_EXE_LINKER_FLAGS="$EXE_LINKER_FLAGS"
+  -DCMAKE_SHARED_LINKER_FLAGS="$SHARED_LINKER_FLAGS"
 )
-
-if [[ -n "$TARGET_CPU" ]]; then
-  CMAKE_ARGS+=(-DCMAKE_C_FLAGS_INIT="-mcpu=$TARGET_CPU" -DCMAKE_CXX_FLAGS_INIT="-mcpu=$TARGET_CPU")
-fi
 
 cmake -S "$SCRIPT_DIR" -B "$BUILD_DIR" -G Ninja "${CMAKE_ARGS[@]}"
 cmake --build "$BUILD_DIR" --target EasyJitRuntime --parallel "$JOBS"

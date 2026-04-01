@@ -11,6 +11,9 @@ SOURCE_FILE=""
 OUTPUT_FILE=""
 RUNTIME_SO=""
 TARGET_CPU=""
+GCC_TOOLCHAIN=""
+EXTRA_CFLAGS=""
+EXTRA_LDFLAGS=""
 
 usage() {
   cat <<'EOF'
@@ -37,6 +40,9 @@ Required:
 
 Optional:
   --target-cpu <cpu>         Optional -mcpu
+  --gcc-toolchain <path>     GCC toolchain root for crt objects and libgcc
+  --extra-cflags <flags>     Extra target C compiler flags
+  --extra-ldflags <flags>    Extra target linker flags
   -h, --help                 Show this help
 
 Example:
@@ -45,6 +51,7 @@ Example:
     --sysroot /opt/sdk/sysroot \
     --host-llvm-build /opt/llvm15-host/build-host \
     --host-easyjit-dir ./prebuilt/llvm15.0.4 \
+    --gcc-toolchain /opt/gcc-aarch64be \
     --runtime-so /tmp/aarch64be/libEasyJitRuntime.so \
     --source ./tests/c_api/config_process_easyjit.c \
     --output ./tests/c_api/output/config_process_easyjit.aarch64be
@@ -66,6 +73,9 @@ while [[ $# -gt 0 ]]; do
     --source) SOURCE_FILE="$2"; shift 2 ;;
     --output) OUTPUT_FILE="$2"; shift 2 ;;
     --target-cpu) TARGET_CPU="$2"; shift 2 ;;
+    --gcc-toolchain) GCC_TOOLCHAIN="$2"; shift 2 ;;
+    --extra-cflags) EXTRA_CFLAGS="$2"; shift 2 ;;
+    --extra-ldflags) EXTRA_LDFLAGS="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option '$1'" ;;
   esac
@@ -112,6 +122,19 @@ COMMON_FLAGS=(
 if [[ -n "$TARGET_CPU" ]]; then
   COMMON_FLAGS+=("-mcpu=$TARGET_CPU")
 fi
+if [[ -n "$GCC_TOOLCHAIN" ]]; then
+  COMMON_FLAGS+=("--gcc-toolchain=$GCC_TOOLCHAIN")
+fi
+if [[ -n "$EXTRA_CFLAGS" ]]; then
+  # shellcheck disable=SC2206
+  EXTRA_CFLAG_ARR=($EXTRA_CFLAGS)
+  COMMON_FLAGS+=("${EXTRA_CFLAG_ARR[@]}")
+fi
+if [[ -n "$EXTRA_LDFLAGS" ]]; then
+  # shellcheck disable=SC2206
+  EXTRA_LDFLAG_ARR=($EXTRA_LDFLAGS)
+  COMMON_FLAGS+=("${EXTRA_LDFLAG_ARR[@]}")
+fi
 
 echo "==> Configuration"
 echo "  target          = $TARGET_TRIPLE"
@@ -119,6 +142,9 @@ echo "  target_cpu      = ${TARGET_CPU:-<default>}"
 echo "  sysroot         = $SYSROOT"
 echo "  host_llvm_build = $HOST_LLVM_BUILD"
 echo "  host_easyjit    = $HOST_EASYJIT_DIR"
+if [[ -n "$GCC_TOOLCHAIN" ]]; then
+  echo "  gcc_toolchain   = $GCC_TOOLCHAIN"
+fi
 echo "  runtime_so      = $RUNTIME_SO"
 echo "  source          = $SOURCE_FILE"
 echo "  output          = $OUTPUT_FILE"
