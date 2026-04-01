@@ -96,6 +96,12 @@ easyjit_error_t easyjit_context_set_struct(easyjit_context_t ctx,
                                             const void* data,
                                             size_t size);
 
+/** Backward-compatible alias for struct snapshot semantics.
+ *  This is equivalent to easyjit_context_set_struct(ctx, data, size). */
+easyjit_error_t easyjit_context_set_snapshot(easyjit_context_t ctx,
+                                              const void* data,
+                                              size_t size);
+
 /* --- Optimization level ------------------------------------------------ */
 
 /** Set the optimization level (opt_level 0-3, opt_size 0-2).
