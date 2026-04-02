@@ -6,15 +6,22 @@ if (NOT PYTHON_EXEC)
 endif (NOT PYTHON_EXEC)
 
 if (NOT PYTHON_EXEC)
-  find_program(PYTHON_EXEC "python${Python_FIND_VERSION}" 
-               DOC "Location of python executable to use")
+  if (Python_FIND_VERSION)
+    find_program(PYTHON_EXEC "python${Python_FIND_VERSION}"
+                 DOC "Location of python executable to use")
+  else()
+    find_program(PYTHON_EXEC NAMES python3 python
+                 DOC "Location of python executable to use")
+  endif()
 endif(NOT PYTHON_EXEC)
 
-execute_process(COMMAND "${PYTHON_EXEC}" "-c"
-"import sys; print('%d.%d' % (sys.version_info[0],sys.version_info[1]))"
-OUTPUT_VARIABLE PYTHON_VERSION
-OUTPUT_STRIP_TRAILING_WHITESPACE)
-string(REPLACE "." "" PYTHON_VERSION_NO_DOTS ${PYTHON_VERSION})
+if (PYTHON_EXEC)
+  execute_process(COMMAND "${PYTHON_EXEC}" "-c"
+  "import sys; print('%d.%d' % (sys.version_info[0],sys.version_info[1]))"
+  OUTPUT_VARIABLE PYTHON_VERSION
+  OUTPUT_STRIP_TRAILING_WHITESPACE)
+  string(REPLACE "." "" PYTHON_VERSION_NO_DOTS "${PYTHON_VERSION}")
+endif()
 
 
 function(find_python_module module)
@@ -24,7 +31,7 @@ function(find_python_module module)
       set(${module}_FIND_REQUIRED TRUE)
     endif()
   # A module's location is usually a directory, but for binary modules it's a .so file.
-    execute_process(COMMAND "${PYTHON_EXEC}" "-c" "import re, ${module}; print re.compile('/__init__.py.*').sub('',${module}.__file__)"
+    execute_process(COMMAND "${PYTHON_EXEC}" "-c" "import importlib, re; m = importlib.import_module('${module}'); print(re.compile(r'/__init__\\.py.*').sub('', m.__file__))"
                     RESULT_VARIABLE _${module}_status 
                     OUTPUT_VARIABLE _${module}_location
                     ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
