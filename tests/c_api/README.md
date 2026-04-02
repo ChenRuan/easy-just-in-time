@@ -14,6 +14,7 @@
 | `easy-jit/tests/c_api/cache_example.c` | Cache test: compile-once, reuse on repeated keys |
 | `easy-jit/tests/c_api/wireless_beamform.c` | Wireless-style test: beamforming kernel with n_ant/n_sub specialized |
 | `easy-jit/tests/c_api/mixed_bindings.c` | Example of mixing forwarded args, scalar constants, and multiple struct snapshots |
+| `easy-jit/tests/c_api/pointer_field_snapshot.c` | Example of snapshotting a struct plus binding a pointed-to array field |
 | `easy-jit/tests/c_api/config_process_base.c` | Baseline C benchmark for a config-processing loop |
 | `easy-jit/tests/c_api/config_process_easyjit.c` | Best-path C API benchmark using snapshot + raw function pointers |
 | `easy-jit/tests/c_api/run_c_api_tests.sh` | One-command build & run script for all C API tests |
@@ -114,6 +115,26 @@ becomes:
 
 ```c
 int (*process_spec_t)(const float*, float);
+```
+
+### Pointer-field array binding
+
+For a struct like `struct Config { const int *array; ... };`, first snapshot the
+struct itself, then bind the pointed-to array onto the most recent snapshot:
+
+```c
+easyjit_context_set_snapshot(ctx, &cfg, sizeof(cfg));
+easyjit_context_bind_array(ctx,
+                           offsetof(Config, array),
+                           cfg.array,
+                           4,
+                           sizeof(int));
+```
+
+This is the C equivalent of:
+
+```cpp
+easy::snapshot(cfg, easy::bind_array(&Config::array, 4))
 ```
 
 ## Current status

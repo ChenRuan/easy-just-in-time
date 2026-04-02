@@ -125,6 +125,29 @@ easyjit_error_t easyjit_context_set_snapshot(easyjit_context_t ctx,
                                               const void* data,
                                               size_t size);
 
+/**
+ * Bind an array snapshot to a pointer field inside the most recent snapshot.
+ *
+ * This extends the latest easyjit_context_set_snapshot()/set_struct() call by
+ * replacing the pointer field at byte offset `field_offset` with a private
+ * constant array built from `data[0..count)`.
+ *
+ * The usual pattern is:
+ *   easyjit_context_set_snapshot(ctx, &cfg, sizeof(cfg));
+ *   easyjit_context_bind_array(ctx, offsetof(Config, array), cfg.array, n, sizeof(int));
+ *
+ * This is the C equivalent of:
+ *   easy::snapshot(cfg, easy::bind_array(&Config::array, n))
+ *
+ * The binding applies to the most recently appended snapshot parameter and is
+ * intended for read-only pointee data.
+ */
+easyjit_error_t easyjit_context_bind_array(easyjit_context_t ctx,
+                                            size_t field_offset,
+                                            const void* data,
+                                            size_t count,
+                                            size_t element_size);
+
 /* --- Optimization level ------------------------------------------------ */
 
 /** Set the optimization level (opt_level 0-3, opt_size 0-2).

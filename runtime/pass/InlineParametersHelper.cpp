@@ -5,6 +5,7 @@
 #include <llvm/IR/InstIterator.h>
 #include <llvm/ADT/SmallSet.h>
 #include <llvm/ADT/SmallVector.h>
+#include <llvm/IR/GlobalVariable.h>
 
 #include <llvm/Support/raw_ostream.h>
 
@@ -166,6 +167,100 @@ llvm::Constant* easy::GetArrayConstant(llvm::DataLayout const &DL,
   }
 
   return ConstantArray::get(ArrayType::get(PointeeTy, Count), Elements);
+}
+
+static Constant* GetRawByteArrayPointer(Module &M,
+                                        easy::StructArgument::ArrayBinding const &Binding) {
+  LLVMContext &Ctx = M.getContext();
+  auto *I8 = Type::getInt8Ty(Ctx);
+  SmallVector<uint8_t, 16> Bytes;
+  Bytes.reserve(Binding.Data_.size());
+  for (char Byte : Binding.Data_)
+    Bytes.push_back(static_cast<uint8_t>(Byte));
+
+  Constant *Init = ConstantDataArray::get(Ctx, Bytes);
+  auto *GV = new GlobalVariable(M,
+                                Init->getType(),
+                                true,
+                                GlobalValue::PrivateLinkage,
+                                Init,
+                                "__easy_snapshot_struct_array");
+  if (Binding.ElementSize_ != 0)
+    GV->setAlignment(llvm::Align(Binding.ElementSize_));
+  Constant* Zero = ConstantInt::get(Type::getInt32Ty(Ctx), 0);
+  Constant* Indices[] = {Zero, Zero};
+  return ConstantExpr::getInBoundsGetElementPtr(Init->getType(), GV, Indices);
+}
+
+static bool FindFieldPathByOffset(llvm::DataLayout const &DL,
+                                  llvm::Type* Ty,
+                                  size_t Offset,
+                                  SmallVectorImpl<unsigned> &Indices,
+                                  llvm::Type*& FieldTy) {
+  if (auto *STy = dyn_cast<StructType>(Ty)) {
+    auto const *SL = DL.getStructLayout(STy);
+    for (unsigned Field = 0; Field != STy->getNumElements(); ++Field) {
+      size_t FieldOffset = SL->getElementOffset(Field);
+      Type* ElemTy = STy->getElementType(Field);
+      size_t FieldSize = DL.getTypeAllocSize(ElemTy);
+      if (Offset < FieldOffset || Offset >= FieldOffset + FieldSize)
+        continue;
+
+      Indices.push_back(Field);
+      if (Offset == FieldOffset && ElemTy->isPointerTy()) {
+        FieldTy = ElemTy;
+        return true;
+      }
+
+      if (FindFieldPathByOffset(DL, ElemTy, Offset - FieldOffset, Indices, FieldTy))
+        return true;
+
+      Indices.pop_back();
+    }
+    return false;
+  }
+
+  if (auto *ATy = dyn_cast<ArrayType>(Ty)) {
+    size_t ElemSize = DL.getTypeAllocSize(ATy->getElementType());
+    if (ElemSize == 0)
+      return false;
+    size_t Index = Offset / ElemSize;
+    if (Index >= ATy->getNumElements())
+      return false;
+    Indices.push_back(static_cast<unsigned>(Index));
+    if (FindFieldPathByOffset(DL, ATy->getElementType(), Offset - Index * ElemSize, Indices, FieldTy))
+      return true;
+    Indices.pop_back();
+    return false;
+  }
+
+  return false;
+}
+
+void easy::ApplyStructArrayBindings(llvm::IRBuilder<> &B,
+                                    llvm::DataLayout const &DL,
+                                    easy::StructArgument const &Struct,
+                                    llvm::Type* StructTy,
+                                    llvm::AllocaInst* Alloc) {
+  for (auto const &Binding : Struct.getArrayBindings()) {
+    SmallVector<unsigned, 8> Indices;
+    Type* FieldTy = nullptr;
+    if (!FindFieldPathByOffset(DL, StructTy, Binding.Offset_, Indices, FieldTy)) {
+      errs() << "WARNING: snapshot bind_array could not resolve field offset "
+             << Binding.Offset_ << "\n";
+      continue;
+    }
+    (void)FieldTy;
+
+    Value* FieldPtr = Alloc;
+    SmallVector<Value*, 8> GEP = {B.getInt32(0)};
+    for (unsigned Index : Indices)
+      GEP.push_back(B.getInt32(Index));
+    FieldPtr = B.CreateGEP(Alloc->getAllocatedType(), Alloc, GEP, "bound.array.field.gep");
+
+    Constant* BoundPtr = GetRawByteArrayPointer(*Alloc->getModule(), Binding);
+    B.CreateStore(BoundPtr, FieldPtr);
+  }
 }
 
 static

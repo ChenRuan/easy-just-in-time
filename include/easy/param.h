@@ -8,6 +8,7 @@
 #include <easy/attributes.h>
 #include <easy/snapshot.h>
 #include <cassert>
+#include <cstring>
 
 namespace easy {
 
@@ -139,7 +140,20 @@ struct snapshot_parameter {
     static_assert(std::is_trivially_copyable<ValueType>::value,
                   "snapshot requires trivially copyable types");
     assert(arg.ptr != nullptr && "easy::snapshot does not accept null pointers");
-    C.setParameterStruct(serialized_arg(arg.ptr, sizeof(ValueType)));
+    std::vector<typename easy::StructArgument::ArrayBinding> bindings;
+    bindings.reserve(arg.array_bindings.size());
+    for (auto const &Binding : arg.array_bindings) {
+      bindings.push_back(typename easy::StructArgument::ArrayBinding{
+          Binding.offset,
+          std::vector<char>(),
+          Binding.count,
+          Binding.element_size});
+      auto &Stored = bindings.back();
+      Stored.Data_.resize(Binding.count * Binding.element_size);
+      if (!Stored.Data_.empty())
+        std::memcpy(Stored.Data_.data(), Binding.data, Stored.Data_.size());
+    }
+    C.setParameterStruct(serialized_arg(arg.ptr, sizeof(ValueType)), std::move(bindings));
   }
 };
 
