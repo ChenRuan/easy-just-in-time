@@ -86,18 +86,41 @@ easyjit_error_t easyjit_context_set_int(easyjit_context_t ctx,
 easyjit_error_t easyjit_context_set_float(easyjit_context_t ctx,
                                            double value);
 
-/** Specialize the next parameter to a concrete pointer value. */
+/** Specialize the next parameter to a concrete pointer value.
+ *  The pointer value itself is baked into the JIT'd code as a constant,
+ *  but the memory it points to is NOT captured — dereferences still
+ *  happen at runtime.  Use set_struct / set_snapshot for struct-pointer
+ *  parameters where you want the pointed-to data to be constant-folded. */
 easyjit_error_t easyjit_context_set_pointer(easyjit_context_t ctx,
                                              const void* ptr);
 
 /** Specialize the next parameter with a raw struct blob (memcpy semantics).
- *  `data` points to the struct bytes, `size` is sizeof(TheStruct). */
+ *  `data` points to the struct bytes, `size` is sizeof(TheStruct).
+ *
+ *  Equivalent to easy::snapshot() in the C++ API: the struct contents
+ *  are copied into the JIT context and become compile-time constants.
+ *  All field accesses in the JIT'd function are constant-folded away.
+ *
+ *  The target function parameter should be a struct pointer (T*)
+ *  or const reference (T const&).
+ */
 easyjit_error_t easyjit_context_set_struct(easyjit_context_t ctx,
                                             const void* data,
                                             size_t size);
 
-/** Backward-compatible alias for struct snapshot semantics.
- *  This is equivalent to easyjit_context_set_struct(ctx, data, size). */
+/**
+ * Snapshot a struct for specialization (convenience alias for set_struct).
+ *
+ * This is the C equivalent of easy::snapshot(cfg) in the C++ API.
+ * The struct bytes at `data` are copied into the context and become
+ * compile-time constants.  The JIT pass will create a constant
+ * allocation initialized with these bytes, so all field accesses
+ * (cfg->field) are folded to constants and branches are eliminated.
+ *
+ * Example:
+ *   PdcchTrpConfig cfg = { ... };
+ *   easyjit_context_set_snapshot(ctx, &cfg, sizeof(cfg));
+ */
 easyjit_error_t easyjit_context_set_snapshot(easyjit_context_t ctx,
                                               const void* data,
                                               size_t size);
@@ -109,6 +132,19 @@ easyjit_error_t easyjit_context_set_snapshot(easyjit_context_t ctx,
 easyjit_error_t easyjit_context_set_opt_level(easyjit_context_t ctx,
                                                unsigned opt_level,
                                                unsigned opt_size);
+
+/**
+ * Enable IR dumping for a C API compilation context.
+ *
+ * When set, compilation writes three files:
+ *   <file>.before.ll  - IR before EasyJIT optimization/specialization
+ *   <file>            - final optimized IR
+ *   <file>.after.ll   - IR after optimization
+ *
+ * Pass NULL or "" to disable dumping.
+ */
+easyjit_error_t easyjit_context_set_dump_ir(easyjit_context_t ctx,
+                                             const char* file);
 
 /* ------------------------------------------------------------------ */
 /*  Compiled function handle                                           */
