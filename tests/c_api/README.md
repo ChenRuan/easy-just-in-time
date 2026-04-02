@@ -13,6 +13,7 @@
 | `easy-jit/tests/c_api/add_int.c` | Minimal test: specialize `add(a,b)` → `inc(a)` |
 | `easy-jit/tests/c_api/cache_example.c` | Cache test: compile-once, reuse on repeated keys |
 | `easy-jit/tests/c_api/wireless_beamform.c` | Wireless-style test: beamforming kernel with n_ant/n_sub specialized |
+| `easy-jit/tests/c_api/mixed_bindings.c` | Example of mixing forwarded args, scalar constants, and multiple struct snapshots |
 | `easy-jit/tests/c_api/config_process_base.c` | Baseline C benchmark for a config-processing loop |
 | `easy-jit/tests/c_api/config_process_easyjit.c` | Best-path C API benchmark using snapshot + raw function pointers |
 | `easy-jit/tests/c_api/run_c_api_tests.sh` | One-command build & run script for all C API tests |
@@ -86,6 +87,34 @@ clang -g -Xclang -disable-O0-optnone \
 The user-side C code needs only:
 - `#include <easy/easyjit_c.h>` for the C API
 - `#include <easy/attributes.h>` for `EASY_JIT_EXPOSE`
+
+### Mixed binding example
+
+`mixed_bindings.c` demonstrates how to bind parameters in signature order when a
+kernel takes multiple runtime values plus multiple structs:
+
+```c
+easyjit_context_set_forward(ctx, 0);          // input
+easyjit_context_set_float(ctx, 2.0);          // scale
+easyjit_context_set_snapshot(ctx, &a, sizeof(a));
+easyjit_context_set_snapshot(ctx, &b, sizeof(b));
+easyjit_context_set_int(ctx, 4);              // index
+easyjit_context_set_forward(ctx, 1);          // offset
+```
+
+The specialized function only keeps the forwarded arguments, so the original
+signature:
+
+```c
+process(const float* input, float scale, const ConfigA* a,
+        const ConfigB* b, int index, float offset)
+```
+
+becomes:
+
+```c
+int (*process_spec_t)(const float*, float);
+```
 
 ## Current status
 
