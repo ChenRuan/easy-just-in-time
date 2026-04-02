@@ -125,6 +125,45 @@ easyjit_error_t easyjit_context_set_snapshot(easyjit_context_t ctx,
                                               const void* data,
                                               size_t size);
 
+/**
+ * Bind an array snapshot to a pointer field inside the most recent snapshot.
+ *
+ * This extends the latest easyjit_context_set_snapshot()/set_struct() call by
+ * replacing the pointer field at byte offset `field_offset` with a private
+ * constant array built from `data[0..count)`.
+ *
+ * The usual pattern is:
+ *   easyjit_context_set_snapshot(ctx, &cfg, sizeof(cfg));
+ *   easyjit_context_bind_array(ctx, offsetof(Config, array), cfg.array, n, sizeof(int));
+ *
+ * This is the C equivalent of:
+ *   easy::snapshot(cfg, easy::bind_array(&Config::array, n))
+ *
+ * The binding applies to the most recently appended snapshot parameter and is
+ * intended for read-only pointee data.
+ */
+easyjit_error_t easyjit_context_bind_array(easyjit_context_t ctx,
+                                            size_t field_offset,
+                                            const void* data,
+                                            size_t count,
+                                            size_t element_size);
+
+/**
+ * Snapshot a flat array for specialization.
+ *
+ * This appends one pointer parameter whose pointee contents are copied into the
+ * context as a private constant array.  It is the C equivalent of:
+ *   easy::snapshot_array(data, count)
+ *
+ * Example:
+ *   easyjit_context_set_forward(ctx, 0);                  // x
+ *   easyjit_context_set_array(ctx, data, 4, sizeof(int)); // values
+ */
+easyjit_error_t easyjit_context_set_array(easyjit_context_t ctx,
+                                           const void* data,
+                                           size_t count,
+                                           size_t element_size);
+
 /* --- Optimization level ------------------------------------------------ */
 
 /** Set the optimization level (opt_level 0-3, opt_size 0-2).
@@ -132,6 +171,19 @@ easyjit_error_t easyjit_context_set_snapshot(easyjit_context_t ctx,
 easyjit_error_t easyjit_context_set_opt_level(easyjit_context_t ctx,
                                                unsigned opt_level,
                                                unsigned opt_size);
+
+/**
+ * Enable IR dumping for a C API compilation context.
+ *
+ * When set, compilation writes three files:
+ *   <file>.before.ll  - IR before EasyJIT optimization/specialization
+ *   <file>            - final optimized IR
+ *   <file>.after.ll   - IR after optimization
+ *
+ * Pass NULL or "" to disable dumping.
+ */
+easyjit_error_t easyjit_context_set_dump_ir(easyjit_context_t ctx,
+                                             const char* file);
 
 /* ------------------------------------------------------------------ */
 /*  Compiled function handle                                           */

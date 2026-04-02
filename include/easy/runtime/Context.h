@@ -78,6 +78,13 @@ struct ArgumentBase {
     else return nullptr;
   }
 
+  template<class ArgTy>
+  std::enable_if_t<std::is_base_of<ArgumentBase, ArgTy>::value, ArgTy*>
+  as() {
+    if(kind() == ArgTy::Kind) return static_cast<ArgTy*>(this);
+    else return nullptr;
+  }
+
   friend std::hash<easy::ArgumentBase>;
 
   virtual ArgumentKind kind() const noexcept = 0;
@@ -118,20 +125,40 @@ DeclareArgument(Module, easy::Function const&);
 
 class StructArgument
     : public ArgumentBase {
+ public:
+  struct ArrayBinding {
+    size_t Offset_;
+    std::vector<char> Data_;
+    size_t Count_;
+    size_t ElementSize_;
+
+    bool operator==(ArrayBinding const& Other) const {
+      return Offset_ == Other.Offset_ &&
+             Count_ == Other.Count_ &&
+             ElementSize_ == Other.ElementSize_ &&
+             Data_ == Other.Data_;
+    }
+  };
+
+ private:
   serialized_arg Data_;
+  std::vector<ArrayBinding> ArrayBindings_;
 
   public:
-  StructArgument(serialized_arg &&arg)
-    : ArgumentBase(), Data_(arg) {}
+  StructArgument(serialized_arg &&arg, std::vector<ArrayBinding> bindings = {})
+    : ArgumentBase(), Data_(std::move(arg)), ArrayBindings_(std::move(bindings)) {}
   virtual ~StructArgument() override = default;
   std::vector<char> const & get() const { return Data_.buf; }
+  std::vector<ArrayBinding> const& getArrayBindings() const { return ArrayBindings_; }
+  void addArrayBinding(ArrayBinding binding) { ArrayBindings_.push_back(std::move(binding)); }
   static constexpr ArgumentKind Kind = AK_Struct;
   ArgumentKind kind() const noexcept override  { return Kind; }
 
   protected:
   bool compareWithSameType(ArgumentBase const& Other) const override {
     auto const &OtherCast = static_cast<StructArgument const&>(Other);
-    return get() == OtherCast.get();
+    return get() == OtherCast.get() &&
+           getArrayBindings() == OtherCast.getArrayBindings();
   }
 
   size_t hash() const noexcept override {
@@ -139,6 +166,13 @@ class StructArgument
     size_t R = 0;
     for (char c : get())
       R ^= hash(c);
+    for (auto const &Binding : getArrayBindings()) {
+      R ^= hash(static_cast<int64_t>(Binding.Offset_));
+      R ^= hash(static_cast<int64_t>(Binding.Count_));
+      R ^= hash(static_cast<int64_t>(Binding.ElementSize_));
+      for (char c : Binding.Data_)
+        R ^= hash(c);
+    }
     return R;
   }
 };
@@ -203,9 +237,10 @@ class Context {
   Context& setParameterInt(int64_t);
   Context& setParameterFloat(double);
   Context& setParameterPointer(void const*);
-  Context& setParameterStruct(serialized_arg);
+  Context& setParameterStruct(serialized_arg, std::vector<StructArgument::ArrayBinding> Bindings = {});
   Context& setParameterArray(std::vector<char>, size_t Count, size_t ElementSize);
   Context& setParameterModule(easy::Function const&);
+  Context& bindArrayToLastStruct(size_t Offset, std::vector<char> Data, size_t Count, size_t ElementSize);
 
   Context& setArgumentLayout(layout_id id) {
     ArgumentLayout_.push_back(id); // each layout id is associated with a number of fields in the bitcode tracker

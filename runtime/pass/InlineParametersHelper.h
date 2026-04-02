@@ -50,6 +50,11 @@ bool LinkAndUpdateSymbol(llvm::Module &M, llvm::StringRef FName, llvm::StringRef
 
 llvm::AllocaInst* GetStructAlloc(llvm::IRBuilder<> &B, llvm::DataLayout const &DL, easy::StructArgument const &Struct, llvm::Type* StructTy);
 llvm::Constant* GetArrayConstant(llvm::DataLayout const &DL, easy::ArrayArgument const &Array, llvm::Type* PointeeTy);
+void ApplyStructArrayBindings(llvm::IRBuilder<> &B,
+                              llvm::DataLayout const &DL,
+                              easy::StructArgument const &Struct,
+                              llvm::Type* StructTy,
+                              llvm::AllocaInst* Alloc);
 
 std::pair<llvm::Constant*, size_t> GetConstantFromRaw(llvm::DataLayout const& DL, llvm::Type* T, const uint8_t* Raw);
 

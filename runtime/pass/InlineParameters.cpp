@@ -133,6 +133,7 @@ void GetInlineArgs(easy::Context const &C,
           Type* StructType = easy::FindPointeeStructType(F, ParamIdx);
           assert(StructType && "Cannot discover struct type for pointer/reference parameter");
           AllocaInst* ParamAlloc = easy::GetStructAlloc(B, DL, *Struct, StructType);
+          easy::ApplyStructArrayBindings(B, DL, *Struct, StructType, ParamAlloc);
           Args.push_back(ParamAlloc);
         } else if (ArgInF.StructByArray_) {
           // struct is passed as an array

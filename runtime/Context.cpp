@@ -1,4 +1,5 @@
 #include "easy/runtime/Context.h"
+#include <stdexcept>
 
 using namespace easy;
 
@@ -18,8 +19,9 @@ Context& Context::setParameterPointer(const void* val) {
   return setArg<PtrArgument>(val);
 }
 
-Context& Context::setParameterStruct(serialized_arg arg) {
-  return setArg<StructArgument>(std::move(arg));
+Context& Context::setParameterStruct(serialized_arg arg,
+                                     std::vector<StructArgument::ArrayBinding> Bindings) {
+  return setArg<StructArgument>(std::move(arg), std::move(Bindings));
 }
 
 Context& Context::setParameterArray(std::vector<char> data, size_t Count, size_t ElementSize) {
@@ -28,6 +30,22 @@ Context& Context::setParameterArray(std::vector<char> data, size_t Count, size_t
 
 Context& Context::setParameterModule(easy::Function const &F) {
   return setArg<ModuleArgument>(F);
+}
+
+Context& Context::bindArrayToLastStruct(size_t Offset,
+                                        std::vector<char> Data,
+                                        size_t Count,
+                                        size_t ElementSize) {
+  if (ArgumentMapping_.empty())
+    throw std::invalid_argument("bindArrayToLastStruct requires a previous snapshot parameter");
+
+  auto *Struct = ArgumentMapping_.back()->as<StructArgument>();
+  if (!Struct)
+    throw std::invalid_argument("bindArrayToLastStruct must follow a snapshot parameter");
+
+  Struct->addArrayBinding(StructArgument::ArrayBinding{
+      Offset, std::move(Data), Count, ElementSize});
+  return *this;
 }
 
 bool Context::operator==(const Context& Other) const {
