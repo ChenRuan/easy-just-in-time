@@ -13,6 +13,7 @@
 | `easy-jit/tests/c_api/add_int.c` | Minimal test: specialize `add(a,b)` → `inc(a)` |
 | `easy-jit/tests/c_api/cache_example.c` | Cache test: compile-once, reuse on repeated keys |
 | `easy-jit/tests/c_api/wireless_beamform.c` | Wireless-style test: beamforming kernel with n_ant/n_sub specialized |
+| `easy-jit/tests/c_api/array_snapshot.c` | Example of specializing a pointer parameter to a copied constant array |
 | `easy-jit/tests/c_api/mixed_bindings.c` | Example of mixing forwarded args, scalar constants, and multiple struct snapshots |
 | `easy-jit/tests/c_api/pointer_field_snapshot.c` | Example of snapshotting a struct plus binding a pointed-to array field |
 | `easy-jit/tests/c_api/config_process_base.c` | Baseline C benchmark for a config-processing loop |
@@ -117,6 +118,28 @@ becomes:
 int (*process_spec_t)(const float*, float);
 ```
 
+### Flat array snapshot
+
+For a plain pointer parameter, the C API now exposes the same idea as
+`easy::snapshot_array(...)`:
+
+```c
+easyjit_context_set_forward(ctx, 0);                 // x
+easyjit_context_set_array(ctx, data, 4, sizeof(int)); // values
+```
+
+This turns a function like:
+
+```c
+int eval_array(int x, const int* data);
+```
+
+into:
+
+```c
+int (*eval_array_spec_t)(int);
+```
+
 ### Pointer-field array binding
 
 For a struct like `struct Config { const int *array; ... };`, first snapshot the
@@ -144,11 +167,11 @@ easy::snapshot(cfg, easy::bind_array(&Config::array, 4))
 | Int parameter specialization | ✅ Working |
 | Float parameter specialization | ✅ Working (API ready, not separately tested) |
 | Pointer forwarding | ✅ Working |
+| Array snapshot | ✅ Working |
 | Loop-bound specialization | ✅ Working (beamform example) |
 | Cache / reuse | ✅ Working |
 | Struct specialization | ⚠️ API ready, works for single-field layout; multi-field structs may need per-case layout registration |
 | Multi-file linking | ❌ Not tested (kernel in separate .c from main) |
-| Array snapshot | ❌ Not exposed in C API yet |
 
 ## Remaining limitations and next steps
 
@@ -156,7 +179,7 @@ easy::snapshot(cfg, easy::bind_array(&Config::array, 4))
 
 2. **Multi-file**: If the kernel lives in a separate `.c` file from `main()`, both must be compiled with the EasyJIT pass. This works in principle but hasn't been tested with the C API.
 
-3. **Array snapshot**: The C++ API supports `snapshot_array` for specializing array contents. Adding `easyjit_context_set_array(ctx, data, count, element_size)` would be straightforward.
+3. **Nested pointees beyond 1-D arrays**: `easyjit_context_set_array(...)` and `easyjit_context_bind_array(...)` cover flat read-only arrays, but multi-level pointers (`T**`) and recursive pointee graphs are still not supported.
 
 4. **Thread safety**: Individual handles are not thread-safe. The `ensure_scalar_layout_registered()` uses a simple `static bool` which is safe on the first call but could be made more robust with `std::call_once`.
 

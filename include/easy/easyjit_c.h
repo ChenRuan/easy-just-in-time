@@ -148,6 +148,22 @@ easyjit_error_t easyjit_context_bind_array(easyjit_context_t ctx,
                                             size_t count,
                                             size_t element_size);
 
+/**
+ * Snapshot a flat array for specialization.
+ *
+ * This appends one pointer parameter whose pointee contents are copied into the
+ * context as a private constant array.  It is the C equivalent of:
+ *   easy::snapshot_array(data, count)
+ *
+ * Example:
+ *   easyjit_context_set_forward(ctx, 0);                 // x
+ *   easyjit_context_set_array(ctx, data, 4, sizeof(int)); // values
+ */
+easyjit_error_t easyjit_context_set_array(easyjit_context_t ctx,
+                                           const void* data,
+                                           size_t count,
+                                           size_t element_size);
+
 /* --- Optimization level ------------------------------------------------ */
 
 /** Set the optimization level (opt_level 0-3, opt_size 0-2).

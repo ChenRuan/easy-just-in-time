@@ -236,6 +236,37 @@ easyjit_error_t easyjit_context_bind_array(easyjit_context_t ctx,
 }
 
 extern "C"
+easyjit_error_t easyjit_context_set_array(easyjit_context_t ctx,
+                                           const void* data,
+                                           size_t count,
+                                           size_t element_size) {
+    clear_last_error();
+    if (!ctx) {
+        set_last_error("easyjit_context_set_array: ctx is NULL");
+        return EASYJIT_ERROR_INVALID_ARGUMENT;
+    }
+    if (!data && count > 0) {
+        set_last_error("easyjit_context_set_array: data is NULL with non-zero count");
+        return EASYJIT_ERROR_INVALID_ARGUMENT;
+    }
+    if (element_size == 0 && count > 0) {
+        set_last_error("easyjit_context_set_array: element_size is zero with non-zero count");
+        return EASYJIT_ERROR_INVALID_ARGUMENT;
+    }
+    try {
+        set_scalar_layout(ctx->ctx);
+        std::vector<char> bytes(count * element_size);
+        if (!bytes.empty())
+            std::memcpy(bytes.data(), data, bytes.size());
+        ctx->ctx.setParameterArray(std::move(bytes), count, element_size);
+        return EASYJIT_OK;
+    } catch (const std::exception& e) {
+        set_last_error(e.what());
+        return EASYJIT_ERROR_INTERNAL;
+    }
+}
+
+extern "C"
 easyjit_error_t easyjit_context_set_opt_level(easyjit_context_t ctx,
                                                unsigned opt_level,
                                                unsigned opt_size) {
