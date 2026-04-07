@@ -344,8 +344,6 @@ COMMON_FLAGS=(
   "-lEasyJitRuntime"
   "-lpthread"
   "-lstdc++"
-  "-Xclang" "-load"
-  "-Xclang" "$PASS_SO"
   "-Xclang" "-fpass-plugin=$PASS_SO"
 )
 
