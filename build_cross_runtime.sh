@@ -64,6 +64,17 @@ die() {
   exit 1
 }
 
+find_readelf() {
+  local candidate
+  for candidate in "${READELF:-}" "$(command -v readelf 2>/dev/null || true)" "$(command -v llvm-readelf 2>/dev/null || true)"; do
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 resolve_gcc_bin_dir() {
   local root="$1"
   local target="$2"
@@ -112,6 +123,24 @@ resolve_llvm_dir() {
   fi
 
   return 1
+}
+
+assert_runtime_is_not_linked_against_llvm_shared() {
+  local runtime_so="$1"
+  local readelf_bin
+  local needed
+
+  readelf_bin="$(find_readelf || true)"
+  [[ -n "$readelf_bin" ]] || die "readelf not found; install binutils or set READELF=/path/to/readelf"
+  [[ -f "$runtime_so" ]] || die "runtime not found for verification: $runtime_so"
+
+  needed="$("$readelf_bin" -d "$runtime_so" 2>/dev/null | grep 'Shared library:' || true)"
+  if grep -Eq 'libLLVM[^]]*\.so|libRemarks\.so|libLTO\.so' <<<"$needed"; then
+    echo "error: runtime still depends on LLVM shared libraries:" >&2
+    echo "$needed" >&2
+    echo "hint: point --target-llvm-dir to an LLVM build/install that includes static archives and not only shared LLVM libraries." >&2
+    exit 1
+  fi
 }
 
 while [[ $# -gt 0 ]]; do
@@ -214,6 +243,9 @@ fi
 
 CMAKE_ARGS=(
   -DLLVM_DIR="$TARGET_LLVM_DIR"
+  -DBUILD_SHARED_LIBS=OFF
+  -DLLVM_BUILD_LLVM_DYLIB=OFF
+  -DLLVM_LINK_LLVM_DYLIB=OFF
   -DCMAKE_BUILD_TYPE="$CMAKE_BUILD_TYPE"
   -DCMAKE_SYSTEM_NAME=Linux
   -DCMAKE_SYSTEM_PROCESSOR="${TARGET_TRIPLE%%-*}"
@@ -222,6 +254,7 @@ CMAKE_ARGS=(
   -DCMAKE_C_COMPILER_TARGET="$TARGET_TRIPLE"
   -DCMAKE_CXX_COMPILER_TARGET="$TARGET_TRIPLE"
   -DCMAKE_SYSROOT="$SYSROOT"
+  -DCMAKE_SKIP_RPATH=ON
   -DCMAKE_C_FLAGS="$C_FLAGS"
   -DCMAKE_CXX_FLAGS="$CXX_FLAGS"
   -DCMAKE_EXE_LINKER_FLAGS="$EXE_LINKER_FLAGS"
@@ -230,6 +263,7 @@ CMAKE_ARGS=(
 
 cmake -S "$SCRIPT_DIR" -B "$BUILD_DIR" -G Ninja "${CMAKE_ARGS[@]}"
 cmake --build "$BUILD_DIR" --target EasyJitRuntime --parallel "$JOBS"
+assert_runtime_is_not_linked_against_llvm_shared "$BUILD_DIR/bin/libEasyJitRuntime.so"
 
 echo "==> Done"
 echo "  runtime : $BUILD_DIR/bin/libEasyJitRuntime.so"
