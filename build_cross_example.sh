@@ -16,6 +16,12 @@ OUTPUT_FILE=""
 CMAKE_BUILD_TYPE="Release"
 JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)}"
 MODE="all"
+GCC_TOOLCHAIN=""
+GCC_BIN_DIR=""
+GCC_LIB_DIR=""
+EXTRA_CFLAGS=""
+EXTRA_CXXFLAGS=""
+EXTRA_LDFLAGS=""
 
 usage() {
   cat <<'EOF'
@@ -42,6 +48,12 @@ Options:
   --host-easyjit-build <path>
                              Host EasyJIT build dir containing EasyJitPass.so, required
   --runtime-build-dir <path> Target EasyJIT runtime build dir, default: <repo>/build-cross-<preset>
+  --gcc-toolchain <path>     GCC toolchain root; script derives bin/lib paths
+  --gcc-bin-dir <path>       Explicit GCC bin dir for -B
+  --gcc-lib-dir <path>       Explicit GCC libgcc dir for -L/-B
+  --extra-cflags <flags>     Extra target C compiler flags
+  --extra-cxxflags <flags>   Extra target C++ compiler flags
+  --extra-ldflags <flags>    Extra target linker flags
   --mode <all|runtime|binary>
                              Build both, only runtime, or only binary
   --build-type <type>        CMake build type, default: Release
@@ -69,6 +81,32 @@ EOF
 die() {
   echo "error: $*" >&2
   exit 1
+}
+
+resolve_gcc_bin_dir() {
+  local root="$1"
+  local target="$2"
+  local candidate
+  for candidate in "$root/bin" "$root/usr/bin"; do
+    if [[ -x "$candidate/${target}-gcc" ]] || [[ -x "$candidate/${target}-ld" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+resolve_gcc_lib_dir() {
+  local root="$1"
+  local target="$2"
+  local candidate
+  while IFS= read -r candidate; do
+    if [[ -f "$candidate/libgcc.a" ]] || [[ -f "$candidate/libgcc_s.so" ]] || [[ -f "$candidate/crtbeginS.o" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done < <(find "$root" -type d \( -path "*/lib/gcc/$target/*" -o -path "*/lib64/gcc/$target/*" \) 2>/dev/null | sort)
+  return 1
 }
 
 find_readelf() {
@@ -128,6 +166,12 @@ while [[ $# -gt 0 ]]; do
     --host-llvm-build) HOST_LLVM_BUILD="$2"; shift 2 ;;
     --host-easyjit-build) HOST_EASYJIT_BUILD="$2"; shift 2 ;;
     --runtime-build-dir) RUNTIME_BUILD_DIR="$2"; shift 2 ;;
+    --gcc-toolchain) GCC_TOOLCHAIN="$2"; shift 2 ;;
+    --gcc-bin-dir) GCC_BIN_DIR="$2"; shift 2 ;;
+    --gcc-lib-dir) GCC_LIB_DIR="$2"; shift 2 ;;
+    --extra-cflags) EXTRA_CFLAGS="$2"; shift 2 ;;
+    --extra-cxxflags) EXTRA_CXXFLAGS="$2"; shift 2 ;;
+    --extra-ldflags) EXTRA_LDFLAGS="$2"; shift 2 ;;
     --mode) MODE="$2"; shift 2 ;;
     --build-type) CMAKE_BUILD_TYPE="$2"; shift 2 ;;
     --jobs) JOBS="$2"; shift 2 ;;
@@ -185,12 +229,59 @@ echo "  host_llvm_build   = $HOST_LLVM_BUILD"
 echo "  host_easyjit_build= $HOST_EASYJIT_BUILD"
 echo "  llvm_dir          = $LLVM_DIR"
 echo "  runtime_build_dir = $RUNTIME_BUILD_DIR"
+if [[ -n "$GCC_TOOLCHAIN" ]]; then
+  echo "  gcc_toolchain     = $GCC_TOOLCHAIN"
+fi
+if [[ -n "$GCC_BIN_DIR" ]]; then
+  echo "  gcc_bin_dir       = $GCC_BIN_DIR"
+fi
+if [[ -n "$GCC_LIB_DIR" ]]; then
+  echo "  gcc_lib_dir       = $GCC_LIB_DIR"
+fi
 if [[ -n "$SOURCE_FILE" ]]; then
   echo "  source            = $SOURCE_FILE"
   echo "  output            = $OUTPUT_FILE"
 fi
 echo "  mode              = $MODE"
 echo
+
+RUNTIME_C_FLAGS=""
+RUNTIME_CXX_FLAGS=""
+RUNTIME_EXE_LINKER_FLAGS=""
+RUNTIME_SHARED_LINKER_FLAGS=""
+
+if [[ -n "$TARGET_CPU" ]]; then
+  RUNTIME_C_FLAGS="-mcpu=$TARGET_CPU"
+  RUNTIME_CXX_FLAGS="-mcpu=$TARGET_CPU"
+fi
+if [[ -n "$GCC_TOOLCHAIN" ]]; then
+  if [[ -z "$GCC_BIN_DIR" ]]; then
+    GCC_BIN_DIR="$(resolve_gcc_bin_dir "$GCC_TOOLCHAIN" "$TARGET_TRIPLE" || true)"
+  fi
+  if [[ -z "$GCC_LIB_DIR" ]]; then
+    GCC_LIB_DIR="$(resolve_gcc_lib_dir "$GCC_TOOLCHAIN" "$TARGET_TRIPLE" || true)"
+  fi
+fi
+if [[ -n "$GCC_BIN_DIR" ]]; then
+  RUNTIME_EXE_LINKER_FLAGS="${RUNTIME_EXE_LINKER_FLAGS:+$RUNTIME_EXE_LINKER_FLAGS }-B$GCC_BIN_DIR"
+  RUNTIME_SHARED_LINKER_FLAGS="${RUNTIME_SHARED_LINKER_FLAGS:+$RUNTIME_SHARED_LINKER_FLAGS }-B$GCC_BIN_DIR"
+fi
+if [[ -n "$GCC_LIB_DIR" ]]; then
+  RUNTIME_C_FLAGS="${RUNTIME_C_FLAGS:+$RUNTIME_C_FLAGS }-B$GCC_LIB_DIR"
+  RUNTIME_CXX_FLAGS="${RUNTIME_CXX_FLAGS:+$RUNTIME_CXX_FLAGS }-B$GCC_LIB_DIR"
+  RUNTIME_EXE_LINKER_FLAGS="${RUNTIME_EXE_LINKER_FLAGS:+$RUNTIME_EXE_LINKER_FLAGS }-B$GCC_LIB_DIR -L$GCC_LIB_DIR"
+  RUNTIME_SHARED_LINKER_FLAGS="${RUNTIME_SHARED_LINKER_FLAGS:+$RUNTIME_SHARED_LINKER_FLAGS }-B$GCC_LIB_DIR -L$GCC_LIB_DIR"
+fi
+if [[ -n "$EXTRA_CFLAGS" ]]; then
+  RUNTIME_C_FLAGS="${RUNTIME_C_FLAGS:+$RUNTIME_C_FLAGS }$EXTRA_CFLAGS"
+fi
+if [[ -n "$EXTRA_CXXFLAGS" ]]; then
+  RUNTIME_CXX_FLAGS="${RUNTIME_CXX_FLAGS:+$RUNTIME_CXX_FLAGS }$EXTRA_CXXFLAGS"
+fi
+if [[ -n "$EXTRA_LDFLAGS" ]]; then
+  RUNTIME_EXE_LINKER_FLAGS="${RUNTIME_EXE_LINKER_FLAGS:+$RUNTIME_EXE_LINKER_FLAGS }$EXTRA_LDFLAGS"
+  RUNTIME_SHARED_LINKER_FLAGS="${RUNTIME_SHARED_LINKER_FLAGS:+$RUNTIME_SHARED_LINKER_FLAGS }$EXTRA_LDFLAGS"
+fi
 
 if [[ "$MODE" == "all" || "$MODE" == "runtime" ]]; then
   echo "==> Configuring target runtime build"
@@ -209,7 +300,11 @@ if [[ "$MODE" == "all" || "$MODE" == "runtime" ]]; then
     -DCMAKE_C_COMPILER_TARGET="$TARGET_TRIPLE" \
     -DCMAKE_CXX_COMPILER_TARGET="$TARGET_TRIPLE" \
     -DCMAKE_SYSROOT="$SYSROOT" \
-    -DCMAKE_SKIP_RPATH=ON
+    -DCMAKE_SKIP_RPATH=ON \
+    -DCMAKE_C_FLAGS="$RUNTIME_C_FLAGS" \
+    -DCMAKE_CXX_FLAGS="$RUNTIME_CXX_FLAGS" \
+    -DCMAKE_EXE_LINKER_FLAGS="$RUNTIME_EXE_LINKER_FLAGS" \
+    -DCMAKE_SHARED_LINKER_FLAGS="$RUNTIME_SHARED_LINKER_FLAGS"
 
   echo "==> Building target runtime"
   cmake --build "$RUNTIME_BUILD_DIR" --target EasyJitRuntime --parallel "$JOBS"
@@ -237,6 +332,22 @@ if [[ "$MODE" == "all" || "$MODE" == "binary" ]]; then
   if [[ -n "$TARGET_CPU" ]]; then
     COMMON_FLAGS+=("-mcpu=$TARGET_CPU")
   fi
+  if [[ -n "$GCC_BIN_DIR" ]]; then
+    COMMON_FLAGS+=("-B$GCC_BIN_DIR")
+  fi
+  if [[ -n "$GCC_LIB_DIR" ]]; then
+    COMMON_FLAGS+=("-B$GCC_LIB_DIR" "-L$GCC_LIB_DIR")
+  fi
+  if [[ -n "$EXTRA_CFLAGS" ]]; then
+    # shellcheck disable=SC2206
+    EXTRA_CFLAG_ARR=($EXTRA_CFLAGS)
+    COMMON_FLAGS+=("${EXTRA_CFLAG_ARR[@]}")
+  fi
+  if [[ -n "$EXTRA_LDFLAGS" ]]; then
+    # shellcheck disable=SC2206
+    EXTRA_LDFLAG_ARR=($EXTRA_LDFLAGS)
+    COMMON_FLAGS+=("${EXTRA_LDFLAG_ARR[@]}")
+  fi
 
   case "$SRC_EXT" in
     c)
@@ -252,9 +363,15 @@ if [[ "$MODE" == "all" || "$MODE" == "binary" ]]; then
         -o "$OUTPUT_FILE"
       ;;
     cc|cp|cxx|cpp|CPP)
+      CXX_COMMON_FLAGS=("${COMMON_FLAGS[@]}")
+      if [[ -n "$EXTRA_CXXFLAGS" ]]; then
+        # shellcheck disable=SC2206
+        EXTRA_CXXFLAG_ARR=($EXTRA_CXXFLAGS)
+        CXX_COMMON_FLAGS+=("${EXTRA_CXXFLAG_ARR[@]}")
+      fi
       echo "==> Cross-compiling C++ binary"
       "$HOST_CLANGXX" \
-        "${COMMON_FLAGS[@]}" \
+        "${CXX_COMMON_FLAGS[@]}" \
         -std=c++17 \
         -g \
         -Xclang -load \
