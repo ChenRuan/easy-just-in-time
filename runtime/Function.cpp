@@ -25,6 +25,8 @@
 
 using namespace easy;
 
+extern void* __dso_handle;
+
 namespace easy {
   DefineEasyException(ExecutionEngineCreateError, "Failed to create execution engine for:");
   DefineEasyException(CouldNotOpenFile, "Failed to file to dump intermediate representation.");
@@ -93,7 +95,7 @@ static void MapGlobals(llvm::ExecutionEngine& EE, GlobalMapping* Globals) {
   for(GlobalMapping *GM = Globals; GM->Name; ++GM) {
     EE.addGlobalMapping(GM->Name, (uint64_t)GM->Address);
   }
-  EE.addGlobalMapping("__dso_handle", (uint64_t)&EE);
+  EE.addGlobalMapping("__dso_handle", (uint64_t)&__dso_handle);
   EE.finalizeObject();
 }
 
