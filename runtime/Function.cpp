@@ -28,6 +28,7 @@ using namespace easy;
 namespace easy {
   DefineEasyException(ExecutionEngineCreateError, "Failed to create execution engine for:");
   DefineEasyException(CouldNotOpenFile, "Failed to file to dump intermediate representation.");
+  DefineEasyException(TargetMachineCreateError, "Failed to create target machine for:");
 }
 
 Function::Function(void* Addr, std::unique_ptr<LLVMHolder> H)
@@ -50,7 +51,9 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
   Builder.Inliner = llvm::createFunctionInliningPass(OptLevel, OptSize, false);
 
   std::unique_ptr<llvm::TargetMachine> TM = GetHostTargetMachine();
-  assert(TM);
+  if (!TM) {
+    throw easy::TargetMachineCreateError(Name);
+  }
   TM->adjustPassManager(Builder);
 
   llvm::legacy::PassManager MPM;
