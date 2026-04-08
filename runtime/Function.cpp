@@ -56,6 +56,8 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
   if (!TM) {
     throw easy::TargetMachineCreateError(Name);
   }
+  M.setTargetTriple(Triple.str());
+  M.setDataLayout(TM->createDataLayout());
   TM->adjustPassManager(Builder);
 
   llvm::legacy::PassManager MPM;
