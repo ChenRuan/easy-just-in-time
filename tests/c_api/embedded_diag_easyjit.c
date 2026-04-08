@@ -137,14 +137,10 @@ static void crash_handler(int sig) {
 }
 
 static void install_handlers(void) {
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = crash_handler;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV, &sa, NULL);
-    sigaction(SIGBUS, &sa, NULL);
-    sigaction(SIGILL, &sa, NULL);
-    sigaction(SIGABRT, &sa, NULL);
+    signal(SIGSEGV, crash_handler);
+    signal(SIGBUS, crash_handler);
+    signal(SIGILL, crash_handler);
+    signal(SIGABRT, crash_handler);
 }
 
 static int get_env_int(const char *name, int default_value) {
