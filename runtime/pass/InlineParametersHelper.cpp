@@ -2,6 +2,7 @@
 #include <easy/runtime/BitcodeTracker.h>
 
 #include <llvm/Linker/Linker.h>
+#include <llvm/ADT/APInt.h>
 #include <llvm/IR/InstIterator.h>
 #include <llvm/ADT/SmallSet.h>
 #include <llvm/ADT/SmallVector.h>
@@ -125,25 +126,50 @@ llvm::Constant* easy::LinkPointerIfPossible(llvm::Module &M, easy::PtrArgument c
 
 std::pair<llvm::Constant*, size_t> easy::GetConstantFromRaw(llvm::DataLayout const& DL,
                                                             llvm::Type* T, const uint8_t* Raw) {
-  // pack in a I8 constant vector and cast
-  Type* I8 = Type::getInt8Ty(T->getContext());
-  size_t Size = DL.getTypeStoreSize(T); // TODO: not sure about this
+  size_t Size = DL.getTypeStoreSize(T);
 
-  SmallVector<Constant*, sizeof(uint64_t)> Elements(Size, nullptr);
-  for(size_t i = 0; i != Size; ++i) {
-    Elements[i] = ConstantInt::get(I8, Raw[i]);
+  auto GetBitsFromRaw = [&](unsigned BitWidth) {
+    llvm::APInt Bits(BitWidth, 0);
+    for (size_t I = 0; I != Size; ++I) {
+      size_t ByteOffset = DL.isLittleEndian() ? I : (Size - 1 - I);
+      Bits |= llvm::APInt(BitWidth, Raw[I]) << (ByteOffset * 8);
+    }
+    return Bits;
+  };
+
+  if (T->isIntegerTy()) {
+    unsigned BitWidth = T->getIntegerBitWidth();
+    llvm::APInt Bits = GetBitsFromRaw(std::max<unsigned>(BitWidth, Size * 8));
+    if (Bits.getBitWidth() != BitWidth) {
+      Bits = Bits.trunc(BitWidth);
+    }
+    return {ConstantInt::get(T, Bits), Size};
   }
 
-  Constant* DataAsI8 = ConstantVector::get(Elements);
-  Constant* DataAsT;
-  if(T->isPointerTy()) {
+  if (T->isFloatingPointTy()) {
+    unsigned BitWidth = T->getPrimitiveSizeInBits();
+    llvm::Type* IntTy = Type::getIntNTy(T->getContext(), BitWidth);
+    llvm::APInt Bits = GetBitsFromRaw(BitWidth);
+    Constant* IntValue = ConstantInt::get(IntTy, Bits);
+    return {ConstantExpr::getBitCast(IntValue, T), Size};
+  }
+
+  if (T->isPointerTy()) {
     Type* TInt = DL.getIntPtrType(T->getContext());
-    Constant* DataAsTSizedInt = ConstantExpr::getBitCast(DataAsI8, TInt);
-    DataAsT = ConstantExpr::getIntToPtr(DataAsTSizedInt, T);
-  } else {
-    DataAsT = ConstantExpr::getBitCast(DataAsI8, T);
+    unsigned BitWidth = TInt->getIntegerBitWidth();
+    llvm::APInt Bits = GetBitsFromRaw(BitWidth);
+    Constant* IntValue = ConstantInt::get(TInt, Bits);
+    return {ConstantExpr::getIntToPtr(IntValue, T), Size};
   }
-  return {DataAsT, Size};
+
+  // Fallback for uncommon scalar leaf types.
+  Type* I8 = Type::getInt8Ty(T->getContext());
+  SmallVector<Constant*, sizeof(uint64_t)> Elements(Size, nullptr);
+  for (size_t I = 0; I != Size; ++I) {
+    Elements[I] = ConstantInt::get(I8, Raw[I]);
+  }
+  Constant* DataAsI8 = ConstantVector::get(Elements);
+  return {ConstantExpr::getBitCast(DataAsI8, T), Size};
 }
 
 llvm::Constant* easy::GetArrayConstant(llvm::DataLayout const &DL,
