@@ -17,7 +17,6 @@
 #include <llvm/Analysis/TargetLibraryInfo.h> 
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/Path.h>
-
 #include <cstdio>
 
 #ifdef NDEBUG
@@ -47,27 +46,56 @@ namespace easy {
   DefineEasyException(ExecutionEngineCreateError, "Failed to create execution engine for:");
   DefineEasyException(CouldNotOpenFile, "Failed to file to dump intermediate representation.");
   DefineEasyException(TargetMachineCreateError, "Failed to create target machine for:");
+  DefineEasyException(TargetLookupError, "Failed to lookup target for:");
 }
 
 Function::Function(void* Addr, std::unique_ptr<LLVMHolder> H)
   : Address(Addr), Holder(std::move(H)) {
 }
 
-static std::unique_ptr<llvm::TargetMachine> GetHostTargetMachine() {
-  EASYJIT_RT_LOG("GetHostTargetMachine: selecting target for process triple=%s cpu=%s\n",
-                 llvm::sys::getProcessTriple().c_str(),
+static std::unique_ptr<llvm::TargetMachine> GetTargetMachineForModule(llvm::Module const& M) {
+  std::string TripleStr = M.getTargetTriple();
+  if (TripleStr.empty()) {
+    TripleStr = llvm::sys::getProcessTriple();
+  }
+
+  llvm::Triple Triple(TripleStr);
+  std::string Error;
+  const llvm::Target* Target = llvm::TargetRegistry::lookupTarget(TripleStr, Error);
+
+  EASYJIT_RT_LOG("GetTargetMachineForModule: module_triple=%s effective_triple=%s cpu=%s\n",
+                 M.getTargetTriple().c_str(),
+                 TripleStr.c_str(),
                  llvm::sys::getHostCPUName().str().c_str());
-  std::unique_ptr<llvm::TargetMachine> TM(llvm::EngineBuilder().selectTarget());
-  EASYJIT_RT_LOG("GetHostTargetMachine: result=%p\n", (void*)TM.get());
+
+  if (!Target) {
+    EASYJIT_RT_LOG("GetTargetMachineForModule: lookup failed error=%s\n", Error.c_str());
+    throw easy::TargetLookupError(TripleStr.c_str());
+  }
+
+  llvm::TargetOptions Options;
+  std::unique_ptr<llvm::TargetMachine> TM(
+      Target->createTargetMachine(TripleStr,
+                                  llvm::sys::getHostCPUName().str(),
+                                  "",
+                                  Options,
+                                  llvm::Reloc::PIC_,
+                                  llvm::CodeModel::Small,
+                                  llvm::CodeGenOpt::Aggressive));
+  EASYJIT_RT_LOG("GetTargetMachineForModule: result=%p\n", (void*)TM.get());
   return TM;
 }
 
 static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, unsigned OptLevel, unsigned OptSize) {
 
-  llvm::Triple Triple{llvm::sys::getProcessTriple()};
+  std::string TripleStr = M.getTargetTriple();
+  if (TripleStr.empty()) {
+    TripleStr = llvm::sys::getProcessTriple();
+  }
+  llvm::Triple Triple{TripleStr};
   EASYJIT_RT_LOG("Optimize: begin name=%s triple=%s opt=%u size=%u module_triple=%s datalayout=%s\n",
                  Name ? Name : "<null>",
-                 Triple.str().c_str(),
+                 TripleStr.c_str(),
                  OptLevel,
                  OptSize,
                  M.getTargetTriple().c_str(),
@@ -79,12 +107,12 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
   Builder.LibraryInfo = new llvm::TargetLibraryInfoImpl(Triple);
   Builder.Inliner = llvm::createFunctionInliningPass(OptLevel, OptSize, false);
 
-  std::unique_ptr<llvm::TargetMachine> TM = GetHostTargetMachine();
+  std::unique_ptr<llvm::TargetMachine> TM = GetTargetMachineForModule(M);
   if (!TM) {
     EASYJIT_RT_LOG("Optimize: target machine creation failed for %s\n", Name ? Name : "<null>");
     throw easy::TargetMachineCreateError(Name);
   }
-  M.setTargetTriple(Triple.str());
+  M.setTargetTriple(TripleStr);
   M.setDataLayout(TM->createDataLayout());
   EASYJIT_RT_LOG("Optimize: adjusted module triple=%s datalayout=%s\n",
                  M.getTargetTriple().c_str(),
@@ -115,13 +143,31 @@ static std::unique_ptr<llvm::ExecutionEngine> GetEngine(std::unique_ptr<llvm::Mo
                  (void*)M.get(),
                  M ? M->getTargetTriple().c_str() : "<null>",
                  M ? M->getDataLayoutStr().c_str() : "<null>");
+  std::string TripleStr = M->getTargetTriple();
+  if (TripleStr.empty()) {
+    TripleStr = llvm::sys::getProcessTriple();
+  }
+  llvm::Triple Triple(TripleStr);
   llvm::EngineBuilder ebuilder(std::move(M));
   std::string eeError;
+  llvm::SmallVector<std::string, 4> MAttrs;
+  std::unique_ptr<llvm::TargetMachine> TM(
+      ebuilder.selectTarget(Triple, "", llvm::sys::getHostCPUName(), MAttrs));
+
+  EASYJIT_RT_LOG("GetEngine: selected target machine=%p effective_triple=%s cpu=%s\n",
+                 (void*)TM.get(), TripleStr.c_str(), llvm::sys::getHostCPUName().str().c_str());
+  if (!TM) {
+    EASYJIT_RT_LOG("GetEngine: target machine creation failed for %s\n", Name ? Name : "<null>");
+    throw easy::TargetMachineCreateError(Name);
+  }
 
 std::unique_ptr<llvm::ExecutionEngine> EE(ebuilder.setErrorStr(&eeError)
-          .setMCPU(llvm::sys::getHostCPUName())
+          .setMCPU(TM->getTargetCPU())
           .setEngineKind(llvm::EngineKind::JIT)
           .setOptLevel(llvm::CodeGenOpt::Level::Aggressive)
+          .setTargetOptions(TM->Options)
+          .setRelocationModel(TM->getRelocationModel())
+          .setCodeModel(TM->getCodeModel())
           .create());
 
   if(!EE) {
