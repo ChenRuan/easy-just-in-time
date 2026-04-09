@@ -9,9 +9,24 @@
 #include <llvm/IR/GlobalVariable.h>
 
 #include <llvm/Support/raw_ostream.h>
+#include <cstdio>
 
 using namespace llvm;
 using namespace easy;
+
+#ifndef EASYJIT_RUNTIME_DEBUG
+#define EASYJIT_RUNTIME_DEBUG 1
+#endif
+
+#if EASYJIT_RUNTIME_DEBUG
+#define EASYJIT_RT_PASS_LOG(...)                                                 \
+  do {                                                                           \
+    std::fprintf(stderr, "[easyjit][pass] " __VA_ARGS__);                        \
+    std::fflush(stderr);                                                         \
+  } while (0)
+#else
+#define EASYJIT_RT_PASS_LOG(...) do { } while (0)
+#endif
 
 HighLevelLayout::HighLevelLayout(easy::Context const& C, llvm::Function &F) {
   StructReturn_ = nullptr;
@@ -127,6 +142,16 @@ llvm::Constant* easy::LinkPointerIfPossible(llvm::Module &M, easy::PtrArgument c
 std::pair<llvm::Constant*, size_t> easy::GetConstantFromRaw(llvm::DataLayout const& DL,
                                                             llvm::Type* T, const uint8_t* Raw) {
   size_t Size = DL.getTypeStoreSize(T);
+  EASYJIT_RT_PASS_LOG("GetConstantFromRaw: type=%s size=%zu little_endian=%d\n",
+                      std::string("").append([&]() {
+                        std::string S;
+                        llvm::raw_string_ostream OS(S);
+                        T->print(OS);
+                        OS.flush();
+                        return S;
+                      }()).c_str(),
+                      Size,
+                      DL.isLittleEndian() ? 1 : 0);
 
   auto GetBitsFromRaw = [&](unsigned BitWidth) {
     llvm::APInt Bits(BitWidth, 0);
@@ -331,6 +356,15 @@ llvm::AllocaInst* easy::GetStructAlloc(llvm::IRBuilder<> &B,
                                        llvm::DataLayout const &DL,
                                        easy::StructArgument const &Struct,
                                        llvm::Type* StructTy) {
+  std::string TypeStr;
+  llvm::raw_string_ostream TypeOS(TypeStr);
+  StructTy->print(TypeOS);
+  TypeOS.flush();
+  EASYJIT_RT_PASS_LOG("GetStructAlloc: struct_ty=%s raw_size=%zu alloc_size=%zu little_endian=%d\n",
+                      TypeStr.c_str(),
+                      Struct.get().size(),
+                      static_cast<size_t>(DL.getTypeAllocSize(StructTy).getFixedValue()),
+                      DL.isLittleEndian() ? 1 : 0);
   AllocaInst* Alloc = B.CreateAlloca(StructTy);
   B.CreateStore(Constant::getNullValue(StructTy), Alloc);
 

@@ -18,8 +18,24 @@
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/Path.h>
 
+#include <cstdio>
+
 #ifdef NDEBUG
 #include <llvm/IR/Verifier.h>
+#endif
+
+#ifndef EASYJIT_RUNTIME_DEBUG
+#define EASYJIT_RUNTIME_DEBUG 1
+#endif
+
+#if EASYJIT_RUNTIME_DEBUG
+#define EASYJIT_RT_LOG(...)                                                      \
+  do {                                                                           \
+    std::fprintf(stderr, "[easyjit][runtime] " __VA_ARGS__);                     \
+    std::fflush(stderr);                                                         \
+  } while (0)
+#else
+#define EASYJIT_RT_LOG(...) do { } while (0)
 #endif
 
 
@@ -38,13 +54,24 @@ Function::Function(void* Addr, std::unique_ptr<LLVMHolder> H)
 }
 
 static std::unique_ptr<llvm::TargetMachine> GetHostTargetMachine() {
+  EASYJIT_RT_LOG("GetHostTargetMachine: selecting target for process triple=%s cpu=%s\n",
+                 llvm::sys::getProcessTriple().c_str(),
+                 llvm::sys::getHostCPUName().str().c_str());
   std::unique_ptr<llvm::TargetMachine> TM(llvm::EngineBuilder().selectTarget());
+  EASYJIT_RT_LOG("GetHostTargetMachine: result=%p\n", (void*)TM.get());
   return TM;
 }
 
 static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, unsigned OptLevel, unsigned OptSize) {
 
   llvm::Triple Triple{llvm::sys::getProcessTriple()};
+  EASYJIT_RT_LOG("Optimize: begin name=%s triple=%s opt=%u size=%u module_triple=%s datalayout=%s\n",
+                 Name ? Name : "<null>",
+                 Triple.str().c_str(),
+                 OptLevel,
+                 OptSize,
+                 M.getTargetTriple().c_str(),
+                 M.getDataLayoutStr().c_str());
 
   llvm::PassManagerBuilder Builder;
   Builder.OptLevel = OptLevel;
@@ -54,10 +81,14 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
 
   std::unique_ptr<llvm::TargetMachine> TM = GetHostTargetMachine();
   if (!TM) {
+    EASYJIT_RT_LOG("Optimize: target machine creation failed for %s\n", Name ? Name : "<null>");
     throw easy::TargetMachineCreateError(Name);
   }
   M.setTargetTriple(Triple.str());
   M.setDataLayout(TM->createDataLayout());
+  EASYJIT_RT_LOG("Optimize: adjusted module triple=%s datalayout=%s\n",
+                 M.getTargetTriple().c_str(),
+                 M.getDataLayoutStr().c_str());
   TM->adjustPassManager(Builder);
 
   llvm::legacy::PassManager MPM;
@@ -73,10 +104,17 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
 
   Builder.populateModulePassManager(MPM);
 
+  EASYJIT_RT_LOG("Optimize: running pass manager for %s\n", Name ? Name : "<null>");
   MPM.run(M);
+  EASYJIT_RT_LOG("Optimize: finished for %s\n", Name ? Name : "<null>");
 }
 
 static std::unique_ptr<llvm::ExecutionEngine> GetEngine(std::unique_ptr<llvm::Module> M, const char *Name) {
+  EASYJIT_RT_LOG("GetEngine: begin name=%s module=%p triple=%s datalayout=%s\n",
+                 Name ? Name : "<null>",
+                 (void*)M.get(),
+                 M ? M->getTargetTriple().c_str() : "<null>",
+                 M ? M->getDataLayoutStr().c_str() : "<null>");
   llvm::EngineBuilder ebuilder(std::move(M));
   std::string eeError;
 
@@ -87,18 +125,27 @@ std::unique_ptr<llvm::ExecutionEngine> EE(ebuilder.setErrorStr(&eeError)
           .create());
 
   if(!EE) {
+    EASYJIT_RT_LOG("GetEngine: create failed name=%s error=%s\n",
+                   Name ? Name : "<null>",
+                   eeError.c_str());
     throw easy::ExecutionEngineCreateError(Name);
   }
 
+  EASYJIT_RT_LOG("GetEngine: success engine=%p\n", (void*)EE.get());
   return EE;
 }
 
 static void MapGlobals(llvm::ExecutionEngine& EE, GlobalMapping* Globals) {
+  EASYJIT_RT_LOG("MapGlobals: begin engine=%p globals=%p\n", (void*)&EE, (void*)Globals);
   for(GlobalMapping *GM = Globals; GM->Name; ++GM) {
+    EASYJIT_RT_LOG("MapGlobals: map %s -> %p\n", GM->Name, GM->Address);
     EE.addGlobalMapping(GM->Name, (uint64_t)GM->Address);
   }
+  EASYJIT_RT_LOG("MapGlobals: map __dso_handle -> %p\n", &__dso_handle);
   EE.addGlobalMapping("__dso_handle", (uint64_t)&__dso_handle);
+  EASYJIT_RT_LOG("MapGlobals: finalizeObject begin\n");
   EE.finalizeObject();
+  EASYJIT_RT_LOG("MapGlobals: finalizeObject end\n");
 }
 
 static void WriteOptimizedToFile(llvm::Module const &M, std::string const& File) {
@@ -135,6 +182,11 @@ CompileAndWrap(const char*Name, GlobalMapping* Globals,
                std::unique_ptr<llvm::LLVMContext> Ctx,
                std::unique_ptr<llvm::Module> M) {
 
+  EASYJIT_RT_LOG("CompileAndWrap: begin name=%s globals=%p module=%p ctx=%p\n",
+                 Name ? Name : "<null>",
+                 (void*)Globals,
+                 (void*)M.get(),
+                 (void*)Ctx.get());
   llvm::Module* MPtr = M.get();
   std::unique_ptr<llvm::ExecutionEngine> EE = GetEngine(std::move(M), Name);
 
@@ -142,9 +194,14 @@ CompileAndWrap(const char*Name, GlobalMapping* Globals,
     MapGlobals(*EE, Globals);
   }
 
+  EASYJIT_RT_LOG("CompileAndWrap: getFunctionAddress begin name=%s\n", Name ? Name : "<null>");
   void *Address = (void*)EE->getFunctionAddress(Name);
+  EASYJIT_RT_LOG("CompileAndWrap: getFunctionAddress end name=%s address=%p\n",
+                 Name ? Name : "<null>", Address);
 
   std::unique_ptr<LLVMHolder> Holder(new easy::LLVMHolderImpl{std::move(EE), std::move(Ctx), MPtr});
+  EASYJIT_RT_LOG("CompileAndWrap: success name=%s holder=%p\n",
+                 Name ? Name : "<null>", (void*)Holder.get());
   return std::unique_ptr<Function>(new Function(Address, std::move(Holder)));
 }
 
@@ -157,26 +214,43 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
   // llvm::setCurrentDebugType("jit");
 
   auto &BT = BitcodeTracker::GetTracker();
+  EASYJIT_RT_LOG("Function::Compile: begin addr=%p ctx_size=%zu\n", Addr, C.size());
 
   const char* Name;
   GlobalMapping* Globals;
   std::tie(Name, Globals) = BT.getNameAndGlobalMapping(Addr);
+  EASYJIT_RT_LOG("Function::Compile: tracker name=%s globals=%p\n",
+                 Name ? Name : "<null>", (void*)Globals);
 
   std::unique_ptr<llvm::Module> M;
   std::unique_ptr<llvm::LLVMContext> Ctx;
   std::tie(M, Ctx) = BT.getModule(Addr);
+  EASYJIT_RT_LOG("Function::Compile: module loaded module=%p ctx=%p module_triple=%s datalayout=%s\n",
+                 (void*)M.get(),
+                 (void*)Ctx.get(),
+                 M ? M->getTargetTriple().c_str() : "<null>",
+                 M ? M->getDataLayoutStr().c_str() : "<null>");
 
   unsigned OptLevel;
   unsigned OptSize;
   std::tie(OptLevel, OptSize) = C.getOptLevel();
+  EASYJIT_RT_LOG("Function::Compile: optlevel=%u optsz=%u debugfile=%s\n",
+                 OptLevel, OptSize, C.getDebugFile().c_str());
 
+  EASYJIT_RT_LOG("Function::Compile: write before-ir begin\n");
   WriteOptimizedToFile(*M, GetDumpFileWithSuffix(C.getDebugFile(), ".before"));
+  EASYJIT_RT_LOG("Function::Compile: write before-ir end\n");
 
   Optimize(*M, Name, C, OptLevel, OptSize);
 
+  EASYJIT_RT_LOG("Function::Compile: write final-ir begin\n");
   WriteOptimizedToFile(*M, C.getDebugFile());
+  EASYJIT_RT_LOG("Function::Compile: write final-ir end\n");
+  EASYJIT_RT_LOG("Function::Compile: write after-ir begin\n");
   WriteOptimizedToFile(*M, GetDumpFileWithSuffix(C.getDebugFile(), ".after"));
+  EASYJIT_RT_LOG("Function::Compile: write after-ir end\n");
 
+  EASYJIT_RT_LOG("Function::Compile: CompileAndWrap begin\n");
   return CompileAndWrap(Name, Globals, std::move(Ctx), std::move(M));
 }
 

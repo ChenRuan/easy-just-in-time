@@ -16,6 +16,21 @@
 #include <memory>
 #include <unordered_map>
 #include <string>
+#include <cstdio>
+
+#ifndef EASYJIT_RUNTIME_DEBUG
+#define EASYJIT_RUNTIME_DEBUG 1
+#endif
+
+#if EASYJIT_RUNTIME_DEBUG
+#define EASYJIT_RT_LOG(...)                                                      \
+    do {                                                                         \
+        std::fprintf(stderr, "[easyjit][c-api] " __VA_ARGS__);                   \
+        std::fflush(stderr);                                                     \
+    } while (0)
+#else
+#define EASYJIT_RT_LOG(...) do { } while (0)
+#endif
 
 /* ------------------------------------------------------------------ */
 /*  Layout helpers                                                     */
@@ -322,6 +337,8 @@ easyjit_error_t easyjit_compile(void* func_ptr,
                                  easyjit_context_t ctx,
                                  easyjit_function_t* out_fn) {
     clear_last_error();
+    EASYJIT_RT_LOG("easyjit_compile: begin func_ptr=%p ctx=%p out_fn=%p\n",
+                   func_ptr, (void*)ctx, (void*)out_fn);
     if (!func_ptr) {
         set_last_error("easyjit_compile: func_ptr is NULL");
         return EASYJIT_ERROR_INVALID_ARGUMENT;
@@ -335,16 +352,20 @@ easyjit_error_t easyjit_compile(void* func_ptr,
         return EASYJIT_ERROR_INVALID_ARGUMENT;
     }
     try {
+        EASYJIT_RT_LOG("easyjit_compile: calling easy::Function::Compile\n");
         auto compiled = easy::Function::Compile(func_ptr, ctx->ctx);
         if (!compiled) {
+            EASYJIT_RT_LOG("easyjit_compile: easy::Function::Compile returned null\n");
             set_last_error("easyjit_compile: compilation returned null");
             return EASYJIT_ERROR_COMPILE_FAILED;
         }
         auto* handle = new easyjit_function_s();
         handle->fun = std::move(compiled);
         *out_fn = handle;
+        EASYJIT_RT_LOG("easyjit_compile: success handle=%p\n", (void*)handle);
         return EASYJIT_OK;
     } catch (const std::exception& e) {
+        EASYJIT_RT_LOG("easyjit_compile: exception=%s\n", e.what());
         set_last_error(e.what());
         return EASYJIT_ERROR_COMPILE_FAILED;
     }
