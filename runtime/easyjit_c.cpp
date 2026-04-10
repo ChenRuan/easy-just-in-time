@@ -19,7 +19,7 @@
 #include <cstdio>
 
 #ifndef EASYJIT_RUNTIME_DEBUG
-#define EASYJIT_RUNTIME_DEBUG 1
+#define EASYJIT_RUNTIME_DEBUG 0
 #endif
 
 #if EASYJIT_RUNTIME_DEBUG
