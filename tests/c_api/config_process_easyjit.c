@@ -138,10 +138,11 @@ static void prepare_keys(void) {
     }
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     typedef int (*jit_fn_t)(void);
     easyjit_function_t handles[NUM_KEYS];
     jit_fn_t fn_ptrs[NUM_KEYS];
+    const char *dump_ir = NULL;
 
     printf("============================================================\n");
     printf("  EasyJIT C Snapshot + Raw Pointer Example\n");
@@ -154,12 +155,23 @@ int main(void) {
     init_groups();
     prepare_keys();
 
+    if (argc > 1 && argv[1] && argv[1][0] != '\0') {
+        dump_ir = argv[1];
+    } else {
+        dump_ir = getenv("EASYJIT_DUMP_IR");
+    }
+
+    if (dump_ir && dump_ir[0] != '\0') {
+        printf("  IR dump prefix = %s\n", dump_ir);
+    }
+
     clock_t warmup_begin = clock();
     for (int i = 0; i < NUM_KEYS; ++i) {
         ConfigRecord *cfg;
         easyjit_context_t ctx = NULL;
         easyjit_function_t fn = NULL;
         void *raw = NULL;
+        char dump_path[256];
 
         update_config(g_keys[i].config_index, g_keys[i].group_index);
         cfg = get_config(g_keys[i].config_index);
@@ -167,6 +179,16 @@ int main(void) {
         easyjit_context_create(&ctx);
         easyjit_context_set_snapshot(ctx, cfg, sizeof(ConfigRecord));
         easyjit_context_set_opt_level(ctx, 3, 0);
+        if (dump_ir && dump_ir[0] != '\0') {
+            snprintf(dump_path, sizeof(dump_path), "%s.key%d.ll", dump_ir, g_keys[i].key);
+            if (easyjit_context_set_dump_ir(ctx, dump_path) != EASYJIT_OK) {
+                fprintf(stderr, "set_dump_ir failed for key=%d: %s\n",
+                        g_keys[i].key, easyjit_get_last_error());
+                easyjit_context_destroy(ctx);
+                free(g_configs);
+                return 1;
+            }
+        }
 
         if (easyjit_compile((void *)process_config_jit, ctx, &fn) != EASYJIT_OK) {
             fprintf(stderr, "compile failed for key=%d: %s\n",
