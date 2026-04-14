@@ -251,6 +251,15 @@ int main(int argc, char **argv) {
     printf("Warm-up (JIT all %d keys): %.4f ms\n",
            NUM_KEYS,
            (double)(warmup_end - warmup_begin) * 1000.0 / CLOCKS_PER_SEC);
+    printf("\nData pointers:\n");
+    printf("  g_configs=%p\n", (void *)g_configs);
+    printf("  g_groups=%p\n", (void *)g_groups);
+    for (i = 0; i < NUM_KEYS; ++i) {
+        ConfigRecord *cfg = get_config(g_keys[i].config_index);
+        long long code_data_delta = (long long)(addrs[i].addr - (uintptr_t)cfg);
+        printf("  slot=%d key=%d cfg=%p code_minus_cfg=%lld\n",
+               i, g_keys[i].key, (void *)cfg, code_data_delta);
+    }
     printf("\nAddress table (original order):\n");
     for (i = 0; i < NUM_KEYS; ++i) {
         long long delta = 0;
