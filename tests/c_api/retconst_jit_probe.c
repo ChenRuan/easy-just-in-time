@@ -1,14 +1,8 @@
 /*
  * retconst_jit_probe.c
  *
- * Small-struct probe that mirrors config_process_easyjit.c as closely as
- * possible, but reduces the JIT body to a constant-return-style specialization.
- *
- * Modes:
- *   1 - AOT baseline direct call
- *   2 - AOT multi-target function-pointer dispatch
- *   3 - JIT all keys, same warm-up/steady-state structure as config_process_easyjit
- *   4 - JIT all keys, but steady-state always uses key 0
+ * Directly mirrors config_process_easyjit.c, but reduces the config payload to
+ * a tiny struct and the JIT body to a constant-return-style specialization.
  */
 
 #include <easy/attributes.h>
@@ -33,15 +27,17 @@ typedef struct {
 } SmallConfig;
 
 typedef struct {
+    int value;
+} GroupConfig;
+
+typedef struct {
     int config_index;
     int group_index;
     int key;
 } KeyInfo;
 
-typedef int (*jit_fn_t)(void);
-
 static SmallConfig *g_configs = NULL;
-static int g_groups[GROUP_MAX];
+static GroupConfig g_groups[GROUP_MAX];
 static KeyInfo g_keys[NUM_KEYS];
 
 static void init_configs(void) {
@@ -62,8 +58,22 @@ static void init_groups(void) {
     int i;
 
     for (i = 0; i < GROUP_MAX; ++i) {
-        g_groups[i] = 15 + i * 8;
+        g_groups[i].value = 15 + i * 8;
     }
+}
+
+static inline SmallConfig *get_config(int index) {
+    return &g_configs[index];
+}
+
+static void update_config(int config_index, int group_index) {
+    SmallConfig *cfg = get_config(config_index);
+    GroupConfig *grp = &g_groups[group_index];
+    cfg->value = grp->value;
+}
+
+int EASY_JIT_EXPOSE process_small_jit(SmallConfig *cfg) {
+    return cfg->value;
 }
 
 static void prepare_keys(void) {
@@ -76,125 +86,61 @@ static void prepare_keys(void) {
     }
 }
 
-static inline SmallConfig *get_config(int index) {
-    return &g_configs[index];
-}
-
-static void update_config(int config_index, int group_index) {
-    SmallConfig *cfg = get_config(config_index);
-    cfg->value = g_groups[group_index];
-}
-
-int EASY_JIT_EXPOSE process_small_jit(SmallConfig *cfg) {
-    return cfg->value;
-}
-
 __attribute__((noinline))
 static int process_small_base(int config_index) {
     SmallConfig *cfg = get_config(config_index);
     return cfg->value;
 }
 
-#define DEFINE_SLOT_FN(N)                                \
-    __attribute__((noinline))                            \
-    static int process_small_slot_##N(void) {            \
-        return process_small_base(N);                    \
-    }
-
-DEFINE_SLOT_FN(0)
-DEFINE_SLOT_FN(1)
-DEFINE_SLOT_FN(2)
-DEFINE_SLOT_FN(3)
-DEFINE_SLOT_FN(4)
-DEFINE_SLOT_FN(5)
-DEFINE_SLOT_FN(6)
-DEFINE_SLOT_FN(7)
-DEFINE_SLOT_FN(8)
-DEFINE_SLOT_FN(9)
-DEFINE_SLOT_FN(10)
-DEFINE_SLOT_FN(11)
-
-static void init_slot_ptrs(jit_fn_t fn_ptrs[CONFIG_MAX]) {
-    fn_ptrs[0] = process_small_slot_0;
-    fn_ptrs[1] = process_small_slot_1;
-    fn_ptrs[2] = process_small_slot_2;
-    fn_ptrs[3] = process_small_slot_3;
-    fn_ptrs[4] = process_small_slot_4;
-    fn_ptrs[5] = process_small_slot_5;
-    fn_ptrs[6] = process_small_slot_6;
-    fn_ptrs[7] = process_small_slot_7;
-    fn_ptrs[8] = process_small_slot_8;
-    fn_ptrs[9] = process_small_slot_9;
-    fn_ptrs[10] = process_small_slot_10;
-    fn_ptrs[11] = process_small_slot_11;
-}
-
-static double elapsed_seconds(clock_t begin, clock_t end) {
-    return (double)(end - begin) / CLOCKS_PER_SEC;
-}
-
-static int run_aot_direct(void) {
-    clock_t begin;
-    clock_t end;
-    volatile int sum = 0;
-    int i;
-
-    begin = clock();
-    for (i = 0; i < LOOP_COUNT; ++i) {
-        int config_index = i % CONFIG_MAX;
-        int group_index = i % GROUP_MAX;
-        update_config(config_index, group_index);
-        sum += process_small_base(config_index);
-    }
-    end = clock();
-
-    printf("mode=1 sum=%d\n", (int)sum);
-    printf("steady-state: %.6f sec\n", elapsed_seconds(begin, end));
-    return 0;
-}
-
-static int run_aot_multifptr(void) {
-    jit_fn_t fn_ptrs[CONFIG_MAX];
-    clock_t begin;
-    clock_t end;
-    volatile int sum = 0;
-    int i;
-
-    init_slot_ptrs(fn_ptrs);
-
-    begin = clock();
-    for (i = 0; i < LOOP_COUNT; ++i) {
-        int config_index = i % CONFIG_MAX;
-        int group_index = i % GROUP_MAX;
-        update_config(config_index, group_index);
-        sum += fn_ptrs[config_index]();
-    }
-    end = clock();
-
-    printf("mode=2 sum=%d\n", (int)sum);
-    printf("steady-state: %.6f sec\n", elapsed_seconds(begin, end));
-    return 0;
-}
-
-static int run_jit_like_original(int single_key_mode) {
+int main(int argc, char **argv) {
+    typedef int (*jit_fn_t)(void);
     easyjit_function_t handles[NUM_KEYS];
     jit_fn_t fn_ptrs[NUM_KEYS];
-    clock_t warm_begin;
-    clock_t warm_end;
-    clock_t begin;
-    clock_t end;
-    volatile int sum = 0;
+    const char *dump_ir = NULL;
+    int single_key_mode = 0;
+    int sum = 0;
     int i;
+    clock_t warmup_begin;
+    clock_t warmup_end;
+    clock_t start;
+    clock_t end;
 
-    memset(handles, 0, sizeof(handles));
-    memset(fn_ptrs, 0, sizeof(fn_ptrs));
+    printf("============================================================\n");
+    printf("  retconst_jit_probe\n");
+    printf("  sizeof(SmallConfig) = %zu bytes\n", sizeof(SmallConfig));
+    printf("  LOOP_COUNT = %d   GROUP_MAX = %d   CONFIG_MAX = %d\n",
+           LOOP_COUNT, GROUP_MAX, CONFIG_MAX);
+    printf("============================================================\n\n");
 
-    warm_begin = clock();
+    init_configs();
+    init_groups();
+    prepare_keys();
+
+    if (argc > 1 && strcmp(argv[1], "single") == 0) {
+        single_key_mode = 1;
+        if (argc > 2 && argv[2] && argv[2][0] != '\0') {
+            dump_ir = argv[2];
+        }
+    } else if (argc > 1 && argv[1] && argv[1][0] != '\0') {
+        dump_ir = argv[1];
+    } else {
+        dump_ir = getenv("EASYJIT_DUMP_IR");
+    }
+
+    if (single_key_mode) {
+        printf("  steady-state mode = single key\n");
+    }
+    if (dump_ir && dump_ir[0] != '\0') {
+        printf("  IR dump prefix = %s\n", dump_ir);
+    }
+
+    warmup_begin = clock();
     for (i = 0; i < NUM_KEYS; ++i) {
         SmallConfig *cfg;
         easyjit_context_t ctx = NULL;
         easyjit_function_t fn = NULL;
         void *raw = NULL;
+        char dump_path[256];
 
         update_config(g_keys[i].config_index, g_keys[i].group_index);
         cfg = get_config(g_keys[i].config_index);
@@ -202,6 +148,16 @@ static int run_jit_like_original(int single_key_mode) {
         easyjit_context_create(&ctx);
         easyjit_context_set_snapshot(ctx, cfg, sizeof(SmallConfig));
         easyjit_context_set_opt_level(ctx, 3, 0);
+        if (dump_ir && dump_ir[0] != '\0') {
+            snprintf(dump_path, sizeof(dump_path), "%s.key%d.ll", dump_ir, g_keys[i].key);
+            if (easyjit_context_set_dump_ir(ctx, dump_path) != EASYJIT_OK) {
+                fprintf(stderr, "set_dump_ir failed for key=%d: %s\n",
+                        g_keys[i].key, easyjit_get_last_error());
+                easyjit_context_destroy(ctx);
+                free(g_configs);
+                return 1;
+            }
+        }
 
         if (easyjit_compile((void *)process_small_jit, ctx, &fn) != EASYJIT_OK) {
             fprintf(stderr, "compile failed for key=%d: %s\n",
@@ -223,9 +179,13 @@ static int run_jit_like_original(int single_key_mode) {
         handles[i] = fn;
         fn_ptrs[i] = (jit_fn_t)raw;
     }
-    warm_end = clock();
+    warmup_end = clock();
 
-    begin = clock();
+    printf("Warm-up (JIT all %d keys): %.4f ms\n",
+           NUM_KEYS,
+           (double)(warmup_end - warmup_begin) * 1000.0 / CLOCKS_PER_SEC);
+
+    start = clock();
     for (i = 0; i < LOOP_COUNT; ++i) {
         int config_index = single_key_mode ? 0 : (i % CONFIG_MAX);
         int group_index = single_key_mode ? 0 : (i % GROUP_MAX);
@@ -234,55 +194,14 @@ static int run_jit_like_original(int single_key_mode) {
     }
     end = clock();
 
-    printf("mode=%d sum=%d\n", single_key_mode ? 4 : 3, (int)sum);
-    printf("warm-up: %.6f sec\n", elapsed_seconds(warm_begin, warm_end));
-    printf("steady-state: %.6f sec\n", elapsed_seconds(begin, end));
+    printf("sum=%d\n", sum);
+    printf("steady-state: %.6f sec\n", (double)(end - start) / CLOCKS_PER_SEC);
+    printf("total wall:   %.6f sec\n\n", (double)(end - warmup_begin) / CLOCKS_PER_SEC);
 
     for (i = 0; i < NUM_KEYS; ++i) {
         easyjit_function_destroy(handles[i]);
     }
+    free(g_configs);
+
     return 0;
-}
-
-static void usage(const char *argv0) {
-    printf("usage: %s <mode>\n", argv0);
-    printf("  1 - aot direct baseline\n");
-    printf("  2 - aot multi-target fnptr baseline\n");
-    printf("  3 - jit all keys (mirror config_process_easyjit)\n");
-    printf("  4 - jit all keys, steady-state key 0 only\n");
-}
-
-int main(int argc, char **argv) {
-    int mode;
-
-    printf("============================================================\n");
-    printf("  retconst_jit_probe (config_process_easyjit-style)\n");
-    printf("  sizeof(SmallConfig) = %zu bytes\n", sizeof(SmallConfig));
-    printf("  LOOP_COUNT = %d   GROUP_MAX = %d   CONFIG_MAX = %d\n",
-           LOOP_COUNT, GROUP_MAX, CONFIG_MAX);
-    printf("============================================================\n\n");
-
-    if (argc < 2) {
-        usage(argv[0]);
-        return 1;
-    }
-
-    init_configs();
-    init_groups();
-    prepare_keys();
-
-    mode = atoi(argv[1]);
-    switch (mode) {
-    case 1:
-        return run_aot_direct();
-    case 2:
-        return run_aot_multifptr();
-    case 3:
-        return run_jit_like_original(0);
-    case 4:
-        return run_jit_like_original(1);
-    default:
-        usage(argv[0]);
-        return 1;
-    }
 }
