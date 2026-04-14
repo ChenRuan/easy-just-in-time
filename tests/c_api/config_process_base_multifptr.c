@@ -129,9 +129,10 @@ static int process_config(int config_index) {
     return result;
 }
 
-#define DEFINE_SLOT_FN(N)                 \
-    static int process_config_slot_##N(void) { \
-        return process_config(N);         \
+#define DEFINE_SLOT_FN(N)                              \
+    __attribute__((noinline))                         \
+    static int process_config_slot_##N(void) {        \
+        return process_config(N);                     \
     }
 
 DEFINE_SLOT_FN(0)
