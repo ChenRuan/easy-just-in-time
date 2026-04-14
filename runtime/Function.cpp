@@ -9,8 +9,16 @@
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Transforms/IPO/PassManagerBuilder.h>
 #include <llvm/Transforms/IPO.h>
+#include <llvm/ExecutionEngine/JITSymbol.h>
+#include <llvm/ExecutionEngine/Orc/Core.h>
+#include <llvm/ExecutionEngine/Orc/ExecutionUtils.h>
+#include <llvm/ExecutionEngine/Orc/LLJIT.h>
+#include <llvm/ExecutionEngine/Orc/Mangling.h>
+#include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
+#include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/Support/Host.h> 
+#include <llvm/Support/Error.h>
 #include <llvm/Target/TargetMachine.h> 
 #include <llvm/MC/TargetRegistry.h>
 #include <llvm/Analysis/TargetTransformInfo.h> 
@@ -43,10 +51,11 @@ using namespace easy;
 extern void* __dso_handle;
 
 namespace easy {
-  DefineEasyException(ExecutionEngineCreateError, "Failed to create execution engine for:");
+  DefineEasyException(JITCreateError, "Failed to create ORC JIT for:");
   DefineEasyException(CouldNotOpenFile, "Failed to file to dump intermediate representation.");
   DefineEasyException(TargetMachineCreateError, "Failed to create target machine for:");
   DefineEasyException(TargetLookupError, "Failed to lookup target for:");
+  DefineEasyException(SymbolLookupError, "Failed to lookup JIT symbol for:");
 }
 
 Function::Function(void* Addr, std::unique_ptr<LLVMHolder> H)
@@ -137,61 +146,90 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
   EASYJIT_RT_LOG("Optimize: finished for %s\n", Name ? Name : "<null>");
 }
 
-static std::unique_ptr<llvm::ExecutionEngine> GetEngine(std::unique_ptr<llvm::Module> M, const char *Name) {
-  EASYJIT_RT_LOG("GetEngine: begin name=%s module=%p triple=%s datalayout=%s\n",
-                 Name ? Name : "<null>",
-                 (void*)M.get(),
-                 M ? M->getTargetTriple().c_str() : "<null>",
-                 M ? M->getDataLayoutStr().c_str() : "<null>");
-  std::string TripleStr = M->getTargetTriple();
+static std::string TakeError(llvm::Error Err) {
+  return llvm::toString(std::move(Err));
+}
+
+static llvm::orc::JITTargetMachineBuilder
+GetJITTargetMachineBuilderForModule(llvm::Module const& M) {
+  std::string TripleStr = M.getTargetTriple();
   if (TripleStr.empty()) {
     TripleStr = llvm::sys::getProcessTriple();
   }
-  llvm::Triple Triple(TripleStr);
-  llvm::EngineBuilder ebuilder(std::move(M));
-  std::string eeError;
-  llvm::SmallVector<std::string, 4> MAttrs;
-  std::unique_ptr<llvm::TargetMachine> TM(
-      ebuilder.selectTarget(Triple, "", llvm::sys::getHostCPUName(), MAttrs));
 
-  EASYJIT_RT_LOG("GetEngine: selected target machine=%p effective_triple=%s cpu=%s\n",
-                 (void*)TM.get(), TripleStr.c_str(), llvm::sys::getHostCPUName().str().c_str());
-  if (!TM) {
-    EASYJIT_RT_LOG("GetEngine: target machine creation failed for %s\n", Name ? Name : "<null>");
-    throw easy::TargetMachineCreateError(Name);
-  }
+  llvm::orc::JITTargetMachineBuilder JTMB{llvm::Triple(TripleStr)};
+  JTMB.setCPU(llvm::sys::getHostCPUName().str());
+  JTMB.setRelocationModel(llvm::Reloc::PIC_);
+  JTMB.setCodeModel(llvm::CodeModel::Small);
+  JTMB.setCodeGenOptLevel(llvm::CodeGenOpt::Aggressive);
 
-std::unique_ptr<llvm::ExecutionEngine> EE(ebuilder.setErrorStr(&eeError)
-          .setMCPU(TM->getTargetCPU())
-          .setEngineKind(llvm::EngineKind::JIT)
-          .setOptLevel(llvm::CodeGenOpt::Level::Aggressive)
-          .setTargetOptions(TM->Options)
-          .setRelocationModel(TM->getRelocationModel())
-          .setCodeModel(TM->getCodeModel())
-          .create());
-
-  if(!EE) {
-    EASYJIT_RT_LOG("GetEngine: create failed name=%s error=%s\n",
-                   Name ? Name : "<null>",
-                   eeError.c_str());
-    throw easy::ExecutionEngineCreateError(Name);
-  }
-
-  EASYJIT_RT_LOG("GetEngine: success engine=%p\n", (void*)EE.get());
-  return EE;
+  EASYJIT_RT_LOG("GetJITTargetMachineBuilderForModule: module_triple=%s effective_triple=%s cpu=%s\n",
+                 M.getTargetTriple().c_str(),
+                 TripleStr.c_str(),
+                 llvm::sys::getHostCPUName().str().c_str());
+  return JTMB;
 }
 
-static void MapGlobals(llvm::ExecutionEngine& EE, GlobalMapping* Globals) {
-  EASYJIT_RT_LOG("MapGlobals: begin engine=%p globals=%p\n", (void*)&EE, (void*)Globals);
-  for(GlobalMapping *GM = Globals; GM->Name; ++GM) {
-    EASYJIT_RT_LOG("MapGlobals: map %s -> %p\n", GM->Name, GM->Address);
-    EE.addGlobalMapping(GM->Name, (uint64_t)GM->Address);
+static std::unique_ptr<llvm::orc::LLJIT>
+CreateJIT(llvm::Module const& M, const char *Name) {
+  EASYJIT_RT_LOG("CreateJIT: begin name=%s triple=%s datalayout=%s\n",
+                 Name ? Name : "<null>",
+                 M.getTargetTriple().c_str(),
+                 M.getDataLayoutStr().c_str());
+  llvm::orc::LLJITBuilder Builder;
+  Builder.setPlatformSetUp(llvm::orc::setUpInactivePlatform);
+  Builder.setNumCompileThreads(0);
+  Builder.setJITTargetMachineBuilder(GetJITTargetMachineBuilderForModule(M));
+  Builder.setDataLayout(M.getDataLayout());
+
+  auto JITOrErr = Builder.create();
+  if (!JITOrErr) {
+    auto Err = TakeError(JITOrErr.takeError());
+    EASYJIT_RT_LOG("CreateJIT: failed name=%s error=%s\n",
+                   Name ? Name : "<null>", Err.c_str());
+    throw easy::JITCreateError(Name);
   }
+
+  EASYJIT_RT_LOG("CreateJIT: success name=%s jit=%p\n",
+                 Name ? Name : "<null>", (void*)JITOrErr->get());
+  return std::move(*JITOrErr);
+}
+
+static void MapGlobals(llvm::orc::LLJIT& JIT, GlobalMapping* Globals) {
+  EASYJIT_RT_LOG("MapGlobals: begin jit=%p globals=%p\n", (void*)&JIT, (void*)Globals);
+
+  llvm::orc::MangleAndInterner Mangle(JIT.getExecutionSession(), JIT.getDataLayout());
+  llvm::orc::SymbolMap Symbols;
+
+  for(GlobalMapping *GM = Globals; GM && GM->Name; ++GM) {
+    EASYJIT_RT_LOG("MapGlobals: map %s -> %p\n", GM->Name, GM->Address);
+    Symbols[Mangle(GM->Name)] =
+      llvm::JITEvaluatedSymbol(llvm::pointerToJITTargetAddress(GM->Address),
+                               llvm::JITSymbolFlags::Exported);
+  }
+
   EASYJIT_RT_LOG("MapGlobals: map __dso_handle -> %p\n", &__dso_handle);
-  EE.addGlobalMapping("__dso_handle", (uint64_t)&__dso_handle);
-  EASYJIT_RT_LOG("MapGlobals: finalizeObject begin\n");
-  EE.finalizeObject();
-  EASYJIT_RT_LOG("MapGlobals: finalizeObject end\n");
+  Symbols[Mangle("__dso_handle")] =
+    llvm::JITEvaluatedSymbol(llvm::pointerToJITTargetAddress(&__dso_handle),
+                             llvm::JITSymbolFlags::Exported);
+
+  if (auto Err = JIT.getMainJITDylib().define(absoluteSymbols(std::move(Symbols)))) {
+    auto ErrStr = TakeError(std::move(Err));
+    EASYJIT_RT_LOG("MapGlobals: define failed error=%s\n", ErrStr.c_str());
+    throw easy::JITCreateError("global mapping");
+  }
+
+  auto GeneratorOrErr =
+      llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+          JIT.getDataLayout().getGlobalPrefix());
+  if (!GeneratorOrErr) {
+    auto ErrStr = TakeError(GeneratorOrErr.takeError());
+    EASYJIT_RT_LOG("MapGlobals: current-process generator failed error=%s\n", ErrStr.c_str());
+    throw easy::JITCreateError("current process symbols");
+  }
+
+  JIT.getMainJITDylib().addGenerator(std::move(*GeneratorOrErr));
+  EASYJIT_RT_LOG("MapGlobals: end\n");
 }
 
 static void WriteOptimizedToFile(llvm::Module const &M, std::string const& File) {
@@ -233,19 +271,53 @@ CompileAndWrap(const char*Name, GlobalMapping* Globals,
                  (void*)Globals,
                  (void*)M.get(),
                  (void*)Ctx.get());
-  llvm::Module* MPtr = M.get();
-  std::unique_ptr<llvm::ExecutionEngine> EE = GetEngine(std::move(M), Name);
-
-  if(Globals) {
-    MapGlobals(*EE, Globals);
+  auto StoredCtx = std::make_unique<llvm::LLVMContext>();
+  auto StoredModule = easy::CloneModuleWithContext(*M, *StoredCtx);
+  if (!StoredModule) {
+    EASYJIT_RT_LOG("CompileAndWrap: failed to clone optimized module name=%s\n",
+                   Name ? Name : "<null>");
+    throw easy::JITCreateError(Name);
   }
 
-  EASYJIT_RT_LOG("CompileAndWrap: getFunctionAddress begin name=%s\n", Name ? Name : "<null>");
-  void *Address = (void*)EE->getFunctionAddress(Name);
-  EASYJIT_RT_LOG("CompileAndWrap: getFunctionAddress end name=%s address=%p\n",
+  auto JIT = CreateJIT(*M, Name);
+
+  if(Globals) {
+    MapGlobals(*JIT, Globals);
+  }
+
+  EASYJIT_RT_LOG("CompileAndWrap: addIRModule begin name=%s\n", Name ? Name : "<null>");
+  auto TSCtx = std::make_unique<llvm::LLVMContext>();
+  auto JITModule = easy::CloneModuleWithContext(*M, *TSCtx);
+  if (!JITModule) {
+    EASYJIT_RT_LOG("CompileAndWrap: failed to clone jit module name=%s\n",
+                   Name ? Name : "<null>");
+    throw easy::JITCreateError(Name);
+  }
+
+  if (auto Err = JIT->addIRModule(
+          llvm::orc::ThreadSafeModule(std::move(JITModule), std::move(TSCtx)))) {
+    auto ErrStr = TakeError(std::move(Err));
+    EASYJIT_RT_LOG("CompileAndWrap: addIRModule failed name=%s error=%s\n",
+                   Name ? Name : "<null>", ErrStr.c_str());
+    throw easy::JITCreateError(Name);
+  }
+  EASYJIT_RT_LOG("CompileAndWrap: addIRModule end name=%s\n", Name ? Name : "<null>");
+
+  EASYJIT_RT_LOG("CompileAndWrap: lookup begin name=%s\n", Name ? Name : "<null>");
+  auto AddressOrErr = JIT->lookup(Name);
+  if (!AddressOrErr) {
+    auto ErrStr = TakeError(AddressOrErr.takeError());
+    EASYJIT_RT_LOG("CompileAndWrap: lookup failed name=%s error=%s\n",
+                   Name ? Name : "<null>", ErrStr.c_str());
+    throw easy::SymbolLookupError(Name);
+  }
+
+  void *Address = AddressOrErr->toPtr<void*>();
+  EASYJIT_RT_LOG("CompileAndWrap: lookup end name=%s address=%p\n",
                  Name ? Name : "<null>", Address);
 
-  std::unique_ptr<LLVMHolder> Holder(new easy::LLVMHolderImpl{std::move(EE), std::move(Ctx), MPtr});
+  std::unique_ptr<LLVMHolder> Holder(
+      new easy::LLVMHolderImpl{std::move(JIT), std::move(StoredCtx), std::move(StoredModule)});
   EASYJIT_RT_LOG("CompileAndWrap: success name=%s holder=%p\n",
                  Name ? Name : "<null>", (void*)Holder.get());
   return std::unique_ptr<Function>(new Function(Address, std::move(Holder)));
@@ -339,11 +411,11 @@ std::unique_ptr<easy::Function> easy::Function::deserialize(std::istream& is) {
 bool Function::operator==(easy::Function const& other) const {
   LLVMHolderImpl& This = static_cast<LLVMHolderImpl&>(*this->Holder);
   LLVMHolderImpl& Other = static_cast<LLVMHolderImpl&>(*other.Holder);
-  return This.M_ == Other.M_;
+  return This.M_.get() == Other.M_.get();
 }
 
 std::hash<easy::Function>::result_type
 std::hash<easy::Function>::operator()(argument_type const& F) const noexcept {
   LLVMHolderImpl& This = static_cast<LLVMHolderImpl&>(*F.Holder);
-  return std::hash<llvm::Module*>{}(This.M_);
+  return std::hash<llvm::Module*>{}(This.M_.get());
 }
