@@ -220,6 +220,50 @@ easyjit_error_t easyjit_context_set_snapshot(easyjit_context_t ctx,
 }
 
 extern "C"
+easyjit_error_t easyjit_context_set_partial_struct(easyjit_context_t ctx,
+                                                    unsigned index) {
+    clear_last_error();
+    if (!ctx) {
+        set_last_error("easyjit_context_set_partial_struct: ctx is NULL");
+        return EASYJIT_ERROR_INVALID_ARGUMENT;
+    }
+    try {
+        set_scalar_layout(ctx->ctx);
+        ctx->ctx.setPartialStruct(index);
+        return EASYJIT_OK;
+    } catch (const std::exception& e) {
+        set_last_error(e.what());
+        return EASYJIT_ERROR_INTERNAL;
+    }
+}
+
+extern "C"
+easyjit_error_t easyjit_context_bind_field(easyjit_context_t ctx,
+                                            size_t field_offset,
+                                            const void* data,
+                                            size_t size) {
+    clear_last_error();
+    if (!ctx) {
+        set_last_error("easyjit_context_bind_field: ctx is NULL");
+        return EASYJIT_ERROR_INVALID_ARGUMENT;
+    }
+    if (!data && size > 0) {
+        set_last_error("easyjit_context_bind_field: data is NULL with non-zero size");
+        return EASYJIT_ERROR_INVALID_ARGUMENT;
+    }
+    try {
+        std::vector<char> bytes(size);
+        if (!bytes.empty())
+            std::memcpy(bytes.data(), data, size);
+        ctx->ctx.bindFieldToLastPartialStruct(field_offset, std::move(bytes));
+        return EASYJIT_OK;
+    } catch (const std::exception& e) {
+        set_last_error(e.what());
+        return EASYJIT_ERROR_INTERNAL;
+    }
+}
+
+extern "C"
 easyjit_error_t easyjit_context_bind_array(easyjit_context_t ctx,
                                             size_t field_offset,
                                             const void* data,

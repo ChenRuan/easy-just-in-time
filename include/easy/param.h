@@ -140,10 +140,10 @@ struct snapshot_parameter {
     static_assert(std::is_trivially_copyable<ValueType>::value,
                   "snapshot requires trivially copyable types");
     assert(arg.ptr != nullptr && "easy::snapshot does not accept null pointers");
-    std::vector<typename easy::StructArgument::ArrayBinding> bindings;
+    std::vector<easy::StructArrayBinding> bindings;
     bindings.reserve(arg.array_bindings.size());
     for (auto const &Binding : arg.array_bindings) {
-      bindings.push_back(typename easy::StructArgument::ArrayBinding{
+      bindings.push_back(easy::StructArrayBinding{
           Binding.offset,
           std::vector<char>(),
           Binding.count,

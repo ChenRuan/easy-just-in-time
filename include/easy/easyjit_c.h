@@ -126,11 +126,43 @@ easyjit_error_t easyjit_context_set_snapshot(easyjit_context_t ctx,
                                               size_t size);
 
 /**
+ * Forward the next parameter as a runtime struct pointer while allowing
+ * selected fields to be bound as compile-time constants.
+ *
+ * This is intended for function parameters of type `T*` / `const T*`
+ * where only some members should be specialized. The parameter remains in the
+ * specialized function signature at runtime index `index`, unlike
+ * easyjit_context_set_snapshot() which removes the parameter entirely.
+ *
+ * After calling this, append one or more easyjit_context_bind_field() and/or
+ * easyjit_context_bind_array() calls to describe which members are constant.
+ */
+easyjit_error_t easyjit_context_set_partial_struct(easyjit_context_t ctx,
+                                                    unsigned index);
+
+/**
+ * Bind one scalar/pointer leaf field inside the most recent partial-struct
+ * parameter to a compile-time constant byte representation.
+ *
+ * `field_offset` should usually be produced with offsetof(T, member).
+ * `data` points to the field value to bake in; `size` is usually sizeof(field).
+ *
+ * Example:
+ *   easyjit_context_set_partial_struct(ctx, 0);
+ *   easyjit_context_bind_field(ctx, offsetof(Config, enabled),
+ *                              &cfg.enabled, sizeof(cfg.enabled));
+ */
+easyjit_error_t easyjit_context_bind_field(easyjit_context_t ctx,
+                                            size_t field_offset,
+                                            const void* data,
+                                            size_t size);
+
+/**
  * Bind an array snapshot to a pointer field inside the most recent snapshot.
  *
- * This extends the latest easyjit_context_set_snapshot()/set_struct() call by
- * replacing the pointer field at byte offset `field_offset` with a private
- * constant array built from `data[0..count)`.
+ * This extends the latest easyjit_context_set_snapshot()/set_struct()/
+ * set_partial_struct() call by replacing the pointer field at byte offset
+ * `field_offset` with a private constant array built from `data[0..count)`.
  *
  * The usual pattern is:
  *   easyjit_context_set_snapshot(ctx, &cfg, sizeof(cfg));
@@ -139,8 +171,8 @@ easyjit_error_t easyjit_context_set_snapshot(easyjit_context_t ctx,
  * This is the C equivalent of:
  *   easy::snapshot(cfg, easy::bind_array(&Config::array, n))
  *
- * The binding applies to the most recently appended snapshot parameter and is
- * intended for read-only pointee data.
+ * The binding applies to the most recently appended snapshot/partial-struct
+ * parameter and is intended for read-only pointee data.
  */
 easyjit_error_t easyjit_context_bind_array(easyjit_context_t ctx,
                                             size_t field_offset,

@@ -28,9 +28,12 @@ HighLevelLayout GetNewLayout(easy::Context const &C, HighLevelLayout &HLL) {
   assert(C.size() == HLL.Args_.size());
 
   size_t NNewArgs = 0;
-  for(auto const &Arg : C)
+  for(auto const &Arg : C) {
     if(auto const *Map = Arg->as<easy::ForwardArgument>())
       NNewArgs = std::max<size_t>(NNewArgs, Map->get()+1);
+    else if (auto const *Map = Arg->as<easy::PartialStructArgument>())
+      NNewArgs = std::max<size_t>(NNewArgs, Map->getIndex()+1);
+  }
 
   HighLevelLayout NewHLL(HLL);
   NewHLL.Args_.clear();
@@ -44,6 +47,10 @@ HighLevelLayout GetNewLayout(easy::Context const &C, HighLevelLayout &HLL) {
       if(!VisitedArgs.insert(Map->get()).second)
         continue;
       NewHLL.Args_[Map->get()] = HLL.Args_[arg];
+    } else if (auto const *Map = C.getArgumentMapping(arg).as<easy::PartialStructArgument>()) {
+      if(!VisitedArgs.insert(Map->getIndex()).second)
+        continue;
+      NewHLL.Args_[Map->getIndex()] = HLL.Args_[arg];
     }
   }
 
@@ -129,7 +136,7 @@ void GetInlineArgs(easy::Context const &C,
           Type* StructType = easy::FindPointeeStructType(F, ParamIdx);
           assert(StructType && "Cannot discover struct type for pointer/reference parameter");
           AllocaInst* ParamAlloc = easy::GetStructAlloc(B, DL, *Struct, StructType);
-          easy::ApplyStructArrayBindings(B, DL, *Struct, StructType, ParamAlloc);
+          easy::ApplyStructArrayBindings(B, DL, Struct->getArrayBindings(), StructType, ParamAlloc);
           Args.push_back(ParamAlloc);
         } else if (ArgInF.StructByArray_) {
           // struct is passed as an array
@@ -166,6 +173,22 @@ void GetInlineArgs(easy::Context const &C,
             RawOffset += RawSize;
           }
         }
+      } break;
+
+      case easy::ArgumentBase::AK_PartialStruct: {
+        auto const *Struct = Arg.as<easy::PartialStructArgument>();
+        auto Forward = GetForwardArgs(ArgInF, FHLL, Wrapper, WrapperHLL);
+        assert(Forward.size() == 1 && "partial struct arguments must map to one wrapper argument");
+        if (!ArgInF.StructByPointer_) {
+          llvm::report_fatal_error("partial struct binding requires a pointer/reference parameter carrier",
+                                   true);
+        }
+
+        unsigned ParamIdx = ArgInF.FirstParamIdx_ + (FHLL.StructReturn_ ? 1 : 0);
+        Type* StructType = easy::FindPointeeStructType(F, ParamIdx);
+        assert(StructType && "Cannot discover struct type for partial-struct parameter");
+        AllocaInst* ParamAlloc = easy::GetPartialStructAlloc(B, DL, *Struct, StructType, Forward[0]);
+        Args.push_back(ParamAlloc);
       } break;
 
       case easy::ArgumentBase::AK_Module: {

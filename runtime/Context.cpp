@@ -20,8 +20,14 @@ Context& Context::setParameterPointer(const void* val) {
 }
 
 Context& Context::setParameterStruct(serialized_arg arg,
-                                     std::vector<StructArgument::ArrayBinding> Bindings) {
+                                     std::vector<StructArrayBinding> Bindings) {
   return setArg<StructArgument>(std::move(arg), std::move(Bindings));
+}
+
+Context& Context::setPartialStruct(unsigned Index,
+                                   std::vector<StructFieldBinding> FieldBindings,
+                                   std::vector<StructArrayBinding> ArrayBindings) {
+  return setArg<PartialStructArgument>(Index, std::move(FieldBindings), std::move(ArrayBindings));
 }
 
 Context& Context::setParameterArray(std::vector<char> data, size_t Count, size_t ElementSize) {
@@ -37,14 +43,33 @@ Context& Context::bindArrayToLastStruct(size_t Offset,
                                         size_t Count,
                                         size_t ElementSize) {
   if (ArgumentMapping_.empty())
-    throw std::invalid_argument("bindArrayToLastStruct requires a previous snapshot parameter");
+    throw std::invalid_argument("bindArrayToLastStruct requires a previous struct parameter");
 
-  auto *Struct = ArgumentMapping_.back()->as<StructArgument>();
-  if (!Struct)
-    throw std::invalid_argument("bindArrayToLastStruct must follow a snapshot parameter");
+  if (auto *Struct = ArgumentMapping_.back()->as<StructArgument>()) {
+    Struct->addArrayBinding(StructArrayBinding{
+        Offset, std::move(Data), Count, ElementSize});
+    return *this;
+  }
 
-  Struct->addArrayBinding(StructArgument::ArrayBinding{
-      Offset, std::move(Data), Count, ElementSize});
+  if (auto *Partial = ArgumentMapping_.back()->as<PartialStructArgument>()) {
+    Partial->addArrayBinding(StructArrayBinding{
+        Offset, std::move(Data), Count, ElementSize});
+    return *this;
+  }
+
+  throw std::invalid_argument("bindArrayToLastStruct must follow a snapshot or partial-struct parameter");
+}
+
+Context& Context::bindFieldToLastPartialStruct(size_t Offset,
+                                               std::vector<char> Data) {
+  if (ArgumentMapping_.empty())
+    throw std::invalid_argument("bindFieldToLastPartialStruct requires a previous partial-struct parameter");
+
+  auto *Partial = ArgumentMapping_.back()->as<PartialStructArgument>();
+  if (!Partial)
+    throw std::invalid_argument("bindFieldToLastPartialStruct must follow a partial-struct parameter");
+
+  Partial->addFieldBinding(StructFieldBinding{Offset, std::move(Data)});
   return *this;
 }
 

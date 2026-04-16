@@ -59,6 +59,7 @@ struct ArgumentBase {
     AK_Float,
     AK_Ptr,
     AK_Struct,
+    AK_PartialStruct,
     AK_Array,
     AK_Module,
   };
@@ -123,34 +124,43 @@ DeclareArgument(Float, double);
 DeclareArgument(Ptr, void const*);
 DeclareArgument(Module, easy::Function const&);
 
+struct StructFieldBinding {
+  size_t Offset_;
+  std::vector<char> Data_;
+
+  bool operator==(StructFieldBinding const& Other) const {
+    return Offset_ == Other.Offset_ && Data_ == Other.Data_;
+  }
+};
+
+struct StructArrayBinding {
+  size_t Offset_;
+  std::vector<char> Data_;
+  size_t Count_;
+  size_t ElementSize_;
+
+  bool operator==(StructArrayBinding const& Other) const {
+    return Offset_ == Other.Offset_ &&
+           Count_ == Other.Count_ &&
+           ElementSize_ == Other.ElementSize_ &&
+           Data_ == Other.Data_;
+  }
+};
+
 class StructArgument
     : public ArgumentBase {
  public:
-  struct ArrayBinding {
-    size_t Offset_;
-    std::vector<char> Data_;
-    size_t Count_;
-    size_t ElementSize_;
-
-    bool operator==(ArrayBinding const& Other) const {
-      return Offset_ == Other.Offset_ &&
-             Count_ == Other.Count_ &&
-             ElementSize_ == Other.ElementSize_ &&
-             Data_ == Other.Data_;
-    }
-  };
-
  private:
   serialized_arg Data_;
-  std::vector<ArrayBinding> ArrayBindings_;
+  std::vector<StructArrayBinding> ArrayBindings_;
 
   public:
-  StructArgument(serialized_arg &&arg, std::vector<ArrayBinding> bindings = {})
+  StructArgument(serialized_arg &&arg, std::vector<StructArrayBinding> bindings = {})
     : ArgumentBase(), Data_(std::move(arg)), ArrayBindings_(std::move(bindings)) {}
   virtual ~StructArgument() override = default;
   std::vector<char> const & get() const { return Data_.buf; }
-  std::vector<ArrayBinding> const& getArrayBindings() const { return ArrayBindings_; }
-  void addArrayBinding(ArrayBinding binding) { ArrayBindings_.push_back(std::move(binding)); }
+  std::vector<StructArrayBinding> const& getArrayBindings() const { return ArrayBindings_; }
+  void addArrayBinding(StructArrayBinding binding) { ArrayBindings_.push_back(std::move(binding)); }
   static constexpr ArgumentKind Kind = AK_Struct;
   ArgumentKind kind() const noexcept override  { return Kind; }
 
@@ -167,6 +177,58 @@ class StructArgument
     for (char c : get())
       R ^= hash(c);
     for (auto const &Binding : getArrayBindings()) {
+      R ^= hash(static_cast<int64_t>(Binding.Offset_));
+      R ^= hash(static_cast<int64_t>(Binding.Count_));
+      R ^= hash(static_cast<int64_t>(Binding.ElementSize_));
+      for (char c : Binding.Data_)
+        R ^= hash(c);
+    }
+    return R;
+  }
+};
+
+class PartialStructArgument
+    : public ArgumentBase {
+  unsigned Index_;
+  std::vector<StructFieldBinding> FieldBindings_;
+  std::vector<StructArrayBinding> ArrayBindings_;
+
+ public:
+  PartialStructArgument(unsigned Index,
+                        std::vector<StructFieldBinding> FieldBindings = {},
+                        std::vector<StructArrayBinding> ArrayBindings = {})
+      : ArgumentBase(),
+        Index_(Index),
+        FieldBindings_(std::move(FieldBindings)),
+        ArrayBindings_(std::move(ArrayBindings)) {}
+  virtual ~PartialStructArgument() override = default;
+
+  unsigned getIndex() const { return Index_; }
+  std::vector<StructFieldBinding> const& getFieldBindings() const { return FieldBindings_; }
+  std::vector<StructArrayBinding> const& getArrayBindings() const { return ArrayBindings_; }
+  void addFieldBinding(StructFieldBinding Binding) { FieldBindings_.push_back(std::move(Binding)); }
+  void addArrayBinding(StructArrayBinding Binding) { ArrayBindings_.push_back(std::move(Binding)); }
+
+  static constexpr ArgumentKind Kind = AK_PartialStruct;
+  ArgumentKind kind() const noexcept override { return Kind; }
+
+ protected:
+  bool compareWithSameType(ArgumentBase const& Other) const override {
+    auto const &OtherCast = static_cast<PartialStructArgument const&>(Other);
+    return Index_ == OtherCast.Index_ &&
+           FieldBindings_ == OtherCast.FieldBindings_ &&
+           ArrayBindings_ == OtherCast.ArrayBindings_;
+  }
+
+  size_t hash() const noexcept override {
+    std::hash<int64_t> hash{};
+    size_t R = hash(static_cast<int64_t>(Index_));
+    for (auto const &Binding : FieldBindings_) {
+      R ^= hash(static_cast<int64_t>(Binding.Offset_));
+      for (char c : Binding.Data_)
+        R ^= hash(c);
+    }
+    for (auto const &Binding : ArrayBindings_) {
       R ^= hash(static_cast<int64_t>(Binding.Offset_));
       R ^= hash(static_cast<int64_t>(Binding.Count_));
       R ^= hash(static_cast<int64_t>(Binding.ElementSize_));
@@ -237,9 +299,13 @@ class Context {
   Context& setParameterInt(int64_t);
   Context& setParameterFloat(double);
   Context& setParameterPointer(void const*);
-  Context& setParameterStruct(serialized_arg, std::vector<StructArgument::ArrayBinding> Bindings = {});
+  Context& setParameterStruct(serialized_arg, std::vector<StructArrayBinding> Bindings = {});
+  Context& setPartialStruct(unsigned Index,
+                            std::vector<StructFieldBinding> FieldBindings = {},
+                            std::vector<StructArrayBinding> ArrayBindings = {});
   Context& setParameterArray(std::vector<char>, size_t Count, size_t ElementSize);
   Context& setParameterModule(easy::Function const&);
+  Context& bindFieldToLastPartialStruct(size_t Offset, std::vector<char> Data);
   Context& bindArrayToLastStruct(size_t Offset, std::vector<char> Data, size_t Count, size_t ElementSize);
 
   Context& setArgumentLayout(layout_id id) {

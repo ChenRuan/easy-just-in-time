@@ -48,10 +48,20 @@ llvm::Constant* LinkPointerIfPossible(llvm::Module &M, easy::PtrArgument const &
 bool LinkAndUpdateSymbol(llvm::Module &M, llvm::StringRef FName, llvm::StringRef WrapperName, llvm::SmallVectorImpl<PostLinkageSymbol> &Symbols, easy::Context const &C, llvm::Value* CallToUpdate);
 
 llvm::AllocaInst* GetStructAlloc(llvm::IRBuilder<> &B, llvm::DataLayout const &DL, easy::StructArgument const &Struct, llvm::Type* StructTy);
+llvm::AllocaInst* GetPartialStructAlloc(llvm::IRBuilder<> &B,
+                                        llvm::DataLayout const &DL,
+                                        easy::PartialStructArgument const &Struct,
+                                        llvm::Type* StructTy,
+                                        llvm::Value* RuntimePtr);
 llvm::Constant* GetArrayConstant(llvm::DataLayout const &DL, easy::ArrayArgument const &Array, llvm::Type* PointeeTy);
 void ApplyStructArrayBindings(llvm::IRBuilder<> &B,
                               llvm::DataLayout const &DL,
-                              easy::StructArgument const &Struct,
+                              std::vector<easy::StructArrayBinding> const &Bindings,
+                              llvm::Type* StructTy,
+                              llvm::AllocaInst* Alloc);
+void ApplyStructFieldBindings(llvm::IRBuilder<> &B,
+                              llvm::DataLayout const &DL,
+                              std::vector<easy::StructFieldBinding> const &Bindings,
                               llvm::Type* StructTy,
                               llvm::AllocaInst* Alloc);
 

@@ -221,7 +221,7 @@ llvm::Constant* easy::GetArrayConstant(llvm::DataLayout const &DL,
 }
 
 static Constant* GetRawByteArrayPointer(Module &M,
-                                        easy::StructArgument::ArrayBinding const &Binding) {
+                                        easy::StructArrayBinding const &Binding) {
   LLVMContext &Ctx = M.getContext();
   auto *I8 = Type::getInt8Ty(Ctx);
   SmallVector<uint8_t, 16> Bytes;
@@ -243,11 +243,11 @@ static Constant* GetRawByteArrayPointer(Module &M,
   return ConstantExpr::getInBoundsGetElementPtr(Init->getType(), GV, Indices);
 }
 
-static bool FindFieldPathByOffset(llvm::DataLayout const &DL,
-                                  llvm::Type* Ty,
-                                  size_t Offset,
-                                  SmallVectorImpl<unsigned> &Indices,
-                                  llvm::Type*& FieldTy) {
+static bool FindLeafFieldPathByOffset(llvm::DataLayout const &DL,
+                                      llvm::Type* Ty,
+                                      size_t Offset,
+                                      SmallVectorImpl<unsigned> &Indices,
+                                      llvm::Type*& FieldTy) {
   if (auto *STy = dyn_cast<StructType>(Ty)) {
     auto const *SL = DL.getStructLayout(STy);
     for (unsigned Field = 0; Field != STy->getNumElements(); ++Field) {
@@ -258,12 +258,12 @@ static bool FindFieldPathByOffset(llvm::DataLayout const &DL,
         continue;
 
       Indices.push_back(Field);
-      if (Offset == FieldOffset && ElemTy->isPointerTy()) {
+      if (Offset == FieldOffset && !ElemTy->isAggregateType()) {
         FieldTy = ElemTy;
         return true;
       }
 
-      if (FindFieldPathByOffset(DL, ElemTy, Offset - FieldOffset, Indices, FieldTy))
+      if (FindLeafFieldPathByOffset(DL, ElemTy, Offset - FieldOffset, Indices, FieldTy))
         return true;
 
       Indices.pop_back();
@@ -279,7 +279,11 @@ static bool FindFieldPathByOffset(llvm::DataLayout const &DL,
     if (Index >= ATy->getNumElements())
       return false;
     Indices.push_back(static_cast<unsigned>(Index));
-    if (FindFieldPathByOffset(DL, ATy->getElementType(), Offset - Index * ElemSize, Indices, FieldTy))
+    if (Offset == Index * ElemSize && !ATy->getElementType()->isAggregateType()) {
+      FieldTy = ATy->getElementType();
+      return true;
+    }
+    if (FindLeafFieldPathByOffset(DL, ATy->getElementType(), Offset - Index * ElemSize, Indices, FieldTy))
       return true;
     Indices.pop_back();
     return false;
@@ -290,18 +294,22 @@ static bool FindFieldPathByOffset(llvm::DataLayout const &DL,
 
 void easy::ApplyStructArrayBindings(llvm::IRBuilder<> &B,
                                     llvm::DataLayout const &DL,
-                                    easy::StructArgument const &Struct,
+                                    std::vector<easy::StructArrayBinding> const &Bindings,
                                     llvm::Type* StructTy,
                                     llvm::AllocaInst* Alloc) {
-  for (auto const &Binding : Struct.getArrayBindings()) {
+  for (auto const &Binding : Bindings) {
     SmallVector<unsigned, 8> Indices;
     Type* FieldTy = nullptr;
-    if (!FindFieldPathByOffset(DL, StructTy, Binding.Offset_, Indices, FieldTy)) {
+    if (!FindLeafFieldPathByOffset(DL, StructTy, Binding.Offset_, Indices, FieldTy)) {
       errs() << "WARNING: snapshot bind_array could not resolve field offset "
              << Binding.Offset_ << "\n";
       continue;
     }
-    (void)FieldTy;
+    if (!FieldTy->isPointerTy()) {
+      errs() << "WARNING: snapshot bind_array field offset " << Binding.Offset_
+             << " does not resolve to a pointer field\n";
+      continue;
+    }
 
     Value* FieldPtr = Alloc;
     SmallVector<Value*, 8> GEP = {B.getInt32(0)};
@@ -311,6 +319,40 @@ void easy::ApplyStructArrayBindings(llvm::IRBuilder<> &B,
 
     Constant* BoundPtr = GetRawByteArrayPointer(*Alloc->getModule(), Binding);
     B.CreateStore(BoundPtr, FieldPtr);
+  }
+}
+
+void easy::ApplyStructFieldBindings(llvm::IRBuilder<> &B,
+                                    llvm::DataLayout const &DL,
+                                    std::vector<easy::StructFieldBinding> const &Bindings,
+                                    llvm::Type* StructTy,
+                                    llvm::AllocaInst* Alloc) {
+  for (auto const &Binding : Bindings) {
+    SmallVector<unsigned, 8> Indices;
+    Type* FieldTy = nullptr;
+    if (!FindLeafFieldPathByOffset(DL, StructTy, Binding.Offset_, Indices, FieldTy)) {
+      errs() << "WARNING: partial struct bind_field could not resolve field offset "
+             << Binding.Offset_ << "\n";
+      continue;
+    }
+
+    Constant* FieldValue;
+    size_t RawSize;
+    std::tie(FieldValue, RawSize) =
+        easy::GetConstantFromRaw(DL, FieldTy,
+                                 reinterpret_cast<uint8_t const*>(Binding.Data_.data()));
+    if (RawSize != Binding.Data_.size()) {
+      errs() << "WARNING: partial struct bind_field raw size mismatch at offset "
+             << Binding.Offset_ << ": binding bytes=" << Binding.Data_.size()
+             << " field store size=" << RawSize << "\n";
+      continue;
+    }
+
+    SmallVector<Value*, 8> GEP = {B.getInt32(0)};
+    for (unsigned Index : Indices)
+      GEP.push_back(B.getInt32(Index));
+    Value* FieldPtr = B.CreateGEP(Alloc->getAllocatedType(), Alloc, GEP, "bound.field.gep");
+    B.CreateStore(FieldValue, FieldPtr);
   }
 }
 
@@ -379,6 +421,24 @@ llvm::AllocaInst* easy::GetStructAlloc(llvm::IRBuilder<> &B,
 
   StoreStructField(B, DL, StructTy, (uint8_t const*)Data.data(), Alloc, GEP);
 
+  return Alloc;
+}
+
+llvm::AllocaInst* easy::GetPartialStructAlloc(llvm::IRBuilder<> &B,
+                                              llvm::DataLayout const &DL,
+                                              easy::PartialStructArgument const &Struct,
+                                              llvm::Type* StructTy,
+                                              llvm::Value* RuntimePtr) {
+  AllocaInst* Alloc = B.CreateAlloca(StructTy);
+  llvm::Align StructAlign = DL.getPrefTypeAlign(StructTy);
+  uint64_t StructSize = DL.getTypeAllocSize(StructTy).getFixedValue();
+
+  Value* Dest = B.CreateBitCast(Alloc, B.getInt8PtrTy(), "partial.struct.dst");
+  Value* Src = B.CreateBitCast(RuntimePtr, B.getInt8PtrTy(), "partial.struct.src");
+  B.CreateMemCpy(Dest, StructAlign, Src, StructAlign, StructSize);
+
+  easy::ApplyStructFieldBindings(B, DL, Struct.getFieldBindings(), StructTy, Alloc);
+  easy::ApplyStructArrayBindings(B, DL, Struct.getArrayBindings(), StructTy, Alloc);
   return Alloc;
 }
 

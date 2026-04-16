@@ -16,6 +16,7 @@
 | `easy-jit/tests/c_api/array_snapshot.c` | Example of specializing a pointer parameter to a copied constant array |
 | `easy-jit/tests/c_api/mixed_bindings.c` | Example of mixing forwarded args, scalar constants, and multiple struct snapshots |
 | `easy-jit/tests/c_api/pointer_field_snapshot.c` | Example of snapshotting a struct plus binding a pointed-to array field |
+| `easy-jit/tests/c_api/partial_struct_binding.c` | Example of forwarding a struct pointer while binding one member as constant |
 | `easy-jit/tests/c_api/config_process_base.c` | Baseline C benchmark for a config-processing loop |
 | `easy-jit/tests/c_api/config_process_easyjit.c` | Best-path C API benchmark using snapshot + raw function pointers |
 | `easy-jit/tests/c_api/run_c_api_tests.sh` | One-command build & run script for all C API tests |
@@ -40,6 +41,8 @@ Parameter binding (positional, in order):
   easyjit_context_set_float()     → specialize to float constant
   easyjit_context_set_pointer()   → specialize to pointer constant
   easyjit_context_set_struct()    → specialize struct (raw memcpy)
+  easyjit_context_set_partial_struct() → keep struct ptr runtime-visible, bind selected members
+  easyjit_context_bind_field()    → bind one scalar/pointer leaf field on latest partial struct
   easyjit_context_set_opt_level() → set O-level
 
 Compilation:
@@ -160,6 +163,23 @@ This is the C equivalent of:
 easy::snapshot(cfg, easy::bind_array(&Config::array, 4))
 ```
 
+### Partial struct specialization
+
+If only some members are invariant, keep the struct pointer as a runtime
+argument and bind the invariant fields explicitly:
+
+```c
+easyjit_context_set_partial_struct(ctx, 0);  // cfg stays in specialized signature
+easyjit_context_bind_field(ctx,
+                           offsetof(Config, enabled),
+                           &cfg.enabled,
+                           sizeof(cfg.enabled));
+easyjit_context_set_forward(ctx, 1);         // x
+```
+
+This lets EasyJIT treat `cfg->enabled` as a constant while other members of
+`cfg` still come from the runtime pointer.
+
 ## Current status
 
 | Feature | Status |
@@ -168,6 +188,7 @@ easy::snapshot(cfg, easy::bind_array(&Config::array, 4))
 | Float parameter specialization | ✅ Working (API ready, not separately tested) |
 | Pointer forwarding | ✅ Working |
 | Array snapshot | ✅ Working |
+| Partial struct field specialization | ✅ Working |
 | Loop-bound specialization | ✅ Working (beamform example) |
 | Cache / reuse | ✅ Working |
 | Struct specialization | ⚠️ API ready, works for single-field layout; multi-field structs may need per-case layout registration |
