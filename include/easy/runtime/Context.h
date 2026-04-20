@@ -147,6 +147,22 @@ struct StructArrayBinding {
   }
 };
 
+struct GlobalStructBinding {
+  const void* Address_;
+  bool WholeSnapshot_ = true;
+  std::vector<char> Data_;
+  std::vector<StructFieldBinding> FieldBindings_;
+  std::vector<StructArrayBinding> ArrayBindings_;
+
+  bool operator==(GlobalStructBinding const& Other) const {
+    return Address_ == Other.Address_ &&
+           WholeSnapshot_ == Other.WholeSnapshot_ &&
+           Data_ == Other.Data_ &&
+           FieldBindings_ == Other.FieldBindings_ &&
+           ArrayBindings_ == Other.ArrayBindings_;
+  }
+};
+
 class StructArgument
     : public ArgumentBase {
  public:
@@ -274,6 +290,7 @@ class ArrayArgument
 class Context {
 
   std::vector<std::unique_ptr<ArgumentBase>> ArgumentMapping_;
+  std::vector<GlobalStructBinding> GlobalStructBindings_;
   unsigned OptLevel_ = 2, OptSize_ = 0;
   std::string DebugFile_;
 
@@ -305,8 +322,19 @@ class Context {
                             std::vector<StructArrayBinding> ArrayBindings = {});
   Context& setParameterArray(std::vector<char>, size_t Count, size_t ElementSize);
   Context& setParameterModule(easy::Function const&);
+  Context& setGlobalStruct(void const* Address,
+                           serialized_arg Data,
+                           std::vector<StructArrayBinding> Bindings = {});
+  Context& setGlobalPartialStruct(void const* Address,
+                                  std::vector<StructFieldBinding> FieldBindings = {},
+                                  std::vector<StructArrayBinding> ArrayBindings = {});
   Context& bindFieldToLastPartialStruct(size_t Offset, std::vector<char> Data);
   Context& bindArrayToLastStruct(size_t Offset, std::vector<char> Data, size_t Count, size_t ElementSize);
+  Context& bindFieldToLastGlobalPartialStruct(size_t Offset, std::vector<char> Data);
+  Context& bindArrayToLastGlobalPartialStruct(size_t Offset,
+                                              std::vector<char> Data,
+                                              size_t Count,
+                                              size_t ElementSize);
 
   Context& setArgumentLayout(layout_id id) {
     ArgumentLayout_.push_back(id); // each layout id is associated with a number of fields in the bitcode tracker
@@ -315,6 +343,10 @@ class Context {
 
   decltype(ArgumentLayout_) const & getLayout() const {
     return ArgumentLayout_;
+  }
+
+  decltype(GlobalStructBindings_) const& getGlobalStructBindings() const {
+    return GlobalStructBindings_;
   }
 
   template<class T>
@@ -382,8 +414,27 @@ namespace std
       size_t H = 0;
       std::hash<easy::ArgumentBase> ArgHash;
       std::hash<std::pair<unsigned, unsigned>> OptHash;
+      std::hash<int64_t> IntHash;
       for(auto const &Arg : C)
         H ^= ArgHash(*Arg);
+      for (auto const &Binding : C.getGlobalStructBindings()) {
+        H ^= std::hash<const void*>{}(Binding.Address_);
+        H ^= IntHash(static_cast<int64_t>(Binding.WholeSnapshot_ ? 1 : 0));
+        for (char Byte : Binding.Data_)
+          H ^= IntHash(Byte);
+        for (auto const &FieldBinding : Binding.FieldBindings_) {
+          H ^= IntHash(static_cast<int64_t>(FieldBinding.Offset_));
+          for (char Byte : FieldBinding.Data_)
+            H ^= IntHash(Byte);
+        }
+        for (auto const &ArrayBinding : Binding.ArrayBindings_) {
+          H ^= IntHash(static_cast<int64_t>(ArrayBinding.Offset_));
+          H ^= IntHash(static_cast<int64_t>(ArrayBinding.Count_));
+          H ^= IntHash(static_cast<int64_t>(ArrayBinding.ElementSize_));
+          for (char Byte : ArrayBinding.Data_)
+            H ^= IntHash(Byte);
+        }
+      }
       H ^= OptHash(C.getOptLevel());
       return H;
     }

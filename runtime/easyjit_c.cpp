@@ -220,6 +220,112 @@ easyjit_error_t easyjit_context_set_snapshot(easyjit_context_t ctx,
 }
 
 extern "C"
+easyjit_error_t easyjit_context_set_global_snapshot(easyjit_context_t ctx,
+                                                     const void* global_addr,
+                                                     const void* data,
+                                                     size_t size) {
+    clear_last_error();
+    if (!ctx) {
+        set_last_error("easyjit_context_set_global_snapshot: ctx is NULL");
+        return EASYJIT_ERROR_INVALID_ARGUMENT;
+    }
+    if (!global_addr) {
+        set_last_error("easyjit_context_set_global_snapshot: global_addr is NULL");
+        return EASYJIT_ERROR_INVALID_ARGUMENT;
+    }
+    if (!data && size > 0) {
+        set_last_error("easyjit_context_set_global_snapshot: data is NULL with non-zero size");
+        return EASYJIT_ERROR_INVALID_ARGUMENT;
+    }
+    try {
+        easy::serialized_arg arg(data, size);
+        ctx->ctx.setGlobalStruct(global_addr, std::move(arg));
+        return EASYJIT_OK;
+    } catch (const std::exception& e) {
+        set_last_error(e.what());
+        return EASYJIT_ERROR_INTERNAL;
+    }
+}
+
+extern "C"
+easyjit_error_t easyjit_context_set_global_partial_struct(easyjit_context_t ctx,
+                                                           const void* global_addr) {
+    clear_last_error();
+    if (!ctx) {
+        set_last_error("easyjit_context_set_global_partial_struct: ctx is NULL");
+        return EASYJIT_ERROR_INVALID_ARGUMENT;
+    }
+    if (!global_addr) {
+        set_last_error("easyjit_context_set_global_partial_struct: global_addr is NULL");
+        return EASYJIT_ERROR_INVALID_ARGUMENT;
+    }
+    try {
+        ctx->ctx.setGlobalPartialStruct(global_addr);
+        return EASYJIT_OK;
+    } catch (const std::exception& e) {
+        set_last_error(e.what());
+        return EASYJIT_ERROR_INTERNAL;
+    }
+}
+
+extern "C"
+easyjit_error_t easyjit_context_bind_global_field(easyjit_context_t ctx,
+                                                   size_t field_offset,
+                                                   const void* data,
+                                                   size_t size) {
+    clear_last_error();
+    if (!ctx) {
+        set_last_error("easyjit_context_bind_global_field: ctx is NULL");
+        return EASYJIT_ERROR_INVALID_ARGUMENT;
+    }
+    if (!data && size > 0) {
+        set_last_error("easyjit_context_bind_global_field: data is NULL with non-zero size");
+        return EASYJIT_ERROR_INVALID_ARGUMENT;
+    }
+    try {
+        std::vector<char> bytes(size);
+        if (!bytes.empty())
+            std::memcpy(bytes.data(), data, size);
+        ctx->ctx.bindFieldToLastGlobalPartialStruct(field_offset, std::move(bytes));
+        return EASYJIT_OK;
+    } catch (const std::exception& e) {
+        set_last_error(e.what());
+        return EASYJIT_ERROR_INTERNAL;
+    }
+}
+
+extern "C"
+easyjit_error_t easyjit_context_bind_global_array(easyjit_context_t ctx,
+                                                   size_t field_offset,
+                                                   const void* data,
+                                                   size_t count,
+                                                   size_t element_size) {
+    clear_last_error();
+    if (!ctx) {
+        set_last_error("easyjit_context_bind_global_array: ctx is NULL");
+        return EASYJIT_ERROR_INVALID_ARGUMENT;
+    }
+    if (!data && count > 0) {
+        set_last_error("easyjit_context_bind_global_array: data is NULL with non-zero count");
+        return EASYJIT_ERROR_INVALID_ARGUMENT;
+    }
+    if (element_size == 0 && count > 0) {
+        set_last_error("easyjit_context_bind_global_array: element_size is zero with non-zero count");
+        return EASYJIT_ERROR_INVALID_ARGUMENT;
+    }
+    try {
+        std::vector<char> bytes(count * element_size);
+        if (!bytes.empty())
+            std::memcpy(bytes.data(), data, bytes.size());
+        ctx->ctx.bindArrayToLastGlobalPartialStruct(field_offset, std::move(bytes), count, element_size);
+        return EASYJIT_OK;
+    } catch (const std::exception& e) {
+        set_last_error(e.what());
+        return EASYJIT_ERROR_INTERNAL;
+    }
+}
+
+extern "C"
 easyjit_error_t easyjit_context_set_partial_struct(easyjit_context_t ctx,
                                                     unsigned index) {
     clear_last_error();

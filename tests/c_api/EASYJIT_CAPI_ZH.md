@@ -16,6 +16,8 @@
 - `tests/c_api/README.md`
 - `tests/c_api/add_int.c`
 - `tests/c_api/array_snapshot.c`
+- `tests/c_api/global_snapshot.c`
+- `tests/c_api/global_partial_snapshot.c`
 - `tests/c_api/pointer_field_snapshot.c`
 - `tests/c_api/partial_struct_binding.c`
 - `tests/c_api/config_process_easyjit.c`
@@ -161,6 +163,19 @@ easyjit_context_bind_array(...)
 - struct 这个参数本身还保留在运行时
 - 但其中一部分成员会被当成编译期常量
 
+### 4.5 函数里直接读全局对象
+
+有些代码不会把配置 struct 当函数参数传进来，而是直接在函数体里读全局变量。
+
+这种场景现在也支持：
+
+- `easyjit_context_set_global_snapshot(...)`
+  - 把整个全局对象按当前值冻结
+- `easyjit_context_set_global_partial_struct(...)`
+  - 只冻结全局对象里的部分字段
+
+这类接口不会给 JIT 函数额外增加参数，因为它们操作的是“函数已经直接引用的全局对象”。
+
 ---
 
 ## 5. 先看几个最常见的场景
@@ -301,6 +316,85 @@ easyjit_context_set_forward(ctx, 1);
 - `bind_field` 适合普通字段
 - `bind_array` 适合“struct 里的指针字段所指向的数组”
 
+### 场景 E：函数直接读全局配置，整块冻结
+
+原函数：
+
+```c
+extern GlobalConfig g_cfg;
+
+int eval_global(int x) {
+    if (g_cfg.enabled) {
+        return x + g_cfg.bias;
+    }
+    return x - 99;
+}
+```
+
+如果你想让 `g_cfg` 在 JIT 编译时按当前值整块固定下来，可以写：
+
+```c
+easyjit_context_set_forward(ctx, 0); /* x */
+easyjit_context_set_global_snapshot(ctx, &g_cfg, &g_cfg, sizeof(g_cfg));
+```
+
+这里的意思是：
+
+- `x` 仍然是运行时参数
+- `g_cfg` 不是函数参数，但会在 JIT 时被冻结
+
+### 场景 F：函数直接读全局配置，但只冻结部分字段
+
+如果还是直接读全局对象：
+
+```c
+extern GlobalConfig g_cfg;
+
+int eval_global(int x) {
+    if (g_cfg.enabled) {
+        return x + g_cfg.bias;
+    }
+    return x - 99;
+}
+```
+
+但你只想固定：
+
+- `g_cfg.enabled`
+
+而 `g_cfg.bias` 保持运行时读取，可以这样写：
+
+```c
+easyjit_context_set_forward(ctx, 0); /* x */
+easyjit_context_set_global_partial_struct(ctx, &g_cfg);
+easyjit_context_bind_global_field(ctx,
+                                  offsetof(GlobalConfig, enabled),
+                                  &g_cfg.enabled,
+                                  sizeof(g_cfg.enabled));
+```
+
+如果全局 struct 里还有指针字段，比如：
+
+```c
+const int *values;
+```
+
+也可以继续：
+
+```c
+easyjit_context_bind_global_array(ctx,
+                                  offsetof(GlobalConfig, values),
+                                  g_cfg.values,
+                                  n,
+                                  sizeof(g_cfg.values[0]));
+```
+
+这样就表示：
+
+- `enabled` 固定
+- `values` 指向的数组内容固定
+- 其他没绑定的字段继续走全局对象当前值
+
 ---
 
 ## 6. 每个常用接口具体是干什么的
@@ -420,6 +514,26 @@ easyjit_context_set_int(ctx, 4);
 easyjit_context_set_snapshot(ctx, &cfg, sizeof(cfg));
 ```
 
+### `easyjit_context_set_global_snapshot(easyjit_context_t ctx, const void *global_addr, const void *data, size_t size)`
+
+作用：
+
+- 把一个“函数直接引用的全局对象”整块固定成常量
+
+参数：
+
+- `global_addr`
+  - 全局对象地址，比如 `&g_cfg`
+- `data`
+  - 当前要冻结的那份对象数据，通常也是 `&g_cfg`
+- `size`
+  - 一般是 `sizeof(g_cfg)`
+
+注意：
+
+- 这个接口不会给最终 JIT 函数增加参数
+- 目标函数必须本来就直接引用了这个全局对象
+
 ### `easyjit_context_set_partial_struct(easyjit_context_t ctx, unsigned index)`
 
 作用：
@@ -436,6 +550,24 @@ easyjit_context_set_snapshot(ctx, &cfg, sizeof(cfg));
 - `set_partial_struct` 只是“声明这个参数走 partial struct 逻辑”
 - 它本身不会自动固定任何字段
 - 真正固定哪些字段，要靠后面的 `bind_field()` 和 `bind_array()`
+
+### `easyjit_context_set_global_partial_struct(easyjit_context_t ctx, const void *global_addr)`
+
+作用：
+
+- 声明“我要对一个被函数直接引用的全局 struct 做部分常量化”
+
+参数：
+
+- `global_addr`
+  - 全局对象地址，比如 `&g_cfg`
+
+注意：
+
+- 这只是开始 global partial 模式
+- 后面还要跟：
+  - `easyjit_context_bind_global_field()`
+  - `easyjit_context_bind_global_array()`
 
 ### `easyjit_context_bind_field(easyjit_context_t ctx, size_t field_offset, const void *data, size_t size)`
 
@@ -461,6 +593,19 @@ easyjit_context_bind_field(ctx,
                            &cfg.enabled,
                            sizeof(cfg.enabled));
 ```
+
+### `easyjit_context_bind_global_field(easyjit_context_t ctx, size_t field_offset, const void *data, size_t size)`
+
+作用：
+
+- 给最近一次 `set_global_partial_struct()` 指定的全局 struct 绑定一个字段常量
+
+它和 `bind_field()` 的区别是：
+
+- `bind_field()`
+  - 用于函数参数里的 partial struct
+- `bind_global_field()`
+  - 用于函数直接引用的全局 struct
 
 ### `easyjit_context_bind_array(easyjit_context_t ctx, size_t field_offset, const void *data, size_t count, size_t element_size)`
 
@@ -488,6 +633,19 @@ easyjit_context_bind_array(ctx,
                            cfg.count,
                            sizeof(cfg.weights[0]));
 ```
+
+### `easyjit_context_bind_global_array(easyjit_context_t ctx, size_t field_offset, const void *data, size_t count, size_t element_size)`
+
+作用：
+
+- 给最近一次 `set_global_partial_struct()` 的全局 struct 中某个“指针字段”绑定一段常量数组
+
+和 `bind_array()` 的关系也是一样的：
+
+- `bind_array()`
+  - 参数里的 partial struct
+- `bind_global_array()`
+  - 直接引用的全局 struct
 
 ### `easyjit_context_set_array(easyjit_context_t ctx, const void *data, size_t count, size_t element_size)`
 
@@ -736,6 +894,20 @@ int result = f(&runtime_cfg, x);
 
 - `easyjit_context_bind_array`
 
+### 情况 7：函数直接读全局对象，而且整个对象都稳定
+
+用：
+
+- `easyjit_context_set_global_snapshot`
+
+### 情况 8：函数直接读全局对象，但只有部分字段稳定
+
+用：
+
+- `easyjit_context_set_global_partial_struct`
+- `easyjit_context_bind_global_field`
+- 必要时 `easyjit_context_bind_global_array`
+
 ---
 
 ## 10. 常见坑
@@ -865,12 +1037,20 @@ easyjit_function_destroy(fn);
   - 参数整体固定
 - `set_snapshot`
   - 整个 struct 固定
+- `set_global_snapshot`
+  - 整个全局对象固定
 - `set_partial_struct`
   - struct 继续运行时传
+- `set_global_partial_struct`
+  - 全局对象继续存在，但只固定其中部分字段
 - `bind_field`
   - 固定 struct 里的某个普通字段
 - `bind_array`
   - 固定 struct 里某个数组指针字段指向的数据
+- `bind_global_field`
+  - 固定全局 struct 里的某个普通字段
+- `bind_global_array`
+  - 固定全局 struct 里某个数组指针字段指向的数据
 
 如果你只是想把原来整块 snapshot 的用例改成“部分字段常量化”，最短做法就是：
 

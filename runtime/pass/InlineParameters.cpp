@@ -284,6 +284,8 @@ bool easy::InlineParameters::runOnModule(llvm::Module &M) {
   llvm::Function* F = M.getFunction(TargetName_);
   assert(F);
 
+  easy::ApplyGlobalStructSnapshots(M, TargetName_, C);
+
   HighLevelLayout HLL(C, *F);
   llvm::Function* WrapperFun = CreateWrapperFun(M, *F, HLL, C);
 

@@ -126,6 +126,57 @@ easyjit_error_t easyjit_context_set_snapshot(easyjit_context_t ctx,
                                               size_t size);
 
 /**
+ * Snapshot a global object for specialization without adding it to the
+ * specialized function signature.
+ *
+ * `global_addr` identifies the referenced global variable in the compiled
+ * module. `data` / `size` provide the bytes that should be treated as the
+ * compile-time value of that global during JIT specialization.
+ *
+ * This is the C API counterpart of the C++ helper:
+ *   easy::options::global_snapshot(g_cfg)
+ *
+ * The target function must already reference this global directly; this call
+ * only marks which global object should be materialized as a constant during
+ * specialization.
+ */
+easyjit_error_t easyjit_context_set_global_snapshot(easyjit_context_t ctx,
+                                                     const void* global_addr,
+                                                     const void* data,
+                                                     size_t size);
+
+/**
+ * Mark a directly referenced global struct for partial specialization.
+ *
+ * Unlike easyjit_context_set_global_snapshot(), this does not freeze the
+ * entire global object. Instead, subsequent easyjit_context_bind_global_field()
+ * / easyjit_context_bind_global_array() calls select which members should be
+ * treated as compile-time constants, while all other fields continue to read
+ * the live global variable at runtime.
+ */
+easyjit_error_t easyjit_context_set_global_partial_struct(easyjit_context_t ctx,
+                                                           const void* global_addr);
+
+/**
+ * Bind one scalar/pointer leaf field inside the most recent global partial
+ * struct to a compile-time constant byte representation.
+ */
+easyjit_error_t easyjit_context_bind_global_field(easyjit_context_t ctx,
+                                                   size_t field_offset,
+                                                   const void* data,
+                                                   size_t size);
+
+/**
+ * Bind a constant array to a pointer field inside the most recent global
+ * partial struct.
+ */
+easyjit_error_t easyjit_context_bind_global_array(easyjit_context_t ctx,
+                                                   size_t field_offset,
+                                                   const void* data,
+                                                   size_t count,
+                                                   size_t element_size);
+
+/**
  * Forward the next parameter as a runtime struct pointer while allowing
  * selected fields to be bound as compile-time constants.
  *

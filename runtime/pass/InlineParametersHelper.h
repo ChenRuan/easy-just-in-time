@@ -41,8 +41,12 @@ struct PostLinkageSymbol {
 llvm::SmallVector<llvm::Value*, 4> GetForwardArgs(easy::HighLevelLayout::HighLevelArg &ArgInF, easy::HighLevelLayout &FHLL,
                                                   llvm::Function &Wrapper, easy::HighLevelLayout &WrapperHLL);
 llvm::Constant* GetScalarArgument(easy::ArgumentBase const& Arg, llvm::Type* T);
+std::pair<llvm::Constant*, size_t> GetAggregateConstantFromRaw(llvm::DataLayout const &DL,
+                                                               llvm::Type* T,
+                                                               const uint8_t* Raw);
 
 llvm::Constant* LinkPointerIfPossible(llvm::Module &M, easy::PtrArgument const &Ptr, llvm::Type* PtrTy);
+bool ApplyGlobalStructSnapshots(llvm::Module &M, llvm::StringRef TargetName, easy::Context const &C);
 
 // Return true if any linkage happened
 bool LinkAndUpdateSymbol(llvm::Module &M, llvm::StringRef FName, llvm::StringRef WrapperName, llvm::SmallVectorImpl<PostLinkageSymbol> &Symbols, easy::Context const &C, llvm::Value* CallToUpdate);

@@ -38,6 +38,30 @@ Context& Context::setParameterModule(easy::Function const &F) {
   return setArg<ModuleArgument>(F);
 }
 
+Context& Context::setGlobalStruct(const void* Address,
+                                  serialized_arg Data,
+                                  std::vector<StructArrayBinding> Bindings) {
+  GlobalStructBindings_.push_back(GlobalStructBinding{
+      Address,
+      true,
+      std::move(Data.buf),
+      {},
+      std::move(Bindings)});
+  return *this;
+}
+
+Context& Context::setGlobalPartialStruct(const void* Address,
+                                         std::vector<StructFieldBinding> FieldBindings,
+                                         std::vector<StructArrayBinding> ArrayBindings) {
+  GlobalStructBindings_.push_back(GlobalStructBinding{
+      Address,
+      false,
+      {},
+      std::move(FieldBindings),
+      std::move(ArrayBindings)});
+  return *this;
+}
+
 Context& Context::bindArrayToLastStruct(size_t Offset,
                                         std::vector<char> Data,
                                         size_t Count,
@@ -73,10 +97,41 @@ Context& Context::bindFieldToLastPartialStruct(size_t Offset,
   return *this;
 }
 
+Context& Context::bindFieldToLastGlobalPartialStruct(size_t Offset,
+                                                     std::vector<char> Data) {
+  if (GlobalStructBindings_.empty())
+    throw std::invalid_argument("bindFieldToLastGlobalPartialStruct requires a previous global partial-struct binding");
+
+  auto &Binding = GlobalStructBindings_.back();
+  if (Binding.WholeSnapshot_)
+    throw std::invalid_argument("bindFieldToLastGlobalPartialStruct must follow a global partial-struct binding");
+
+  Binding.FieldBindings_.push_back(StructFieldBinding{Offset, std::move(Data)});
+  return *this;
+}
+
+Context& Context::bindArrayToLastGlobalPartialStruct(size_t Offset,
+                                                     std::vector<char> Data,
+                                                     size_t Count,
+                                                     size_t ElementSize) {
+  if (GlobalStructBindings_.empty())
+    throw std::invalid_argument("bindArrayToLastGlobalPartialStruct requires a previous global partial-struct binding");
+
+  auto &Binding = GlobalStructBindings_.back();
+  if (Binding.WholeSnapshot_)
+    throw std::invalid_argument("bindArrayToLastGlobalPartialStruct must follow a global partial-struct binding");
+
+  Binding.ArrayBindings_.push_back(StructArrayBinding{
+      Offset, std::move(Data), Count, ElementSize});
+  return *this;
+}
+
 bool Context::operator==(const Context& Other) const {
   if(getOptLevel() != Other.getOptLevel())
     return false;
   if(size() != Other.size())
+    return false;
+  if(getGlobalStructBindings() != Other.getGlobalStructBindings())
     return false;
 
   for(auto this_it = begin(), other_it = Other.begin();

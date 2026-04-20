@@ -220,6 +220,234 @@ llvm::Constant* easy::GetArrayConstant(llvm::DataLayout const &DL,
   return ConstantArray::get(ArrayType::get(PointeeTy, Count), Elements);
 }
 
+std::pair<llvm::Constant*, size_t> easy::GetAggregateConstantFromRaw(llvm::DataLayout const &DL,
+                                                                     llvm::Type* T,
+                                                                     const uint8_t* Raw) {
+  if (auto *STy = dyn_cast<StructType>(T)) {
+    SmallVector<Constant*, 8> Fields;
+    Fields.reserve(STy->getNumElements());
+    auto const *SL = DL.getStructLayout(STy);
+    for (unsigned Field = 0; Field != STy->getNumElements(); ++Field) {
+      size_t FieldOffset = SL->getElementOffset(Field);
+      auto FieldValue = easy::GetAggregateConstantFromRaw(DL, STy->getElementType(Field), Raw + FieldOffset);
+      Fields.push_back(FieldValue.first);
+    }
+    return {ConstantStruct::get(STy, Fields), DL.getTypeAllocSize(STy)};
+  }
+
+  if (auto *ATy = dyn_cast<ArrayType>(T)) {
+    SmallVector<Constant*, 8> Elements;
+    Elements.reserve(ATy->getNumElements());
+    size_t ElemSize = DL.getTypeAllocSize(ATy->getElementType());
+    for (uint64_t Index = 0; Index != ATy->getNumElements(); ++Index) {
+      auto ElemValue =
+          easy::GetAggregateConstantFromRaw(DL, ATy->getElementType(), Raw + Index * ElemSize);
+      Elements.push_back(ElemValue.first);
+    }
+    return {ConstantArray::get(ATy, Elements), DL.getTypeAllocSize(ATy)};
+  }
+
+  return easy::GetConstantFromRaw(DL, T, Raw);
+}
+
+static const char* FindGlobalNameForAddress(easy::GlobalMapping* Globals, const void* Address) {
+  for (easy::GlobalMapping* GM = Globals; GM && GM->Name; ++GM) {
+    if (GM->Address == Address)
+      return GM->Name;
+  }
+  return nullptr;
+}
+
+static bool FindLeafFieldPathByOffset(llvm::DataLayout const &DL,
+                                      llvm::Type* Ty,
+                                      size_t Offset,
+                                      SmallVectorImpl<unsigned> &Indices,
+                                      llvm::Type*& FieldTy);
+static llvm::Constant* GetRawByteArrayPointer(Module &M,
+                                              easy::StructArrayBinding const &Binding);
+
+static bool ExtractGlobalFieldIndices(llvm::Value* Ptr,
+                                      llvm::GlobalVariable* GV,
+                                      SmallVectorImpl<unsigned> &Indices) {
+  Ptr = Ptr->stripPointerCasts();
+  if (Ptr == GV)
+    return true;
+
+  auto *GEP = dyn_cast<GEPOperator>(Ptr);
+  if (!GEP)
+    return false;
+
+  if (!ExtractGlobalFieldIndices(GEP->getPointerOperand(), GV, Indices))
+    return false;
+
+  bool First = true;
+  for (auto It = GEP->idx_begin(); It != GEP->idx_end(); ++It) {
+    auto *CI = dyn_cast<ConstantInt>(It->get());
+    if (!CI)
+      return false;
+    if (First && CI->isZero()) {
+      First = false;
+      continue;
+    }
+    First = false;
+    Indices.push_back(static_cast<unsigned>(CI->getZExtValue()));
+  }
+  return true;
+}
+
+static bool ReplaceGlobalFieldLoads(llvm::Module &M,
+                                    llvm::GlobalVariable* GV,
+                                    ArrayRef<unsigned> FieldIndices,
+                                    llvm::Constant* Replacement) {
+  SmallVector<LoadInst*, 8> LoadsToReplace;
+  for (llvm::Function &F : M) {
+    for (llvm::Instruction &I : instructions(F)) {
+      auto *LI = dyn_cast<LoadInst>(&I);
+      if (!LI)
+        continue;
+
+      SmallVector<unsigned, 8> Indices;
+      if (!ExtractGlobalFieldIndices(LI->getPointerOperand(), GV, Indices))
+        continue;
+      bool Matches = (Indices == FieldIndices);
+      if (!Matches && Indices.empty() && FieldIndices.size() == 1 &&
+          FieldIndices.front() == 0 &&
+          LI->getPointerOperand()->stripPointerCasts() == GV) {
+        Matches = true;
+      }
+      if (Matches)
+        LoadsToReplace.push_back(LI);
+    }
+  }
+
+  for (LoadInst* LI : LoadsToReplace) {
+    llvm::Constant* Value = Replacement;
+    if (Value->getType() != LI->getType()) {
+      if (Value->getType()->isPointerTy() && LI->getType()->isPointerTy()) {
+        Value = llvm::ConstantExpr::getPointerCast(Value, LI->getType());
+      } else {
+        continue;
+      }
+    }
+    LI->replaceAllUsesWith(Value);
+    LI->eraseFromParent();
+  }
+  return !LoadsToReplace.empty();
+}
+
+static llvm::Constant* BuildGlobalArrayPointer(Module &M,
+                                               easy::StructArrayBinding const &Binding) {
+  return GetRawByteArrayPointer(M, Binding);
+}
+
+bool easy::ApplyGlobalStructSnapshots(llvm::Module &M, llvm::StringRef TargetName, easy::Context const &C) {
+  if (C.getGlobalStructBindings().empty())
+    return false;
+
+  auto &BT = easy::BitcodeTracker::GetTracker();
+  void* HostFunction = BT.getAddress(TargetName.str());
+  if (!HostFunction) {
+    errs() << "WARNING: global snapshot could not resolve host function for "
+           << TargetName << "\n";
+    return false;
+  }
+
+  GlobalMapping* Globals = nullptr;
+  std::tie(std::ignore, Globals) = BT.getNameAndGlobalMapping(HostFunction);
+  if (!Globals) {
+    errs() << "WARNING: global snapshot has no global mapping table for "
+           << TargetName << "\n";
+    return false;
+  }
+
+  bool Changed = false;
+  llvm::DataLayout const &DL = M.getDataLayout();
+
+  for (auto const &Binding : C.getGlobalStructBindings()) {
+    const char* GlobalName = FindGlobalNameForAddress(Globals, Binding.Address_);
+    if (!GlobalName) {
+      errs() << "WARNING: global snapshot could not resolve symbol for host address "
+             << Binding.Address_ << "\n";
+      continue;
+    }
+
+    GlobalVariable* GV = M.getNamedGlobal(GlobalName);
+    if (!GV) {
+      errs() << "WARNING: global snapshot could not find llvm global " << GlobalName << "\n";
+      continue;
+    }
+
+    if (Binding.WholeSnapshot_) {
+      auto InitValue =
+          easy::GetAggregateConstantFromRaw(DL,
+                                            GV->getValueType(),
+                                            reinterpret_cast<uint8_t const*>(Binding.Data_.data()));
+      if (InitValue.second != Binding.Data_.size()) {
+        errs() << "WARNING: global snapshot size mismatch for " << GlobalName
+               << ": binding bytes=" << Binding.Data_.size()
+               << " llvm alloc size=" << InitValue.second << "\n";
+        continue;
+      }
+
+      GV->setInitializer(InitValue.first);
+      GV->setConstant(true);
+      GV->setLinkage(GlobalValue::PrivateLinkage);
+      Changed = true;
+      continue;
+    }
+
+    for (auto const &FieldBinding : Binding.FieldBindings_) {
+      SmallVector<unsigned, 8> Indices;
+      Type* FieldTy = nullptr;
+      if (!FindLeafFieldPathByOffset(DL, GV->getValueType(), FieldBinding.Offset_, Indices, FieldTy)) {
+        errs() << "WARNING: global partial snapshot could not resolve field offset "
+               << FieldBinding.Offset_ << " for " << GlobalName << "\n";
+        continue;
+      }
+
+      Constant* FieldValue;
+      size_t RawSize;
+      std::tie(FieldValue, RawSize) =
+          easy::GetConstantFromRaw(DL, FieldTy, reinterpret_cast<uint8_t const*>(FieldBinding.Data_.data()));
+      if (RawSize != FieldBinding.Data_.size()) {
+        errs() << "WARNING: global partial snapshot raw size mismatch at offset "
+               << FieldBinding.Offset_ << " for " << GlobalName << "\n";
+        continue;
+      }
+
+      Changed |= ReplaceGlobalFieldLoads(M, GV, Indices, FieldValue);
+    }
+
+    for (auto const &ArrayBinding : Binding.ArrayBindings_) {
+      SmallVector<unsigned, 8> Indices;
+      Type* FieldTy = nullptr;
+      if (!FindLeafFieldPathByOffset(DL, GV->getValueType(), ArrayBinding.Offset_, Indices, FieldTy)) {
+        errs() << "WARNING: global partial snapshot could not resolve array field offset "
+               << ArrayBinding.Offset_ << " for " << GlobalName << "\n";
+        continue;
+      }
+      if (!FieldTy->isPointerTy()) {
+        errs() << "WARNING: global partial snapshot array binding offset "
+               << ArrayBinding.Offset_ << " does not resolve to a pointer field for "
+               << GlobalName << "\n";
+        continue;
+      }
+
+      Changed |= ReplaceGlobalFieldLoads(M, GV, Indices, BuildGlobalArrayPointer(M, ArrayBinding));
+    }
+
+    auto *IntPtrTy = DL.getIntPtrType(M.getContext());
+    auto HostAddr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(Binding.Address_));
+    Constant* HostPtr = ConstantExpr::getIntToPtr(ConstantInt::get(IntPtrTy, HostAddr), GV->getType());
+    GV->replaceAllUsesWith(HostPtr);
+    if (GV->use_empty())
+      GV->eraseFromParent();
+    Changed = true;
+  }
+
+  return Changed;
+}
+
 static Constant* GetRawByteArrayPointer(Module &M,
                                         easy::StructArrayBinding const &Binding) {
   LLVMContext &Ctx = M.getContext();

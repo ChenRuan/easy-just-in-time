@@ -68,12 +68,12 @@ namespace easy {
       if(ObjectsToJIT.empty())
         return false;
       
-      SmallVector<GlobalValue*, 8> LocalVariables;
-      collectLocalGlobals(M, LocalVariables);
-      nameGlobals(LocalVariables, "unnamed_local_global");
+      SmallVector<GlobalValue*, 8> MappedGlobals;
+      collectMappedGlobals(M, MappedGlobals);
+      nameGlobals(MappedGlobals, "unnamed_local_global");
 
       auto Bitcode = embedBitcode(M, ObjectsToJIT);
-      GlobalVariable* GlobalMapping = getGlobalMapping(M, LocalVariables);
+      GlobalVariable* GlobalMapping = getGlobalMapping(M, MappedGlobals);
 
       Function* RegisterBitcodeFun = declareRegisterBitcode(M, GlobalMapping);
       registerBitcode(M, ObjectsToJIT, Bitcode, GlobalMapping, RegisterBitcodeFun);
@@ -294,12 +294,13 @@ namespace easy {
           GO.setSection(JIT_SECTION);
     }
 
-    static void collectLocalGlobals(Module &M, SmallVectorImpl<GlobalValue*> &Globals) {
-      for(GlobalVariable &GV : M.globals())
-        if(GV.hasLocalLinkage()) {
-          LLVM_DEBUG(dbgs() << "Found local global: " << GV << "\n");
-          Globals.push_back(&GV);
-        }
+    static void collectMappedGlobals(Module &M, SmallVectorImpl<GlobalValue*> &Globals) {
+      for (GlobalVariable &GV : M.globals()) {
+        if (GV.getName().startswith("llvm."))
+          continue;
+        LLVM_DEBUG(dbgs() << "Mapped global: " << GV << "\n");
+        Globals.push_back(&GV);
+      }
     }
 
     static void nameGlobals(SmallVectorImpl<GlobalValue*> &Globals, Twine Name) {
