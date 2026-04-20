@@ -12,13 +12,13 @@
 
 相关参考文件：
 
-- [easyjit_c.h](/home/ruanchen/workspace/llvm-project-15.0.4/easy-jit-llvm15/include/easy/easyjit_c.h)
-- [README.md](/home/ruanchen/workspace/llvm-project-15.0.4/easy-jit-llvm15/tests/c_api/README.md)
-- [add_int.c](/home/ruanchen/workspace/llvm-project-15.0.4/easy-jit-llvm15/tests/c_api/add_int.c)
-- [array_snapshot.c](/home/ruanchen/workspace/llvm-project-15.0.4/easy-jit-llvm15/tests/c_api/array_snapshot.c)
-- [pointer_field_snapshot.c](/home/ruanchen/workspace/llvm-project-15.0.4/easy-jit-llvm15/tests/c_api/pointer_field_snapshot.c)
-- [partial_struct_binding.c](/home/ruanchen/workspace/llvm-project-15.0.4/easy-jit-llvm15/tests/c_api/partial_struct_binding.c)
-- [config_process_easyjit.c](/home/ruanchen/workspace/llvm-project-15.0.4/easy-jit-llvm15/tests/c_api/config_process_easyjit.c)
+- `include/easy/easyjit_c.h`
+- `tests/c_api/README.md`
+- `tests/c_api/add_int.c`
+- `tests/c_api/array_snapshot.c`
+- `tests/c_api/pointer_field_snapshot.c`
+- `tests/c_api/partial_struct_binding.c`
+- `tests/c_api/config_process_easyjit.c`
 
 ---
 

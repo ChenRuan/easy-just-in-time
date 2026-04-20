@@ -1,30 +1,29 @@
-# EasyJIT C Interface — Exploration Summary
+# EasyJIT C Interface — Overview
 
-## Branch
-`easyjit-c-interface` (based on the previous working branch)
+## Recommended file set
 
-## What was done
+The `tests/c_api/` directory is intentionally kept focused. The recommended
+examples to keep and read are:
 
-### New files
 | File | Purpose |
 |------|---------|
-| `easy-jit/include/easy/easyjit_c.h` | Public C header — opaque handle API |
-| `easy-jit/runtime/easyjit_c.cpp` | Thin C++ wrapper implementing the C API |
-| `easy-jit/tests/c_api/add_int.c` | Minimal test: specialize `add(a,b)` → `inc(a)` |
-| `easy-jit/tests/c_api/cache_example.c` | Cache test: compile-once, reuse on repeated keys |
-| `easy-jit/tests/c_api/wireless_beamform.c` | Wireless-style test: beamforming kernel with n_ant/n_sub specialized |
-| `easy-jit/tests/c_api/array_snapshot.c` | Example of specializing a pointer parameter to a copied constant array |
-| `easy-jit/tests/c_api/mixed_bindings.c` | Example of mixing forwarded args, scalar constants, and multiple struct snapshots |
-| `easy-jit/tests/c_api/pointer_field_snapshot.c` | Example of snapshotting a struct plus binding a pointed-to array field |
-| `easy-jit/tests/c_api/partial_struct_binding.c` | Example of forwarding a struct pointer while binding one member as constant |
-| `easy-jit/tests/c_api/config_process_base.c` | Baseline C benchmark for a config-processing loop |
-| `easy-jit/tests/c_api/config_process_easyjit.c` | Best-path C API benchmark using snapshot + raw function pointers |
-| `easy-jit/tests/c_api/run_c_api_tests.sh` | One-command build & run script for all C API tests |
+| `include/easy/easyjit_c.h` | Public C API header |
+| `tests/c_api/EASYJIT_CAPI_ZH.md` | Chinese step-by-step tutorial |
+| `tests/c_api/add_int.c` | Smallest end-to-end example |
+| `tests/c_api/array_snapshot.c` | Flat array specialization |
+| `tests/c_api/struct_snapshot.c` | Whole-struct snapshot specialization |
+| `tests/c_api/pointer_field_snapshot.c` | Snapshot + bind pointed-to array field |
+| `tests/c_api/partial_struct_binding.c` | Partial struct field specialization |
+| `tests/c_api/mixed_bindings.c` | Mixed runtime args + scalar constants + snapshots |
+| `tests/c_api/cache_example.c` | Cache / reuse flow |
+| `tests/c_api/wireless_beamform.c` | More realistic domain-style kernel |
+| `tests/c_api/config_process_base.c` | Baseline benchmark |
+| `tests/c_api/config_process_easyjit.c` | JIT benchmark companion |
+| `tests/c_api/embedded_diag_easyjit.c` | Embedded board diagnostic harness |
+| `tests/c_api/run_c_api_tests.sh` | One-command build & run script |
 
-### Modified files
-| File | Change |
-|------|--------|
-| `easy-jit/runtime/CMakeLists.txt` | Added `easyjit_c.cpp` to the `EasyJitRuntime` shared library |
+Several one-off benchmark probes and performance investigation variants were
+intentionally removed to keep this directory readable.
 
 ## Core design
 
