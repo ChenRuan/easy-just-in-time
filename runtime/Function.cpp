@@ -146,6 +146,33 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
   EASYJIT_RT_LOG("Optimize: finished for %s\n", Name ? Name : "<null>");
 }
 
+static void DisableRecursiveJit(llvm::Module &M, const char *EntryName) {
+  if (!EntryName)
+    return;
+
+  for (const char *CtorDtorName : {"llvm.global_ctors", "llvm.global_dtors"}) {
+    if (llvm::GlobalVariable *GV = M.getGlobalVariable(CtorDtorName)) {
+      GV->replaceAllUsesWith(llvm::UndefValue::get(GV->getType()));
+      GV->eraseFromParent();
+    }
+  }
+
+  for (llvm::Function &F : M) {
+    if (F.isDeclaration() || F.getName() == EntryName)
+      continue;
+    if (F.getName().startswith("llvm."))
+      continue;
+    if (F.getName() == "register_layout")
+      continue;
+
+    F.deleteBody();
+    F.setComdat(nullptr);
+    F.setSection("");
+    F.setVisibility(llvm::GlobalValue::DefaultVisibility);
+    F.setLinkage(llvm::GlobalValue::ExternalLinkage);
+  }
+}
+
 static std::string TakeError(llvm::Error Err) {
   return llvm::toString(std::move(Err));
 }
@@ -358,6 +385,12 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
   EASYJIT_RT_LOG("Function::Compile: write before-ir begin\n");
   WriteOptimizedToFile(*M, GetDumpFileWithSuffix(C.getDebugFile(), ".before"));
   EASYJIT_RT_LOG("Function::Compile: write before-ir end\n");
+
+  if (!C.getRecursiveJit()) {
+    EASYJIT_RT_LOG("Function::Compile: disabling recursive JIT for %s\n",
+                   Name ? Name : "<null>");
+    DisableRecursiveJit(*M, Name);
+  }
 
   Optimize(*M, Name, C, OptLevel, OptSize);
 

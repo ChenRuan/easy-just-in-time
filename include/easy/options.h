@@ -51,6 +51,18 @@ namespace options{
     std::string file_;
   };
 
+  EASY_NEW_OPTION_STRUCT(recursive_jit) {
+    explicit recursive_jit(bool Enabled = true)
+        : Enabled_(Enabled) {}
+
+    EASY_HANDLE_OPTION_STRUCT(recursive_jit, C) {
+      C.setRecursiveJit(Enabled_);
+    }
+
+   private:
+    bool Enabled_;
+  };
+
   template<class T>
   struct global_snapshot_option;
 

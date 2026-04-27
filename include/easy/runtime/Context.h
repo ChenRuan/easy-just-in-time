@@ -293,6 +293,7 @@ class Context {
   std::vector<GlobalStructBinding> GlobalStructBindings_;
   unsigned OptLevel_ = 2, OptSize_ = 0;
   std::string DebugFile_;
+  bool RecursiveJit_ = false;
 
   // describes how the arguments of the function are passed
   //  struct arguments can be packed in a single int, or passed field by field,
@@ -365,12 +366,21 @@ class Context {
     return *this;
   }
 
+  Context& setRecursiveJit(bool Enabled) {
+    RecursiveJit_ = Enabled;
+    return *this;
+  }
+
   std::pair<unsigned, unsigned> getOptLevel() const {
     return std::make_pair(OptLevel_, OptSize_);
   }
 
   std::string const& getDebugFile() const {
     return DebugFile_;
+  }
+
+  bool getRecursiveJit() const {
+    return RecursiveJit_;
   }
 
   auto begin() const { return ArgumentMapping_.begin(); }
@@ -436,6 +446,7 @@ namespace std
         }
       }
       H ^= OptHash(C.getOptLevel());
+      H ^= IntHash(C.getRecursiveJit() ? 1 : 0);
       return H;
     }
   };

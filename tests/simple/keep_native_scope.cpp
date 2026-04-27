@@ -30,7 +30,10 @@ int outer(int x) {
 }
 
 int main(int argc, char** argv) {
-  auto fn = easy::jit(outer, _1, easy::options::dump_ir(argv[1]));
+  auto fn = easy::jit(outer,
+                      _1,
+                      easy::options::recursive_jit(),
+                      easy::options::dump_ir(argv[1]));
   printf("result=%d\n", fn(5));
   return 0;
 }

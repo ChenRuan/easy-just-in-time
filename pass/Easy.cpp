@@ -69,7 +69,7 @@ namespace easy {
         return false;
       
       SmallVector<GlobalValue*, 8> MappedGlobals;
-      collectMappedGlobals(M, MappedGlobals);
+      collectMappedGlobals(M, ObjectsToJIT, MappedGlobals);
       nameGlobals(MappedGlobals, "unnamed_local_global");
 
       auto Bitcode = embedBitcode(M, ObjectsToJIT);
@@ -294,8 +294,14 @@ namespace easy {
           GO.setSection(JIT_SECTION);
     }
 
-    static void collectMappedGlobals(Module &M, SmallVectorImpl<GlobalValue*> &Globals) {
+    static void collectMappedGlobals(Module &M,
+                                     SmallVectorImpl<GlobalObject*> &ObjectsToJIT,
+                                     SmallVectorImpl<GlobalValue*> &Globals) {
       SmallPtrSet<GlobalValue*, 16> Seen;
+      SmallPtrSet<GlobalObject*, 8> JitEntries;
+      for (GlobalObject *GO : ObjectsToJIT)
+        JitEntries.insert(GO);
+
       for (GlobalVariable &GV : M.globals()) {
         if (GV.getName().startswith("llvm."))
           continue;
@@ -337,6 +343,23 @@ namespace easy {
             if (Seen.insert(Callee).second)
               Globals.push_back(Callee);
           }
+        }
+      }
+
+      for (GlobalObject *Entry : ObjectsToJIT) {
+        for (GlobalValue *GV : getReferencedFromEntry(*Entry)) {
+          auto *F = dyn_cast<Function>(GV);
+          if (!F || F->isDeclaration() || F->getName().startswith("llvm."))
+            continue;
+          if (JitEntries.count(F))
+            continue;
+          if (isKeepNativeMarker(F))
+            continue;
+
+          LLVM_DEBUG(dbgs() << "Mapped native callee: " << F->getName()
+                            << " for " << Entry->getName() << "\n");
+          if (Seen.insert(F).second)
+            Globals.push_back(F);
         }
       }
     }

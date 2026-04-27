@@ -410,9 +410,9 @@ if (err != EASYJIT_OK) {
 
 ## 3. 递归 JIT 的使用场景和结果
 
-### 3.1 默认递归 JIT
+### 3.1 默认不递归 JIT
 
-当一个被 JIT 的函数直接调用同一编译单元里可见的 helper，pass 会把 direct callee 一起放进 JIT 模块。这个适合“外层入口很小，但真正热路径在 helper 里”的场景。
+默认情况下，一个被 JIT 的函数直接调用 helper 时，entry 本身会进入 JIT，helper 保持 native。这个默认值更保守：不会因为外层函数被 JIT，就自动把下面一串 direct callee 都搬进 JIT 模块。
 
 ```cpp
 #include <easy/jit.h>
@@ -438,11 +438,36 @@ int main() {
 }
 ```
 
-这里 `outer` 和 `helper_jit` 会作为一个闭包进入 JIT。结果上看还是普通函数调用语义；实现上看，`helper_jit` 不再走原生函数地址，而是 JIT 模块里的版本。
+这里结果仍然是普通函数调用语义；实现上看，`outer` 是 JIT 版本，`helper_jit` 会被剥成外部声明，并通过 EasyJIT 的 global mapping 解析到宿主进程里的原生函数地址。
 
-### 3.2 部分递归：保留某些调用为 native
+```llvm
+; 默认：helper_jit 不进入 JIT 模块，只保留声明
+declare i32 @_Z10helper_jiti(i32)
+```
 
-如果某个 helper 不希望被递归 JIT，比如里面有不适合搬进 JIT 的库调用、平台 API、复杂副作用，或者暂时想保持与原生实现完全一致，可以在调用点外面加 `EASY_JIT_KEEP_NATIVE_SCOPE()`。
+### 3.2 显式开启递归 JIT
+
+如果确实希望把 direct callee 一起编进 JIT 模块，需要在外侧调用点显式加 option：
+
+```cpp
+auto fn = easy::jit(
+    outer,
+    _1,
+    easy::options::recursive_jit());
+```
+
+加了 `easy::options::recursive_jit()` 后，`outer` 引用到的 helper 定义会保留在 JIT module 里。这个适合“外层入口很小，但真正热路径在 helper 里”的场景。
+
+```llvm
+; recursive_jit option：helper_jit 保留定义，进入 JIT 模块
+define internal i32 @_Z10helper_jiti(i32 %x) {
+  ...
+}
+```
+
+### 3.3 部分递归：保留某些调用为 native
+
+开启递归 JIT 后，如果某个 helper 不希望被递归 JIT，比如里面有不适合搬进 JIT 的库调用、平台 API、复杂副作用，或者暂时想保持与原生实现完全一致，可以在调用点外面加 `EASY_JIT_KEEP_NATIVE_SCOPE()`。
 
 ```cpp
 #include <easy/jit.h>
@@ -473,7 +498,10 @@ int outer(int x) {
 }
 
 int main() {
-  auto fn = easy::jit(outer, _1);
+  auto fn = easy::jit(
+      outer,
+      _1,
+      easy::options::recursive_jit());
   std::printf("result=%d\n", fn(5)); // 25
 }
 ```
@@ -490,7 +518,7 @@ define internal i32 @_Z10helper_jiti(i32 %x) {
 declare i32 @_Z13helper_nativei(i32)
 ```
 
-### 3.3 不支持在 JIT 后的机器码里再次调用 `easy::jit`
+### 3.4 不支持在 JIT 后的机器码里再次调用 `easy::jit`
 
 一个容易误用的场景是在被 JIT 的函数内部再调用 `easy::jit`。
 
@@ -509,9 +537,9 @@ auto outer_fn = easy::jit(outer_bad, std::placeholders::_1);
 
 这个模式不建议也不作为当前支持目标。原因是 EasyJIT 的 bitcode 发现和注册发生在原始编译产物上，JIT 后机器码里的函数地址不是原始 host function address，也不会重新跑 pass 去登记新的 bitcode。实际效果通常不是“嵌套生成一份新的 JIT”，而是找不到正确的 bitcode/上下文，甚至触发崩溃。
 
-如果需求是“调用某个入口时，把它下面的一部分 helper 也 JIT 掉”，应该用默认递归 JIT；如果需求是“有些 helper 不要 JIT”，就在调用点加 `EASY_JIT_KEEP_NATIVE_SCOPE()`。这个模型更接近原本的函数调用写法，也避免在 JIT 产物里再次启动编译器。
+如果需求是“调用某个入口时，把它下面的一部分 helper 也 JIT 掉”，应该在外层 `easy::jit(...)` 上加 `easy::options::recursive_jit()`；如果需求是“递归 JIT 开启后，某些 helper 不要 JIT”，就在调用点加 `EASY_JIT_KEEP_NATIVE_SCOPE()`。这个模型更接近原本的函数调用写法，也避免在 JIT 产物里再次启动编译器。
 
-### 3.4 当前边界
+### 3.5 当前边界
 
 `EASY_JIT_KEEP_NATIVE_SCOPE()` 主要覆盖直接调用场景：
 

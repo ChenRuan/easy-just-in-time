@@ -129,6 +129,8 @@ Context& Context::bindArrayToLastGlobalPartialStruct(size_t Offset,
 bool Context::operator==(const Context& Other) const {
   if(getOptLevel() != Other.getOptLevel())
     return false;
+  if(getRecursiveJit() != Other.getRecursiveJit())
+    return false;
   if(size() != Other.size())
     return false;
   if(getGlobalStructBindings() != Other.getGlobalStructBindings())
