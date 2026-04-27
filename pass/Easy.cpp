@@ -295,11 +295,49 @@ namespace easy {
     }
 
     static void collectMappedGlobals(Module &M, SmallVectorImpl<GlobalValue*> &Globals) {
+      SmallPtrSet<GlobalValue*, 16> Seen;
       for (GlobalVariable &GV : M.globals()) {
         if (GV.getName().startswith("llvm."))
           continue;
         LLVM_DEBUG(dbgs() << "Mapped global: " << GV << "\n");
-        Globals.push_back(&GV);
+        if (Seen.insert(&GV).second)
+          Globals.push_back(&GV);
+      }
+
+      for (Function &F : M) {
+        if (F.isDeclaration())
+          continue;
+
+        unsigned KeepNativeDepth = 0;
+        for (Instruction &I : instructions(F)) {
+          auto *CB = dyn_cast<CallBase>(&I);
+          if (!CB)
+            continue;
+
+          Function *Callee = CB->getCalledFunction();
+          if (!Callee)
+            continue;
+
+          StringRef CalleeName = Callee->getName();
+          if (CalleeName.contains("keep_native_scope_begin") ||
+              CalleeName.contains("KeepNativeScopeC")) {
+            ++KeepNativeDepth;
+            continue;
+          }
+          if (CalleeName.contains("keep_native_scope_end") ||
+              CalleeName.contains("KeepNativeScopeD")) {
+            if (KeepNativeDepth > 0)
+              --KeepNativeDepth;
+            continue;
+          }
+
+          if (KeepNativeDepth > 0 && !Callee->isDeclaration()) {
+            LLVM_DEBUG(dbgs() << "Mapped keep-native function: "
+                              << Callee->getName() << "\n");
+            if (Seen.insert(Callee).second)
+              Globals.push_back(Callee);
+          }
+        }
       }
     }
 
@@ -374,6 +412,103 @@ namespace easy {
                                 BitcodeInit, Name);
     }
 
+    static bool isKeepNativeMarker(Function const *F) {
+      if (!F)
+        return false;
+      return F->getSection() == KEEP_NATIVE_SECTION ||
+             F->getName().contains("keep_native_scope_begin") ||
+             F->getName().contains("keep_native_scope_end") ||
+             F->getName().contains("KeepNativeScope");
+    }
+
+    static bool isKeepNativeBegin(Function const *F) {
+      return F && (F->getName().contains("keep_native_scope_begin") ||
+                   F->getName().contains("KeepNativeScopeC"));
+    }
+
+    static bool isKeepNativeEnd(Function const *F) {
+      return F && (F->getName().contains("keep_native_scope_end") ||
+                   F->getName().contains("KeepNativeScopeD"));
+    }
+
+    static SmallPtrSet<Function*, 8> collectKeepNativeCallees(Module &M) {
+      SmallPtrSet<Function*, 8> Excluded;
+
+      for (Function &F : M) {
+        if (F.isDeclaration())
+          continue;
+
+        unsigned KeepNativeDepth = 0;
+        for (Instruction &I : instructions(F)) {
+          auto *CB = dyn_cast<CallBase>(&I);
+          if (!CB)
+            continue;
+
+          Function *Callee = CB->getCalledFunction();
+          if (!Callee)
+            continue;
+
+          if (isKeepNativeBegin(Callee)) {
+            ++KeepNativeDepth;
+            continue;
+          }
+          if (isKeepNativeEnd(Callee)) {
+            if (KeepNativeDepth > 0)
+              --KeepNativeDepth;
+            continue;
+          }
+
+          if (KeepNativeDepth > 0 && !Callee->isDeclaration() &&
+              !isKeepNativeMarker(Callee)) {
+            Excluded.insert(Callee);
+          }
+        }
+      }
+
+      return Excluded;
+    }
+
+    static void stripKeepNativeMarkers(Module &M) {
+      SmallVector<Instruction*, 8> CallsToErase;
+      for (Function &F : M) {
+        if (F.isDeclaration())
+          continue;
+        for (Instruction &I : instructions(F)) {
+          auto *CI = dyn_cast<CallInst>(&I);
+          if (!CI)
+            continue;
+          if (isKeepNativeMarker(CI->getCalledFunction()))
+            CallsToErase.push_back(CI);
+        }
+      }
+
+      for (Instruction *I : CallsToErase)
+        I->eraseFromParent();
+
+      SmallVector<Function*, 4> MarkersToErase;
+      for (Function &F : M)
+        if (isKeepNativeMarker(&F) && F.use_empty())
+          MarkersToErase.push_back(&F);
+      for (Function *F : MarkersToErase)
+        F->eraseFromParent();
+    }
+
+    static void applyKeepNativeExclusions(GlobalValue &Entry, Module &M) {
+      SmallPtrSet<Function*, 8> Excluded = collectKeepNativeCallees(M);
+      stripKeepNativeMarkers(M);
+
+      for (Function *F : Excluded) {
+        if (F == &Entry)
+          continue;
+
+        F->deleteBody();
+        F->setComdat(nullptr);
+        F->setSection("");
+        F->setVisibility(GlobalValue::DefaultVisibility);
+        F->setLinkage(GlobalValue::ExternalLinkage);
+      }
+    }
+
     static void cleanModule(GlobalValue &Entry, Module &M) {
 
       llvm::StripDebugInfo(M);
@@ -387,6 +522,10 @@ namespace easy {
 
       if(ForFunction) {
         Entry.setLinkage(GlobalValue::ExternalLinkage);
+      }
+
+      if(ForFunction) {
+        applyKeepNativeExclusions(Entry, M);
       }
 
       //clean the cloned module
