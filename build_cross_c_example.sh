@@ -20,6 +20,12 @@ EXTRA_CXXFLAGS=""
 EXTRA_LDFLAGS=""
 GCC_BIN_DIR=""
 GCC_LIB_DIR=""
+CXX_STDLIB=""
+USE_LLD=0
+LIBCXX_INCLUDE_DIR=""
+LIBCXX_LIB_DIR=""
+LIBCXXABI_LIB_DIR=""
+LIBUNWIND_LIB_DIR=""
 CMAKE_BUILD_TYPE="Release"
 JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)}"
 
@@ -55,9 +61,18 @@ Optional:
   --gcc-toolchain <path>     GCC toolchain root; script derives bin/lib paths
   --gcc-bin-dir <path>       Explicit GCC bin dir for -B
   --gcc-lib-dir <path>       Explicit GCC libgcc dir for -L/-B
+  --stdlib <name>            C++ runtime: libstdc++, libc++, or none.
+                             Default is libstdc++ for backwards compatibility.
+  --use-lld                  Add -fuse-ld=lld to target link flags
+  --libcxx-include-dir <dir> Extra libc++ header dir for runtime build
+  --libcxx-lib-dir <dir>     Extra dir containing libc++.a/.so
+  --libcxxabi-lib-dir <dir>  Extra dir containing libc++abi.a/.so
+  --libunwind-lib-dir <dir>  Extra dir containing libunwind.a/.so
   --extra-cflags <flags>     Extra target C compiler flags
   --extra-cxxflags <flags>   Extra target C++ compiler flags for runtime build
   --extra-ldflags <flags>    Extra target linker flags
+                             Use this for explicit ABI/unwind libs, e.g.
+                             '-lc++abi -lunwind', if the toolchain needs them.
   --build-type <type>        CMake build type, default: Release
   --jobs <n>                 Parallel build jobs
   -h, --help                 Show this help
@@ -82,6 +97,20 @@ Example:
     --gcc-toolchain /opt/gcc-aarch64 \
     --source ./wireless-test/example1/example1-c-api-snapshot-rawptr.c \
     --output ./wireless-test/example1/out/example1-c-api-snapshot-rawptr.aarch64
+
+Pure clang + libc++ example:
+  ./build_cross_c_example.sh \
+    --target aarch64_be-linux-gnu \
+    --sysroot /opt/sdk/sysroot \
+    --host-llvm-build /opt/llvm15-host/build-host \
+    --host-easyjit-build /path/to/easy-jit/build-llvm15 \
+    --llvm-dir /opt/llvm15-aarch64be \
+    --stdlib libc++ \
+    --use-lld \
+    --libcxx-include-dir /opt/sdk/sysroot/usr/include/c++/v1 \
+    --libcxx-lib-dir /opt/sdk/lib64 \
+    --source ./tests/c_api/add_int.c \
+    --output ./tests/c_api/output/add_int.aarch64be
 EOF
 }
 
@@ -185,6 +214,12 @@ while [[ $# -gt 0 ]]; do
     --gcc-toolchain) GCC_TOOLCHAIN="$2"; shift 2 ;;
     --gcc-bin-dir) GCC_BIN_DIR="$2"; shift 2 ;;
     --gcc-lib-dir) GCC_LIB_DIR="$2"; shift 2 ;;
+    --stdlib) CXX_STDLIB="$2"; shift 2 ;;
+    --use-lld) USE_LLD=1; shift ;;
+    --libcxx-include-dir) LIBCXX_INCLUDE_DIR="$2"; shift 2 ;;
+    --libcxx-lib-dir) LIBCXX_LIB_DIR="$2"; shift 2 ;;
+    --libcxxabi-lib-dir) LIBCXXABI_LIB_DIR="$2"; shift 2 ;;
+    --libunwind-lib-dir) LIBUNWIND_LIB_DIR="$2"; shift 2 ;;
     --extra-cflags) EXTRA_CFLAGS="$2"; shift 2 ;;
     --extra-cxxflags) EXTRA_CXXFLAGS="$2"; shift 2 ;;
     --extra-ldflags) EXTRA_LDFLAGS="$2"; shift 2 ;;
@@ -213,6 +248,10 @@ PASS_SO="$HOST_EASYJIT_DIR/EasyJitPass.so"
 [[ -f "$PASS_SO" ]] || die "host pass plugin not found: $PASS_SO"
 [[ -f "$SOURCE_FILE" ]] || die "source file not found: $SOURCE_FILE"
 [[ -d "$SYSROOT" ]] || die "sysroot not found: $SYSROOT"
+case "$CXX_STDLIB" in
+  ""|libstdc++|libc++|none) ;;
+  *) die "--stdlib must be one of: libstdc++, libc++, none" ;;
+esac
 
 if [[ -z "$RUNTIME_SO" ]]; then
   [[ -n "$LLVM_DIR" ]] || die "--llvm-dir is required when --runtime-so is omitted"
@@ -255,6 +294,26 @@ if [[ -n "$GCC_LIB_DIR" ]]; then
   RUNTIME_EXE_LINKER_FLAGS="${RUNTIME_EXE_LINKER_FLAGS:+$RUNTIME_EXE_LINKER_FLAGS }-B$GCC_LIB_DIR -L$GCC_LIB_DIR"
   RUNTIME_SHARED_LINKER_FLAGS="${RUNTIME_SHARED_LINKER_FLAGS:+$RUNTIME_SHARED_LINKER_FLAGS }-B$GCC_LIB_DIR -L$GCC_LIB_DIR"
 fi
+if [[ "$USE_LLD" -eq 1 ]]; then
+  RUNTIME_EXE_LINKER_FLAGS="${RUNTIME_EXE_LINKER_FLAGS:+$RUNTIME_EXE_LINKER_FLAGS }-fuse-ld=lld"
+  RUNTIME_SHARED_LINKER_FLAGS="${RUNTIME_SHARED_LINKER_FLAGS:+$RUNTIME_SHARED_LINKER_FLAGS }-fuse-ld=lld"
+fi
+if [[ -n "$CXX_STDLIB" && "$CXX_STDLIB" != "none" ]]; then
+  RUNTIME_CXX_FLAGS="${RUNTIME_CXX_FLAGS:+$RUNTIME_CXX_FLAGS }-stdlib=$CXX_STDLIB"
+  RUNTIME_EXE_LINKER_FLAGS="${RUNTIME_EXE_LINKER_FLAGS:+$RUNTIME_EXE_LINKER_FLAGS }-stdlib=$CXX_STDLIB"
+  RUNTIME_SHARED_LINKER_FLAGS="${RUNTIME_SHARED_LINKER_FLAGS:+$RUNTIME_SHARED_LINKER_FLAGS }-stdlib=$CXX_STDLIB"
+fi
+if [[ -n "$LIBCXX_INCLUDE_DIR" ]]; then
+  [[ -d "$LIBCXX_INCLUDE_DIR" ]] || die "libc++ include dir not found: $LIBCXX_INCLUDE_DIR"
+  RUNTIME_CXX_FLAGS="${RUNTIME_CXX_FLAGS:+$RUNTIME_CXX_FLAGS }-isystem $LIBCXX_INCLUDE_DIR"
+fi
+for dir in "$LIBCXX_LIB_DIR" "$LIBCXXABI_LIB_DIR" "$LIBUNWIND_LIB_DIR"; do
+  if [[ -n "$dir" ]]; then
+    [[ -d "$dir" ]] || die "C++ runtime library dir not found: $dir"
+    RUNTIME_EXE_LINKER_FLAGS="${RUNTIME_EXE_LINKER_FLAGS:+$RUNTIME_EXE_LINKER_FLAGS }-L$dir"
+    RUNTIME_SHARED_LINKER_FLAGS="${RUNTIME_SHARED_LINKER_FLAGS:+$RUNTIME_SHARED_LINKER_FLAGS }-L$dir"
+  fi
+done
 if [[ -n "$EXTRA_CFLAGS" ]]; then
   RUNTIME_C_FLAGS="${RUNTIME_C_FLAGS:+$RUNTIME_C_FLAGS }$EXTRA_CFLAGS"
 fi
@@ -283,6 +342,24 @@ if [[ -n "$GCC_BIN_DIR" ]]; then
 fi
 if [[ -n "$GCC_LIB_DIR" ]]; then
   echo "  gcc_lib_dir     = $GCC_LIB_DIR"
+fi
+if [[ -n "$CXX_STDLIB" ]]; then
+  echo "  cxx_stdlib      = $CXX_STDLIB"
+fi
+if [[ "$USE_LLD" -eq 1 ]]; then
+  echo "  linker          = lld"
+fi
+if [[ -n "$LIBCXX_INCLUDE_DIR" ]]; then
+  echo "  libcxx_include  = $LIBCXX_INCLUDE_DIR"
+fi
+if [[ -n "$LIBCXX_LIB_DIR" ]]; then
+  echo "  libcxx_lib_dir  = $LIBCXX_LIB_DIR"
+fi
+if [[ -n "$LIBCXXABI_LIB_DIR" ]]; then
+  echo "  libcxxabi_lib_dir = $LIBCXXABI_LIB_DIR"
+fi
+if [[ -n "$LIBUNWIND_LIB_DIR" ]]; then
+  echo "  libunwind_lib_dir = $LIBUNWIND_LIB_DIR"
 fi
 if [[ -n "$LLVM_DIR" ]]; then
   echo "  llvm_dir        = $LLVM_DIR"
@@ -343,9 +420,26 @@ COMMON_FLAGS=(
   "-Wl,-rpath,\$ORIGIN"
   "-lEasyJitRuntime"
   "-lpthread"
-  "-lstdc++"
   "-Xclang" "-fpass-plugin=$PASS_SO"
 )
+
+if [[ "$USE_LLD" -eq 1 ]]; then
+  COMMON_FLAGS+=("-fuse-ld=lld")
+fi
+if [[ -n "$LIBCXX_LIB_DIR" ]]; then
+  COMMON_FLAGS+=("-L$LIBCXX_LIB_DIR")
+fi
+if [[ -n "$LIBCXXABI_LIB_DIR" ]]; then
+  COMMON_FLAGS+=("-L$LIBCXXABI_LIB_DIR")
+fi
+if [[ -n "$LIBUNWIND_LIB_DIR" ]]; then
+  COMMON_FLAGS+=("-L$LIBUNWIND_LIB_DIR")
+fi
+case "${CXX_STDLIB:-libstdc++}" in
+  libstdc++) COMMON_FLAGS+=("-lstdc++") ;;
+  libc++) COMMON_FLAGS+=("-lc++") ;;
+  none) ;;
+esac
 
 if [[ -n "$TARGET_CPU" ]]; then
   COMMON_FLAGS+=("-mcpu=$TARGET_CPU")

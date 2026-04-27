@@ -17,6 +17,12 @@ EXTRA_CXXFLAGS=""
 EXTRA_LDFLAGS=""
 GCC_BIN_DIR=""
 GCC_LIB_DIR=""
+CXX_STDLIB=""
+USE_LLD=0
+LIBCXX_INCLUDE_DIR=""
+LIBCXX_LIB_DIR=""
+LIBCXXABI_LIB_DIR=""
+LIBUNWIND_LIB_DIR=""
 
 usage() {
   cat <<'EOF'
@@ -42,9 +48,18 @@ Optional:
   --gcc-toolchain <path>     GCC toolchain root; script derives bin/lib paths
   --gcc-bin-dir <path>       Explicit GCC bin dir for -B
   --gcc-lib-dir <path>       Explicit GCC libgcc dir for -L/-B
+  --stdlib <name>            C++ runtime: libstdc++, libc++, or none.
+                             Default keeps clang's normal target default.
+  --use-lld                  Add -fuse-ld=lld to target link flags
+  --libcxx-include-dir <dir> Extra libc++ header dir, e.g. sysroot/usr/include/c++/v1
+  --libcxx-lib-dir <dir>     Extra dir containing libc++.a/.so
+  --libcxxabi-lib-dir <dir>  Extra dir containing libc++abi.a/.so
+  --libunwind-lib-dir <dir>  Extra dir containing libunwind.a/.so
   --extra-cflags <flags>     Extra target C compiler flags
   --extra-cxxflags <flags>   Extra target C++ compiler flags
   --extra-ldflags <flags>    Extra target linker flags
+                             Use this for explicit ABI/unwind libs, e.g.
+                             '-lc++abi -lunwind', if the toolchain needs them.
   --build-type <type>        CMake build type, default: Release
   --jobs <n>                 Parallel jobs
   -h, --help                 Show this help
@@ -56,6 +71,17 @@ Example:
     --target-llvm-dir /opt/llvm15-aarch64be \
     --host-llvm-build /opt/llvm15-host/build-host \
     --gcc-toolchain /opt/gcc-aarch64be
+
+Pure clang + libc++ example:
+  ./build_cross_runtime.sh \
+    --target aarch64_be-linux-gnu \
+    --sysroot /opt/sdk/sysroot \
+    --target-llvm-dir /opt/llvm15-aarch64be \
+    --host-llvm-build /opt/llvm15-host/build-host \
+    --stdlib libc++ \
+    --use-lld \
+    --libcxx-include-dir /opt/sdk/sysroot/usr/include/c++/v1 \
+    --libcxx-lib-dir /opt/sdk/lib64
 EOF
 }
 
@@ -154,6 +180,12 @@ while [[ $# -gt 0 ]]; do
     --gcc-toolchain) GCC_TOOLCHAIN="$2"; shift 2 ;;
     --gcc-bin-dir) GCC_BIN_DIR="$2"; shift 2 ;;
     --gcc-lib-dir) GCC_LIB_DIR="$2"; shift 2 ;;
+    --stdlib) CXX_STDLIB="$2"; shift 2 ;;
+    --use-lld) USE_LLD=1; shift ;;
+    --libcxx-include-dir) LIBCXX_INCLUDE_DIR="$2"; shift 2 ;;
+    --libcxx-lib-dir) LIBCXX_LIB_DIR="$2"; shift 2 ;;
+    --libcxxabi-lib-dir) LIBCXXABI_LIB_DIR="$2"; shift 2 ;;
+    --libunwind-lib-dir) LIBUNWIND_LIB_DIR="$2"; shift 2 ;;
     --extra-cflags) EXTRA_CFLAGS="$2"; shift 2 ;;
     --extra-cxxflags) EXTRA_CXXFLAGS="$2"; shift 2 ;;
     --extra-ldflags) EXTRA_LDFLAGS="$2"; shift 2 ;;
@@ -174,6 +206,10 @@ HOST_CLANGXX="$HOST_LLVM_BUILD/bin/clang++"
 [[ -x "$HOST_CLANG" ]] || die "host clang not found: $HOST_CLANG"
 [[ -x "$HOST_CLANGXX" ]] || die "host clang++ not found: $HOST_CLANGXX"
 [[ -d "$SYSROOT" ]] || die "sysroot not found: $SYSROOT"
+case "$CXX_STDLIB" in
+  ""|libstdc++|libc++|none) ;;
+  *) die "--stdlib must be one of: libstdc++, libc++, none" ;;
+esac
 
 TARGET_LLVM_DIR=$(resolve_llvm_dir "$TARGET_LLVM_DIR" || true)
 [[ -n "$TARGET_LLVM_DIR" ]] || die "could not resolve target LLVM dir; pass a directory containing LLVMConfig.cmake, or an LLVM root with lib/cmake/llvm or lib64/cmake/llvm"
@@ -199,6 +235,24 @@ if [[ -n "$GCC_BIN_DIR" ]]; then
 fi
 if [[ -n "$GCC_LIB_DIR" ]]; then
   echo "  gcc_lib_dir     = $GCC_LIB_DIR"
+fi
+if [[ -n "$CXX_STDLIB" ]]; then
+  echo "  cxx_stdlib      = $CXX_STDLIB"
+fi
+if [[ "$USE_LLD" -eq 1 ]]; then
+  echo "  linker          = lld"
+fi
+if [[ -n "$LIBCXX_INCLUDE_DIR" ]]; then
+  echo "  libcxx_include  = $LIBCXX_INCLUDE_DIR"
+fi
+if [[ -n "$LIBCXX_LIB_DIR" ]]; then
+  echo "  libcxx_lib_dir  = $LIBCXX_LIB_DIR"
+fi
+if [[ -n "$LIBCXXABI_LIB_DIR" ]]; then
+  echo "  libcxxabi_lib_dir = $LIBCXXABI_LIB_DIR"
+fi
+if [[ -n "$LIBUNWIND_LIB_DIR" ]]; then
+  echo "  libunwind_lib_dir = $LIBUNWIND_LIB_DIR"
 fi
 echo "  build_dir       = $BUILD_DIR"
 echo
@@ -230,6 +284,26 @@ if [[ -n "$GCC_LIB_DIR" ]]; then
   EXE_LINKER_FLAGS="${EXE_LINKER_FLAGS:+$EXE_LINKER_FLAGS }-B$GCC_LIB_DIR -L$GCC_LIB_DIR"
   SHARED_LINKER_FLAGS="${SHARED_LINKER_FLAGS:+$SHARED_LINKER_FLAGS }-B$GCC_LIB_DIR -L$GCC_LIB_DIR"
 fi
+if [[ "$USE_LLD" -eq 1 ]]; then
+  EXE_LINKER_FLAGS="${EXE_LINKER_FLAGS:+$EXE_LINKER_FLAGS }-fuse-ld=lld"
+  SHARED_LINKER_FLAGS="${SHARED_LINKER_FLAGS:+$SHARED_LINKER_FLAGS }-fuse-ld=lld"
+fi
+if [[ -n "$CXX_STDLIB" && "$CXX_STDLIB" != "none" ]]; then
+  CXX_FLAGS="${CXX_FLAGS:+$CXX_FLAGS }-stdlib=$CXX_STDLIB"
+  EXE_LINKER_FLAGS="${EXE_LINKER_FLAGS:+$EXE_LINKER_FLAGS }-stdlib=$CXX_STDLIB"
+  SHARED_LINKER_FLAGS="${SHARED_LINKER_FLAGS:+$SHARED_LINKER_FLAGS }-stdlib=$CXX_STDLIB"
+fi
+if [[ -n "$LIBCXX_INCLUDE_DIR" ]]; then
+  [[ -d "$LIBCXX_INCLUDE_DIR" ]] || die "libc++ include dir not found: $LIBCXX_INCLUDE_DIR"
+  CXX_FLAGS="${CXX_FLAGS:+$CXX_FLAGS }-isystem $LIBCXX_INCLUDE_DIR"
+fi
+for dir in "$LIBCXX_LIB_DIR" "$LIBCXXABI_LIB_DIR" "$LIBUNWIND_LIB_DIR"; do
+  if [[ -n "$dir" ]]; then
+    [[ -d "$dir" ]] || die "C++ runtime library dir not found: $dir"
+    EXE_LINKER_FLAGS="${EXE_LINKER_FLAGS:+$EXE_LINKER_FLAGS }-L$dir"
+    SHARED_LINKER_FLAGS="${SHARED_LINKER_FLAGS:+$SHARED_LINKER_FLAGS }-L$dir"
+  fi
+done
 if [[ -n "$EXTRA_CFLAGS" ]]; then
   C_FLAGS="${C_FLAGS:+$C_FLAGS }$EXTRA_CFLAGS"
 fi
