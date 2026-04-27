@@ -61,5 +61,17 @@ int main() {
     printf("triple(%d) is %d\n", v, triple_hit(v));
   }
 
+  ExplicitCache.clear();
+  if(ExplicitCache.has(3)) {
+    printf("explicit cache still populated after clear!\n");
+    return -1;
+  }
+
+  auto const &triple_recompiled = ExplicitCache.jit(3, mul, _1, 3);
+  if(!ExplicitCache.has(3) || triple_recompiled(4) != 12) {
+    printf("explicit cache did not repopulate after clear!\n");
+    return -1;
+  }
+
   return 0;
 }

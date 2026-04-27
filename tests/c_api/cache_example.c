@@ -78,6 +78,42 @@ int main(void) {
         printf("mac(10, %d) = %d\n", factor, spec_mac(10));
     }
 
+    err = easyjit_cache_clear(cache);
+    if (err != EASYJIT_OK) {
+        fprintf(stderr, "cache_clear failed: %s\n", easyjit_get_last_error());
+        easyjit_cache_destroy(cache);
+        return 1;
+    }
+
+    int hit_after_clear = 1;
+    err = easyjit_cache_has(cache, 3, &hit_after_clear);
+    if (err != EASYJIT_OK || hit_after_clear) {
+        fprintf(stderr, "cache clear did not remove factor=3\n");
+        easyjit_cache_destroy(cache);
+        return 1;
+    }
+
+    easyjit_context_t ctx = NULL;
+    easyjit_context_create(&ctx);
+    easyjit_context_set_forward(ctx, 0);
+    easyjit_context_set_int(ctx, 3);
+
+    void* fptr = NULL;
+    err = easyjit_cache_get_or_compile(cache, 3, (void*)mac, ctx, &fptr);
+    easyjit_context_destroy(ctx);
+    if (err != EASYJIT_OK) {
+        fprintf(stderr, "cache repopulate failed: %s\n", easyjit_get_last_error());
+        easyjit_cache_destroy(cache);
+        return 1;
+    }
+
+    mac_specialized_t spec_mac = (mac_specialized_t)fptr;
+    if (spec_mac(10) != 30) {
+        fprintf(stderr, "cache repopulate produced wrong result\n");
+        easyjit_cache_destroy(cache);
+        return 1;
+    }
+
     easyjit_cache_destroy(cache);
     return 0;
 }

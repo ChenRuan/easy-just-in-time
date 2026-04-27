@@ -368,6 +368,15 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
   WriteOptimizedToFile(*M, GetDumpFileWithSuffix(C.getDebugFile(), ".after"));
   EASYJIT_RT_LOG("Function::Compile: write after-ir end\n");
 
+  // ORC emits object code through an object streamer, which cannot handle
+  // module-level raw inline asm. C++ standard-library headers may inject
+  // harmless directives such as ".globl _ZSt21ios_base_library_initv"; strip
+  // them before handing the module to the JIT compiler.
+  if (!M->getModuleInlineAsm().empty()) {
+    EASYJIT_RT_LOG("Function::Compile: stripping module inline asm before JIT\n");
+    M->setModuleInlineAsm("");
+  }
+
   EASYJIT_RT_LOG("Function::Compile: CompileAndWrap begin\n");
   return CompileAndWrap(Name, Globals, std::move(Ctx), std::move(M));
 }

@@ -314,6 +314,9 @@ easyjit_error_t easyjit_cache_create(easyjit_cache_t* out_cache);
 /** Destroy a cache and all compiled functions it owns. */
 void easyjit_cache_destroy(easyjit_cache_t cache);
 
+/** Clear all compiled functions from a cache while keeping the cache reusable. */
+easyjit_error_t easyjit_cache_clear(easyjit_cache_t cache);
+
 /**
  * Look up or compile a specialized function in the cache.
  *

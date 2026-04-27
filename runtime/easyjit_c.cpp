@@ -555,6 +555,13 @@ struct easyjit_cache_s {
     std::unordered_map<int64_t, easyjit_function_s*> entries;
 };
 
+static void easyjit_cache_clear_entries(easyjit_cache_s* cache) {
+    for (auto& kv : cache->entries) {
+        delete kv.second;
+    }
+    cache->entries.clear();
+}
+
 extern "C"
 easyjit_error_t easyjit_cache_create(easyjit_cache_t* out_cache) {
     clear_last_error();
@@ -574,10 +581,19 @@ easyjit_error_t easyjit_cache_create(easyjit_cache_t* out_cache) {
 extern "C"
 void easyjit_cache_destroy(easyjit_cache_t cache) {
     if (!cache) return;
-    for (auto& kv : cache->entries) {
-        delete kv.second;
-    }
+    easyjit_cache_clear_entries(cache);
     delete cache;
+}
+
+extern "C"
+easyjit_error_t easyjit_cache_clear(easyjit_cache_t cache) {
+    clear_last_error();
+    if (!cache) {
+        set_last_error("easyjit_cache_clear: cache is NULL");
+        return EASYJIT_ERROR_INVALID_ARGUMENT;
+    }
+    easyjit_cache_clear_entries(cache);
+    return EASYJIT_OK;
 }
 
 extern "C"

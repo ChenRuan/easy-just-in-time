@@ -74,6 +74,10 @@ class Cache : public CacheBase<Key> {
     auto const CacheEntry = CacheBase<Key>::Cache_.find(K);
     return CacheEntry != CacheBase<Key>::Cache_.end();
   }
+
+  void clear() {
+    CacheBase<Key>::Cache_.clear();
+  }
 };
 
 
@@ -105,6 +109,10 @@ class Cache<AutoKey> : public CacheBase<AutoKey> {
         CacheBase<Key>::Cache_.find(Key(FunPtr,
                     get_context_for<T, Args...>(std::forward<Args>(args)...)));
     return CacheEntry != Cache_.end();
+  }
+
+  void clear() {
+    CacheBase<Key>::Cache_.clear();
   }
 };
 
