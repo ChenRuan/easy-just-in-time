@@ -23,6 +23,7 @@ LIBCXX_INCLUDE_DIR=""
 LIBCXX_LIB_DIR=""
 LIBCXXABI_LIB_DIR=""
 LIBUNWIND_LIB_DIR=""
+RUNTIME_TYPE="shared"
 
 usage() {
   cat <<'EOF'
@@ -34,7 +35,7 @@ Usage:
     --host-llvm-build <path> \
     [--build-dir <path>] [--target-cpu <cpu>]
 
-Builds target-side libEasyJitRuntime.so.
+Builds target-side libEasyJitRuntime.so or libEasyJitRuntime.a.
 
 Required:
   --target <triple>          Target triple, e.g. aarch64_be-linux-gnu
@@ -45,6 +46,7 @@ Required:
 Optional:
   --build-dir <path>         Output build dir, default: ./build-cross-runtime-<sanitized-target>
   --target-cpu <cpu>         Optional -mcpu
+  --runtime-type <type>      Runtime output: shared or static, default: shared
   --gcc-toolchain <path>     GCC toolchain root; script derives bin/lib paths
   --gcc-bin-dir <path>       Explicit GCC bin dir for -B
   --gcc-lib-dir <path>       Explicit GCC libgcc dir for -L/-B
@@ -72,12 +74,22 @@ Example:
     --host-llvm-build /opt/llvm15-host/build-host \
     --gcc-toolchain /opt/gcc-aarch64be
 
+Static runtime example:
+  ./build_cross_runtime.sh \
+    --target aarch64_be-linux-gnu \
+    --sysroot /opt/sdk/sysroot \
+    --target-llvm-dir /opt/llvm15-aarch64be \
+    --host-llvm-build /opt/llvm15-host/build-host \
+    --runtime-type static \
+    --gcc-toolchain /opt/gcc-aarch64be
+
 Pure clang + libc++ example:
   ./build_cross_runtime.sh \
     --target aarch64_be-linux-gnu \
     --sysroot /opt/sdk/sysroot \
     --target-llvm-dir /opt/llvm15-aarch64be \
     --host-llvm-build /opt/llvm15-host/build-host \
+    --runtime-type static \
     --stdlib libc++ \
     --use-lld \
     --libcxx-include-dir /opt/sdk/sysroot/usr/include/c++/v1 \
@@ -177,6 +189,7 @@ while [[ $# -gt 0 ]]; do
     --host-llvm-build) HOST_LLVM_BUILD="$2"; shift 2 ;;
     --build-dir) BUILD_DIR="$2"; shift 2 ;;
     --target-cpu) TARGET_CPU="$2"; shift 2 ;;
+    --runtime-type) RUNTIME_TYPE="$2"; shift 2 ;;
     --gcc-toolchain) GCC_TOOLCHAIN="$2"; shift 2 ;;
     --gcc-bin-dir) GCC_BIN_DIR="$2"; shift 2 ;;
     --gcc-lib-dir) GCC_LIB_DIR="$2"; shift 2 ;;
@@ -210,6 +223,10 @@ case "$CXX_STDLIB" in
   ""|libstdc++|libc++|none) ;;
   *) die "--stdlib must be one of: libstdc++, libc++, none" ;;
 esac
+case "$RUNTIME_TYPE" in
+  shared|static) ;;
+  *) die "--runtime-type must be one of: shared, static" ;;
+esac
 
 TARGET_LLVM_DIR=$(resolve_llvm_dir "$TARGET_LLVM_DIR" || true)
 [[ -n "$TARGET_LLVM_DIR" ]] || die "could not resolve target LLVM dir; pass a directory containing LLVMConfig.cmake, or an LLVM root with lib/cmake/llvm or lib64/cmake/llvm"
@@ -227,6 +244,7 @@ echo "  target_cpu      = ${TARGET_CPU:-<default>}"
 echo "  sysroot         = $SYSROOT"
 echo "  target_llvm_dir = $TARGET_LLVM_DIR"
 echo "  host_llvm_build = $HOST_LLVM_BUILD"
+echo "  runtime_type    = $RUNTIME_TYPE"
 if [[ -n "$GCC_TOOLCHAIN" ]]; then
   echo "  gcc_toolchain   = $GCC_TOOLCHAIN"
 fi
@@ -321,6 +339,7 @@ CMAKE_ARGS=(
   -DLLVM_BUILD_LLVM_DYLIB=OFF
   -DLLVM_LINK_LLVM_DYLIB=OFF
   -DEASY_JIT_BUILD_PASS=OFF
+  -DEASY_JIT_RUNTIME_TYPE="${RUNTIME_TYPE^^}"
   -DCMAKE_BUILD_TYPE="$CMAKE_BUILD_TYPE"
   -DCMAKE_SYSTEM_NAME=Linux
   -DCMAKE_SYSTEM_PROCESSOR="${TARGET_TRIPLE%%-*}"
@@ -338,7 +357,14 @@ CMAKE_ARGS=(
 
 cmake -S "$SCRIPT_DIR" -B "$BUILD_DIR" -G Ninja "${CMAKE_ARGS[@]}"
 cmake --build "$BUILD_DIR" --target EasyJitRuntime --parallel "$JOBS"
-assert_runtime_is_not_linked_against_llvm_shared "$BUILD_DIR/bin/libEasyJitRuntime.so"
+
+if [[ "$RUNTIME_TYPE" == "static" ]]; then
+  RUNTIME_OUTPUT="$BUILD_DIR/bin/libEasyJitRuntime.a"
+  [[ -f "$RUNTIME_OUTPUT" ]] || die "static runtime not found: $RUNTIME_OUTPUT"
+else
+  RUNTIME_OUTPUT="$BUILD_DIR/bin/libEasyJitRuntime.so"
+  assert_runtime_is_not_linked_against_llvm_shared "$RUNTIME_OUTPUT"
+fi
 
 echo "==> Done"
-echo "  runtime : $BUILD_DIR/bin/libEasyJitRuntime.so"
+echo "  runtime : $RUNTIME_OUTPUT"
