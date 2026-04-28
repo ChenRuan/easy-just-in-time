@@ -41,6 +41,8 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/bin)
 
 set(EASY_JIT_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 
+option(EASY_JIT_BUILD_PASS "Build the EasyJIT LLVM pass plugin" ON)
+
 # Suppress superfluous randlib warnings about "*.a" having no symbols on MacOSX.
 if (APPLE)
 	set(CMAKE_C_ARCHIVE_CREATE   "<CMAKE_AR> Scr <TARGET> <LINK_FLAGS> <OBJECTS>")
@@ -51,10 +53,16 @@ endif()
 
 add_subdirectory(cmake)
 add_subdirectory(include)
-add_subdirectory(pass)
+if (EASY_JIT_BUILD_PASS)
+	add_subdirectory(pass)
+endif()
 add_subdirectory(runtime)
 
-add_custom_target(easy-jit-core DEPENDS EasyJitPass EasyJitRuntime)
+set(EASY_JIT_CORE_DEPS EasyJitRuntime)
+if (TARGET EasyJitPass)
+	list(APPEND EASY_JIT_CORE_DEPS EasyJitPass)
+endif()
+add_custom_target(easy-jit-core DEPENDS ${EASY_JIT_CORE_DEPS})
 
 add_subdirectory(doc)
 add_subdirectory(benchmark)
