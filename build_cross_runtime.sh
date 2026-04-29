@@ -30,6 +30,7 @@ BUNDLE_LLVM_NEEDED_STATIC=0
 STATIC_LIBUNWIND=0
 STRIP_DEBUG=0
 LIGHT_BACKEND="default"   # default | on | off
+LIGHT_BACKEND_ONLY=0      # 1 = compile MinimalOrcJIT/CodeGen/MC out
 LLVM_COMPONENTS=(
   analysis
   bitreader
@@ -42,6 +43,20 @@ LLVM_COMPONENTS=(
   native
   nativecodegen
   orcjit
+  scalaropts
+  support
+  transformutils
+)
+# Minimal closure used when --light-backend-only is in effect: no
+# codegen/MC/orcjit/native; just enough to load bitcode and run the
+# IR-level pass pipeline.
+LLVM_COMPONENTS_LIGHT_ONLY=(
+  analysis
+  bitreader
+  bitwriter
+  core
+  ipo
+  linker
   scalaropts
   support
   transformutils
@@ -97,6 +112,10 @@ Optional:
                              sections from generated static bundle artifacts
   --enable-light-backend     Force LightBackend ON (-DEASYJIT_ENABLE_LIGHT_BACKEND=ON)
   --disable-light-backend    Force LightBackend OFF (-DEASYJIT_ENABLE_LIGHT_BACKEND=OFF)
+  --light-backend-only       Light-only build: drop MinimalOrcJIT/CodeGen/MC,
+                             keep only the LightBackend path. Implies
+                             --enable-light-backend; conflicts with
+                             --disable-light-backend; AArch64 only.
   --extra-cflags <flags>     Extra target C compiler flags
   --extra-cxxflags <flags>   Extra target C++ compiler flags
   --extra-ldflags <flags>    Extra target linker flags
@@ -280,6 +299,9 @@ write_llvm_static_libs() {
   local components
 
   components="${LLVM_COMPONENTS[*]}"
+  if [[ "$LIGHT_BACKEND_ONLY" -eq 1 ]]; then
+    components="${LLVM_COMPONENTS_LIGHT_ONLY[*]}"
+  fi
   rm -rf "$probe_src" "$probe_build"
   mkdir -p "$probe_src"
   cat > "$probe_src/CMakeLists.txt" <<EOF
@@ -541,6 +563,7 @@ while [[ $# -gt 0 ]]; do
     --strip-debug) STRIP_DEBUG=1; shift ;;
     --enable-light-backend) LIGHT_BACKEND="on"; shift ;;
     --disable-light-backend) LIGHT_BACKEND="off"; shift ;;
+    --light-backend-only) LIGHT_BACKEND_ONLY=1; shift ;;
     --extra-cflags) EXTRA_CFLAGS="$2"; shift 2 ;;
     --extra-cxxflags) EXTRA_CXXFLAGS="$2"; shift 2 ;;
     --extra-ldflags) EXTRA_LDFLAGS="$2"; shift 2 ;;
@@ -738,7 +761,18 @@ case "$LIGHT_BACKEND" in
   off) CMAKE_ARGS+=( -DEASYJIT_ENABLE_LIGHT_BACKEND=OFF ) ;;
   default) ;;
 esac
+
+if [[ "$LIGHT_BACKEND_ONLY" -eq 1 ]]; then
+  if [[ "$LIGHT_BACKEND" == "off" ]]; then
+    die "--light-backend-only conflicts with --disable-light-backend"
+  fi
+  CMAKE_ARGS+=(
+    -DEASYJIT_LIGHT_BACKEND_ONLY=ON
+    -DEASYJIT_ENABLE_LIGHT_BACKEND=ON
+  )
+fi
 echo "  light_backend = $LIGHT_BACKEND"
+echo "  light_backend_only = $LIGHT_BACKEND_ONLY"
 
 cmake -S "$SCRIPT_DIR" -B "$BUILD_DIR" -G Ninja "${CMAKE_ARGS[@]}"
 cmake --build "$BUILD_DIR" --target EasyJitRuntime --parallel "$JOBS"

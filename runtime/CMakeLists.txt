@@ -21,12 +21,27 @@ option(EASYJIT_ENABLE_LIGHT_BACKEND
        "Build the lightweight AArch64 runtime backend (LightBackend)"
        ${_easyjit_light_default})
 
+# Light-only mode: completely drop MinimalOrcJIT/ORC/CodeGen/MC from the
+# runtime. Only the lightweight AArch64 emitter is compiled in. Intended
+# for embedded / strictly controlled workloads where unsupported IR must
+# fail loudly instead of falling back through ORC.
+option(EASYJIT_LIGHT_BACKEND_ONLY
+       "Light-only runtime build: no ORC fallback, no CodeGen/MC"
+       OFF)
+if (EASYJIT_LIGHT_BACKEND_ONLY)
+  if (NOT _easyjit_lower_proc MATCHES "^(aarch64|aarch64_be|arm64)$")
+    message(FATAL_ERROR
+      "EASYJIT_LIGHT_BACKEND_ONLY=ON requires an AArch64 target "
+      "(CMAKE_SYSTEM_PROCESSOR='${CMAKE_SYSTEM_PROCESSOR}')")
+  endif()
+  set(EASYJIT_ENABLE_LIGHT_BACKEND ON CACHE BOOL
+      "Forced ON by EASYJIT_LIGHT_BACKEND_ONLY" FORCE)
+endif()
+
 set(EASYJIT_RUNTIME_SOURCES
   BitcodeTracker.cpp
   Context.cpp
   Function.cpp
-  InitNativeTarget.cpp
-  MinimalOrcJIT.cpp
   Utils.cpp
   custom_new_delete.cpp
   easyjit_c.cpp
@@ -36,6 +51,12 @@ set(EASYJIT_RUNTIME_SOURCES
   pass/InlineParametersHelper.cpp
   pass/ConstStructPropagate.cpp
 )
+if (NOT EASYJIT_LIGHT_BACKEND_ONLY)
+  # Full mode keeps the ORC backend and native-target initialization.
+  list(APPEND EASYJIT_RUNTIME_SOURCES
+    InitNativeTarget.cpp
+    MinimalOrcJIT.cpp)
+endif()
 if (EASYJIT_ENABLE_LIGHT_BACKEND)
   list(APPEND EASYJIT_RUNTIME_SOURCES
     LightBackend.cpp
@@ -45,25 +66,43 @@ endif()
 add_library(EasyJitRuntime ${EASY_JIT_RUNTIME_TYPE} ${EASYJIT_RUNTIME_SOURCES})
 target_compile_definitions(EasyJitRuntime PRIVATE
   EASYJIT_USE_CUSTOM_NEW_DELETE=$<IF:$<BOOL:${EASYJIT_USE_CUSTOM_NEW_DELETE}>,1,0>
-  EASYJIT_LIGHT_BACKEND_ENABLED=$<IF:$<BOOL:${EASYJIT_ENABLE_LIGHT_BACKEND}>,1,0>)
+  EASYJIT_LIGHT_BACKEND_ENABLED=$<IF:$<BOOL:${EASYJIT_ENABLE_LIGHT_BACKEND}>,1,0>
+  EASYJIT_LIGHT_BACKEND_ONLY=$<IF:$<BOOL:${EASYJIT_LIGHT_BACKEND_ONLY}>,1,0>)
 
 message(STATUS "EasyJIT LightBackend: ${EASYJIT_ENABLE_LIGHT_BACKEND} (target processor: ${CMAKE_SYSTEM_PROCESSOR})")
+message(STATUS "EasyJIT LightBackendOnly: ${EASYJIT_LIGHT_BACKEND_ONLY}")
 
-llvm_config(EasyJitRuntime
-  analysis
-  bitreader
-  bitwriter
-  core
-  codegen
-  instcombine
-  ipo
-  linker
-  native
-  nativecodegen
-  orcjit
-  scalaropts
-  support
-  transformutils)
+if (EASYJIT_LIGHT_BACKEND_ONLY)
+  # Minimal LLVM component closure for light-only mode: no codegen, no
+  # MC, no ORC, no native target. Only enough to load bitcode and run
+  # the IR-level pass pipeline.
+  llvm_config(EasyJitRuntime
+    analysis
+    bitreader
+    bitwriter
+    core
+    ipo
+    linker
+    scalaropts
+    support
+    transformutils)
+else()
+  llvm_config(EasyJitRuntime
+    analysis
+    bitreader
+    bitwriter
+    core
+    codegen
+    instcombine
+    ipo
+    linker
+    native
+    nativecodegen
+    orcjit
+    scalaropts
+    support
+    transformutils)
+endif()
 
 
 if (EASY_JIT_RUNTIME_TYPE STREQUAL "STATIC")

@@ -1,8 +1,14 @@
+#ifndef EASYJIT_LIGHT_BACKEND_ONLY
+#define EASYJIT_LIGHT_BACKEND_ONLY 0
+#endif
+
 #include <easy/runtime/BitcodeTracker.h>
 #include <easy/runtime/Function.h>
 #include <easy/runtime/RuntimePasses.h>
 #include <easy/runtime/LLVMHolderImpl.h>
+#if !EASYJIT_LIGHT_BACKEND_ONLY
 #include <easy/runtime/MinimalOrcJIT.h>
+#endif
 #include <easy/runtime/Utils.h>
 #include <easy/exceptions.h>
 
@@ -15,19 +21,23 @@
 #include <llvm/Transforms/IPO.h>
 #include <llvm/Transforms/Scalar.h>
 #include <llvm/Transforms/Utils.h>
+#if !EASYJIT_LIGHT_BACKEND_ONLY
 #include <llvm/ExecutionEngine/JITSymbol.h>
 #include <llvm/ExecutionEngine/Orc/Core.h>
 #include <llvm/ExecutionEngine/Orc/ExecutionUtils.h>
 #include <llvm/ExecutionEngine/Orc/Mangling.h>
 #include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
+#endif
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Constants.h>
-#include <llvm/Support/Host.h> 
+#include <llvm/Support/Host.h>
 #include <llvm/Support/Error.h>
-#include <llvm/Target/TargetMachine.h> 
+#if !EASYJIT_LIGHT_BACKEND_ONLY
+#include <llvm/Target/TargetMachine.h>
 #include <llvm/MC/TargetRegistry.h>
-#include <llvm/Analysis/TargetTransformInfo.h> 
-#include <llvm/Analysis/TargetLibraryInfo.h> 
+#endif
+#include <llvm/Analysis/TargetTransformInfo.h>
+#include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/Path.h>
 #include <cstdio>
@@ -67,6 +77,7 @@ Function::Function(void* Addr, std::unique_ptr<LLVMHolder> H)
   : Address(Addr), Holder(std::move(H)) {
 }
 
+#if !EASYJIT_LIGHT_BACKEND_ONLY
 static std::unique_ptr<llvm::TargetMachine> GetTargetMachineForModule(llvm::Module const& M) {
   std::string TripleStr = M.getTargetTriple();
   if (TripleStr.empty()) {
@@ -99,6 +110,7 @@ static std::unique_ptr<llvm::TargetMachine> GetTargetMachineForModule(llvm::Modu
   EASYJIT_RT_LOG("GetTargetMachineForModule: result=%p\n", (void*)TM.get());
   return TM;
 }
+#endif // !EASYJIT_LIGHT_BACKEND_ONLY
 
 static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, unsigned OptLevel, unsigned OptSize) {
 
@@ -115,6 +127,7 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
                  M.getTargetTriple().c_str(),
                  M.getDataLayoutStr().c_str());
 
+#if !EASYJIT_LIGHT_BACKEND_ONLY
   std::unique_ptr<llvm::TargetMachine> TM = GetTargetMachineForModule(M);
   if (!TM) {
     EASYJIT_RT_LOG("Optimize: target machine creation failed for %s\n", Name ? Name : "<null>");
@@ -125,6 +138,17 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
   EASYJIT_RT_LOG("Optimize: adjusted module triple=%s datalayout=%s\n",
                  M.getTargetTriple().c_str(),
                  M.getDataLayoutStr().c_str());
+#else
+  // Light-only: no LLVMCodeGen / LLVMMC available. Keep the module's
+  // existing triple/DataLayout (set by clang at -emit-llvm time) and
+  // skip TargetMachine-derived analyses (TTI). The lightweight pass
+  // pipeline below works without TTI.
+  if (M.getTargetTriple().empty())
+    M.setTargetTriple(TripleStr);
+  EASYJIT_RT_LOG("Optimize: light-only mode, using module triple=%s datalayout=%s\n",
+                 M.getTargetTriple().c_str(),
+                 M.getDataLayoutStr().c_str());
+#endif
 
   // Lightweight optimization pipeline (synced from llvm15_trim).
   //
@@ -159,7 +183,14 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
   // unchanged.
 
   llvm::legacy::PassManager MPM;
+#if !EASYJIT_LIGHT_BACKEND_ONLY
   MPM.add(llvm::createTargetTransformInfoWrapperPass(TM->getTargetIRAnalysis()));
+#else
+  // Light-only: use a default (no-target) TargetIRAnalysis. The custom
+  // ConstStructPropagate pass and InstCombine-free pipeline do not rely
+  // on accurate cost modeling.
+  MPM.add(llvm::createTargetTransformInfoWrapperPass(llvm::TargetIRAnalysis()));
+#endif
   MPM.add(easy::createContextAnalysisPass(C));
   MPM.add(easy::createInlineParametersPass(Name));
   MPM.add(easy::createDevirtualizeConstantPass(Name));
@@ -226,6 +257,7 @@ static std::string TakeError(llvm::Error Err) {
   return llvm::toString(std::move(Err));
 }
 
+#if !EASYJIT_LIGHT_BACKEND_ONLY
 static llvm::orc::JITTargetMachineBuilder
 GetJITTargetMachineBuilderForModule(llvm::Module const& M) {
   std::string TripleStr = M.getTargetTriple();
@@ -303,6 +335,7 @@ static void MapGlobals(easy::detail::MinimalOrcJIT& JIT, GlobalMapping* Globals)
   JIT.getMainJITDylib().addGenerator(std::move(*GeneratorOrErr));
   EASYJIT_RT_LOG("MapGlobals: end\n");
 }
+#endif // !EASYJIT_LIGHT_BACKEND_ONLY
 
 static void WriteOptimizedToFile(llvm::Module const &M, std::string const& File) {
   if(File.empty())
@@ -333,6 +366,7 @@ static std::string GetDumpFileWithSuffix(std::string File, llvm::StringRef Suffi
   return std::string(Path.str());
 }
 
+#if !EASYJIT_LIGHT_BACKEND_ONLY
 std::unique_ptr<Function>
 CompileAndWrap(const char*Name, GlobalMapping* Globals,
                std::unique_ptr<llvm::LLVMContext> Ctx,
@@ -393,6 +427,7 @@ CompileAndWrap(const char*Name, GlobalMapping* Globals,
                  Name ? Name : "<null>", (void*)Holder.get());
   return std::unique_ptr<Function>(new Function(Address, std::move(Holder)));
 }
+#endif // !EASYJIT_LIGHT_BACKEND_ONLY
 
 llvm::Module const& Function::getLLVMModule() const {
   return *this->Holder->getModule();
@@ -457,6 +492,12 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
 #if EASYJIT_LIGHT_BACKEND_ENABLED
   {
     auto policy = easy::light_backend::GetPolicyFromEnv();
+#if EASYJIT_LIGHT_BACKEND_ONLY
+    // Light-only build: no ORC fallback exists. Always go through the
+    // light backend; treat any non-success as a hard JIT failure.
+    if (policy == easy::light_backend::Policy::Off)
+      policy = easy::light_backend::Policy::Try;
+#endif
     if (policy != easy::light_backend::Policy::Off) {
       std::unique_ptr<Function> lightFn;
       auto rep = easy::light_backend::TryLightCompile(
@@ -471,20 +512,38 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
                          rep.reason.c_str());
           throw easy::JITCreateError(Name);
         case easy::light_backend::Outcome::Unsupported:
+#if EASYJIT_LIGHT_BACKEND_ONLY
+          EASYJIT_RT_LOG("Function::Compile: light unsupported in light-only build: %s\n",
+                         rep.reason.c_str());
+          throw easy::JITCreateError(Name);
+#else
           EASYJIT_RT_LOG("Function::Compile: light unsupported (%s), ORC fallback\n",
                          rep.reason.c_str());
           break;
+#endif
         case easy::light_backend::Outcome::SkippedByPolicy:
+#if EASYJIT_LIGHT_BACKEND_ONLY
+          EASYJIT_RT_LOG("Function::Compile: light skipped in light-only build: %s\n",
+                         rep.reason.c_str());
+          throw easy::JITCreateError(Name);
+#else
           EASYJIT_RT_LOG("Function::Compile: light skipped (%s)\n",
                          rep.reason.c_str());
           break;
+#endif
       }
     }
   }
 #endif
 
+#if EASYJIT_LIGHT_BACKEND_ONLY
+  // Light-only build: no ORC fallback compiled in.
+  EASYJIT_RT_LOG("Function::Compile: light-only build cannot fall back\n");
+  throw easy::JITCreateError(Name);
+#else
   EASYJIT_RT_LOG("Function::Compile: CompileAndWrap begin\n");
   return CompileAndWrap(Name, Globals, std::move(Ctx), std::move(M));
+#endif
 }
 
 void easy::Function::serialize(std::ostream& os) const {
@@ -502,6 +561,12 @@ void easy::Function::serialize(std::ostream& os) const {
 
 std::unique_ptr<easy::Function> easy::Function::deserialize(std::istream& is) {
 
+#if EASYJIT_LIGHT_BACKEND_ONLY
+  // Light-only builds intentionally drop the ORC backend; bitcode
+  // deserialization (which would need full codegen) is not supported.
+  (void)is;
+  return nullptr;
+#else
   auto &BT = BitcodeTracker::GetTracker();
 
   std::string buf(std::istreambuf_iterator<char>(is), {}); // read the entire istream
@@ -523,6 +588,7 @@ std::unique_ptr<easy::Function> easy::Function::deserialize(std::istream& is) {
   }
 
   return CompileAndWrap(FunName.c_str(), Globals, std::move(Ctx), std::move(M));
+#endif // EASYJIT_LIGHT_BACKEND_ONLY
 }
 
 bool Function::operator==(easy::Function const& other) const {

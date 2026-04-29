@@ -2,12 +2,21 @@
 #define LLVMHOLDER_IMPL
 
 #include <easy/runtime/LLVMHolder.h>
-#include <easy/runtime/MinimalOrcJIT.h>
 
 #include <llvm/IR/Module.h>
 #include <llvm/IR/LLVMContext.h>
 
+#ifndef EASYJIT_LIGHT_BACKEND_ONLY
+#define EASYJIT_LIGHT_BACKEND_ONLY 0
+#endif
+
+#if !EASYJIT_LIGHT_BACKEND_ONLY
+#include <easy/runtime/MinimalOrcJIT.h>
+#endif
+
 namespace easy {
+
+#if !EASYJIT_LIGHT_BACKEND_ONLY
 class LLVMHolderImpl : public easy::LLVMHolder {
   public:
 
@@ -25,6 +34,8 @@ class LLVMHolderImpl : public easy::LLVMHolder {
 
   virtual ~LLVMHolderImpl() = default;
 };
+#endif // !EASYJIT_LIGHT_BACKEND_ONLY
+
 }
 
 #endif
