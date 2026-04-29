@@ -27,6 +27,7 @@ RUNTIME_TYPE="shared"
 USE_CUSTOM_NEW_DELETE=0
 BUNDLE_LLVM_STATIC=0
 BUNDLE_LLVM_NEEDED_STATIC=0
+STATIC_LIBUNWIND=0
 LLVM_COMPONENTS=(
   core
   codegen
@@ -88,6 +89,8 @@ Optional:
   --libcxx-lib-dir <dir>     Extra dir containing libc++.a/.so
   --libcxxabi-lib-dir <dir>  Extra dir containing libc++abi.a/.so
   --libunwind-lib-dir <dir>  Extra dir containing libunwind.a/.so
+  --static-libunwind         Link libunwind by full path to libunwind.a from
+                             --libunwind-lib-dir, avoiding accidental .so use
   --extra-cflags <flags>     Extra target C compiler flags
   --extra-cxxflags <flags>   Extra target C++ compiler flags
   --extra-ldflags <flags>    Extra target linker flags
@@ -194,6 +197,19 @@ resolve_llvm_dir() {
     return 0
   fi
 
+  return 1
+}
+
+resolve_static_lib() {
+  local lib_name="$1"
+  shift
+  local dir
+  for dir in "$@"; do
+    if [[ -n "$dir" && -f "$dir/$lib_name" ]]; then
+      printf '%s\n' "$dir/$lib_name"
+      return 0
+    fi
+  done
   return 1
 }
 
@@ -362,8 +378,7 @@ bundle_static_runtime_with_needed_llvm() {
   write_llvm_static_libs "$llvm_libs_file"
 
   link_cmd=( "$HOST_CLANGXX" "--target=$TARGET_TRIPLE" "--sysroot=$SYSROOT" )
-  append_shell_words link_cmd "$CXX_FLAGS"
-  append_shell_words link_cmd "$EXE_LINKER_FLAGS"
+  append_shell_words link_cmd "$BUNDLE_LINKER_FLAGS"
   link_cmd+=( -r -nostdlib -o "$needed_object" )
   link_cmd+=( -Wl,--whole-archive "$runtime_archive" -Wl,--no-whole-archive )
   link_cmd+=( -Wl,--start-group )
@@ -433,6 +448,7 @@ while [[ $# -gt 0 ]]; do
     --libcxx-lib-dir) LIBCXX_LIB_DIR="$2"; shift 2 ;;
     --libcxxabi-lib-dir) LIBCXXABI_LIB_DIR="$2"; shift 2 ;;
     --libunwind-lib-dir) LIBUNWIND_LIB_DIR="$2"; shift 2 ;;
+    --static-libunwind) STATIC_LIBUNWIND=1; shift ;;
     --extra-cflags) EXTRA_CFLAGS="$2"; shift 2 ;;
     --extra-cxxflags) EXTRA_CXXFLAGS="$2"; shift 2 ;;
     --extra-ldflags) EXTRA_LDFLAGS="$2"; shift 2 ;;
@@ -467,6 +483,15 @@ fi
 if [[ "$BUNDLE_LLVM_NEEDED_STATIC" -eq 1 && "$RUNTIME_TYPE" != "static" ]]; then
   die "--bundle-llvm-needed-static requires --runtime-type static"
 fi
+if [[ "$STATIC_LIBUNWIND" -eq 1 && -z "$LIBUNWIND_LIB_DIR" ]]; then
+  die "--static-libunwind requires --libunwind-lib-dir"
+fi
+if [[ "$STATIC_LIBUNWIND" -eq 1 && "$EXTRA_LDFLAGS" =~ (^|[[:space:]])-lunwind($|[[:space:]]) ]]; then
+  die "--static-libunwind already links libunwind.a; remove '-lunwind' from --extra-ldflags"
+fi
+if [[ "$STATIC_LIBUNWIND" -eq 1 && "$EXTRA_LDFLAGS" == *libunwind.so* ]]; then
+  die "--static-libunwind cannot be combined with a libunwind.so path in --extra-ldflags"
+fi
 
 TARGET_LLVM_DIR=$(resolve_llvm_dir "$TARGET_LLVM_DIR" || true)
 [[ -n "$TARGET_LLVM_DIR" ]] || die "could not resolve target LLVM dir; pass a directory containing LLVMConfig.cmake, or an LLVM root with lib/cmake/llvm or lib64/cmake/llvm"
@@ -488,6 +513,7 @@ echo "  runtime_type    = $RUNTIME_TYPE"
 echo "  custom_new_delete = $USE_CUSTOM_NEW_DELETE"
 echo "  bundle_llvm_static = $BUNDLE_LLVM_STATIC"
 echo "  bundle_llvm_needed_static = $BUNDLE_LLVM_NEEDED_STATIC"
+echo "  static_libunwind = $STATIC_LIBUNWIND"
 if [[ -n "$GCC_TOOLCHAIN" ]]; then
   echo "  gcc_toolchain   = $GCC_TOOLCHAIN"
 fi
@@ -522,6 +548,7 @@ C_FLAGS=""
 CXX_FLAGS=""
 EXE_LINKER_FLAGS=""
 SHARED_LINKER_FLAGS=""
+BUNDLE_LINKER_FLAGS=""
 
 if [[ -n "$TARGET_CPU" ]]; then
   C_FLAGS="-mcpu=$TARGET_CPU"
@@ -538,16 +565,19 @@ fi
 if [[ -n "$GCC_BIN_DIR" ]]; then
   EXE_LINKER_FLAGS="${EXE_LINKER_FLAGS:+$EXE_LINKER_FLAGS }-B$GCC_BIN_DIR"
   SHARED_LINKER_FLAGS="${SHARED_LINKER_FLAGS:+$SHARED_LINKER_FLAGS }-B$GCC_BIN_DIR"
+  BUNDLE_LINKER_FLAGS="${BUNDLE_LINKER_FLAGS:+$BUNDLE_LINKER_FLAGS }-B$GCC_BIN_DIR"
 fi
 if [[ -n "$GCC_LIB_DIR" ]]; then
   C_FLAGS="${C_FLAGS:+$C_FLAGS }-B$GCC_LIB_DIR"
   CXX_FLAGS="${CXX_FLAGS:+$CXX_FLAGS }-B$GCC_LIB_DIR"
   EXE_LINKER_FLAGS="${EXE_LINKER_FLAGS:+$EXE_LINKER_FLAGS }-B$GCC_LIB_DIR -L$GCC_LIB_DIR"
   SHARED_LINKER_FLAGS="${SHARED_LINKER_FLAGS:+$SHARED_LINKER_FLAGS }-B$GCC_LIB_DIR -L$GCC_LIB_DIR"
+  BUNDLE_LINKER_FLAGS="${BUNDLE_LINKER_FLAGS:+$BUNDLE_LINKER_FLAGS }-B$GCC_LIB_DIR -L$GCC_LIB_DIR"
 fi
 if [[ "$USE_LLD" -eq 1 ]]; then
   EXE_LINKER_FLAGS="${EXE_LINKER_FLAGS:+$EXE_LINKER_FLAGS }-fuse-ld=lld"
   SHARED_LINKER_FLAGS="${SHARED_LINKER_FLAGS:+$SHARED_LINKER_FLAGS }-fuse-ld=lld"
+  BUNDLE_LINKER_FLAGS="${BUNDLE_LINKER_FLAGS:+$BUNDLE_LINKER_FLAGS }-fuse-ld=lld"
 fi
 if [[ -n "$CXX_STDLIB" && "$CXX_STDLIB" != "none" ]]; then
   CXX_FLAGS="${CXX_FLAGS:+$CXX_FLAGS }-stdlib=$CXX_STDLIB"
@@ -565,6 +595,13 @@ for dir in "$LIBCXX_LIB_DIR" "$LIBCXXABI_LIB_DIR" "$LIBUNWIND_LIB_DIR"; do
     SHARED_LINKER_FLAGS="${SHARED_LINKER_FLAGS:+$SHARED_LINKER_FLAGS }-L$dir"
   fi
 done
+if [[ "$STATIC_LIBUNWIND" -eq 1 ]]; then
+  STATIC_LIBUNWIND_PATH="$(resolve_static_lib libunwind.a "$LIBUNWIND_LIB_DIR" || true)"
+  [[ -n "$STATIC_LIBUNWIND_PATH" ]] || die "libunwind.a not found in --libunwind-lib-dir: $LIBUNWIND_LIB_DIR"
+  EXE_LINKER_FLAGS="${EXE_LINKER_FLAGS:+$EXE_LINKER_FLAGS }$STATIC_LIBUNWIND_PATH"
+  SHARED_LINKER_FLAGS="${SHARED_LINKER_FLAGS:+$SHARED_LINKER_FLAGS }$STATIC_LIBUNWIND_PATH"
+  echo "  static_libunwind_path = $STATIC_LIBUNWIND_PATH"
+fi
 if [[ -n "$EXTRA_CFLAGS" ]]; then
   C_FLAGS="${C_FLAGS:+$C_FLAGS }$EXTRA_CFLAGS"
 fi
