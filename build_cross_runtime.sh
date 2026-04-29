@@ -25,6 +25,23 @@ LIBCXXABI_LIB_DIR=""
 LIBUNWIND_LIB_DIR=""
 RUNTIME_TYPE="shared"
 USE_CUSTOM_NEW_DELETE=0
+BUNDLE_LLVM_STATIC=0
+LLVM_COMPONENTS=(
+  core
+  codegen
+  interpreter
+  support
+  mcjit
+  native
+  nativecodegen
+  executionengine
+  passes
+  objcarcopts
+  jitlink
+  orcjit
+  orcshared
+  orctargetprocess
+)
 
 usage() {
   cat <<'EOF'
@@ -50,6 +67,10 @@ Optional:
   --runtime-type <type>      Runtime output: shared or static, default: shared
   --use-custom-new-delete    Route EasyJIT's global new/delete through
                              the platform XXX_MemAlloc/XXX_MemFree hooks
+  --bundle-llvm-static       With --runtime-type static, also emit
+                             libEasyJitRuntimeWithLLVM.a containing EasyJIT
+                             runtime objects plus LLVM static archive members.
+                             C++ runtime libraries are intentionally excluded.
   --gcc-toolchain <path>     GCC toolchain root; script derives bin/lib paths
   --gcc-bin-dir <path>       Explicit GCC bin dir for -B
   --gcc-lib-dir <path>       Explicit GCC libgcc dir for -L/-B
@@ -85,6 +106,7 @@ Static runtime example:
     --host-llvm-build /opt/llvm15-host/build-host \
     --runtime-type static \
     --use-custom-new-delete \
+    --bundle-llvm-static \
     --gcc-toolchain /opt/gcc-aarch64be
 
 Pure clang + libc++ example:
@@ -167,6 +189,138 @@ resolve_llvm_dir() {
   return 1
 }
 
+find_llvm_ar() {
+  local candidate
+  for candidate in \
+      "$HOST_LLVM_BUILD/bin/llvm-ar" \
+      "$(command -v llvm-ar 2>/dev/null || true)" \
+      "$(command -v ar 2>/dev/null || true)"; do
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+find_llvm_ranlib() {
+  local candidate
+  for candidate in \
+      "$HOST_LLVM_BUILD/bin/llvm-ranlib" \
+      "$(command -v llvm-ranlib 2>/dev/null || true)" \
+      "$(command -v ranlib 2>/dev/null || true)"; do
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+write_llvm_static_libs() {
+  local out_file="$1"
+  local probe_src="$BUILD_DIR/llvm-lib-probe-src"
+  local probe_build="$BUILD_DIR/llvm-lib-probe-build"
+  local components
+
+  components="${LLVM_COMPONENTS[*]}"
+  rm -rf "$probe_src" "$probe_build"
+  mkdir -p "$probe_src"
+  cat > "$probe_src/CMakeLists.txt" <<EOF
+cmake_minimum_required(VERSION 3.13)
+project(easyjit_llvm_lib_probe NONE)
+find_package(LLVM REQUIRED CONFIG)
+include("\${LLVM_CMAKE_DIR}/LLVM-Config.cmake")
+function(append_llvm_target target)
+  if(NOT TARGET "\${target}")
+    return()
+  endif()
+  get_property(visited GLOBAL PROPERTY EASYJIT_VISITED_LLVM_TARGETS)
+  if(";\${visited};" MATCHES ";\${target};")
+    return()
+  endif()
+  set_property(GLOBAL APPEND PROPERTY EASYJIT_VISITED_LLVM_TARGETS "\${target}")
+  set_property(GLOBAL APPEND PROPERTY EASYJIT_LLVM_TARGETS "\${target}")
+  get_target_property(deps "\${target}" INTERFACE_LINK_LIBRARIES)
+  foreach(dep IN LISTS deps)
+    if("\${dep}" MATCHES "^\\\$<LINK_ONLY:([^>]+)>$")
+      set(dep "\${CMAKE_MATCH_1}")
+    endif()
+    if("\${dep}" MATCHES "^LLVM")
+      append_llvm_target("\${dep}")
+    endif()
+  endforeach()
+endfunction()
+
+llvm_map_components_to_libnames(EASYJIT_DIRECT_LLVM_LIBS ${components})
+foreach(lib IN LISTS EASYJIT_DIRECT_LLVM_LIBS)
+  append_llvm_target("\${lib}")
+endforeach()
+get_property(EASYJIT_LLVM_LIBS GLOBAL PROPERTY EASYJIT_LLVM_TARGETS)
+file(WRITE "\${CMAKE_BINARY_DIR}/llvm-static-libs.txt" "")
+foreach(lib IN LISTS EASYJIT_LLVM_LIBS)
+  set(loc "")
+  if(TARGET "\${lib}")
+    get_target_property(loc "\${lib}" IMPORTED_LOCATION_RELEASE)
+    if(NOT loc)
+      get_target_property(loc "\${lib}" IMPORTED_LOCATION)
+    endif()
+  endif()
+  if(NOT loc)
+    find_library(loc NAMES "\${lib}" "lib\${lib}.a" PATHS \${LLVM_LIBRARY_DIRS} NO_DEFAULT_PATH)
+  endif()
+  if(NOT loc)
+    message(FATAL_ERROR "Could not resolve LLVM static library for \${lib}")
+  endif()
+  file(APPEND "\${CMAKE_BINARY_DIR}/llvm-static-libs.txt" "\${loc}\\n")
+endforeach()
+EOF
+
+  cmake -S "$probe_src" -B "$probe_build" -DLLVM_DIR="$TARGET_LLVM_DIR" >/dev/null
+  sort -u "$probe_build/llvm-static-libs.txt" > "$out_file"
+}
+
+bundle_static_runtime_with_llvm() {
+  local runtime_archive="$1"
+  local bundled_archive="$BUILD_DIR/bin/libEasyJitRuntimeWithLLVM.a"
+  local llvm_libs_file="$BUILD_DIR/easyjit-llvm-static-libs.txt"
+  local mri_script="$BUILD_DIR/easyjit-bundle-llvm.mri"
+  local ar_bin
+  local ranlib_bin
+  local lib
+
+  [[ "$RUNTIME_TYPE" == "static" ]] || die "--bundle-llvm-static requires --runtime-type static"
+  [[ -f "$runtime_archive" ]] || die "runtime archive not found: $runtime_archive"
+
+  ar_bin="$(find_llvm_ar || true)"
+  [[ -n "$ar_bin" ]] || die "llvm-ar/ar not found"
+
+  write_llvm_static_libs "$llvm_libs_file"
+
+  {
+    printf 'CREATE %s\n' "$bundled_archive"
+    printf 'ADDLIB %s\n' "$runtime_archive"
+    while IFS= read -r lib; do
+      [[ -n "$lib" ]] || continue
+      [[ -f "$lib" ]] || die "LLVM static library not found: $lib"
+      printf 'ADDLIB %s\n' "$lib"
+    done < "$llvm_libs_file"
+    printf 'SAVE\n'
+    printf 'END\n'
+  } > "$mri_script"
+
+  rm -f "$bundled_archive"
+  "$ar_bin" -M < "$mri_script"
+
+  ranlib_bin="$(find_llvm_ranlib || true)"
+  if [[ -n "$ranlib_bin" ]]; then
+    "$ranlib_bin" "$bundled_archive"
+  fi
+
+  echo "  bundled runtime : $bundled_archive"
+  echo "  bundled LLVM libs list : $llvm_libs_file"
+}
+
 assert_runtime_is_not_linked_against_llvm_shared() {
   local runtime_so="$1"
   local readelf_bin
@@ -195,6 +349,7 @@ while [[ $# -gt 0 ]]; do
     --target-cpu) TARGET_CPU="$2"; shift 2 ;;
     --runtime-type) RUNTIME_TYPE="$2"; shift 2 ;;
     --use-custom-new-delete) USE_CUSTOM_NEW_DELETE=1; shift ;;
+    --bundle-llvm-static) BUNDLE_LLVM_STATIC=1; shift ;;
     --gcc-toolchain) GCC_TOOLCHAIN="$2"; shift 2 ;;
     --gcc-bin-dir) GCC_BIN_DIR="$2"; shift 2 ;;
     --gcc-lib-dir) GCC_LIB_DIR="$2"; shift 2 ;;
@@ -232,6 +387,9 @@ case "$RUNTIME_TYPE" in
   shared|static) ;;
   *) die "--runtime-type must be one of: shared, static" ;;
 esac
+if [[ "$BUNDLE_LLVM_STATIC" -eq 1 && "$RUNTIME_TYPE" != "static" ]]; then
+  die "--bundle-llvm-static requires --runtime-type static"
+fi
 
 TARGET_LLVM_DIR=$(resolve_llvm_dir "$TARGET_LLVM_DIR" || true)
 [[ -n "$TARGET_LLVM_DIR" ]] || die "could not resolve target LLVM dir; pass a directory containing LLVMConfig.cmake, or an LLVM root with lib/cmake/llvm or lib64/cmake/llvm"
@@ -251,6 +409,7 @@ echo "  target_llvm_dir = $TARGET_LLVM_DIR"
 echo "  host_llvm_build = $HOST_LLVM_BUILD"
 echo "  runtime_type    = $RUNTIME_TYPE"
 echo "  custom_new_delete = $USE_CUSTOM_NEW_DELETE"
+echo "  bundle_llvm_static = $BUNDLE_LLVM_STATIC"
 if [[ -n "$GCC_TOOLCHAIN" ]]; then
   echo "  gcc_toolchain   = $GCC_TOOLCHAIN"
 fi
@@ -368,6 +527,9 @@ cmake --build "$BUILD_DIR" --target EasyJitRuntime --parallel "$JOBS"
 if [[ "$RUNTIME_TYPE" == "static" ]]; then
   RUNTIME_OUTPUT="$BUILD_DIR/bin/libEasyJitRuntime.a"
   [[ -f "$RUNTIME_OUTPUT" ]] || die "static runtime not found: $RUNTIME_OUTPUT"
+  if [[ "$BUNDLE_LLVM_STATIC" -eq 1 ]]; then
+    bundle_static_runtime_with_llvm "$RUNTIME_OUTPUT"
+  fi
 else
   RUNTIME_OUTPUT="$BUILD_DIR/bin/libEasyJitRuntime.so"
   assert_runtime_is_not_linked_against_llvm_shared "$RUNTIME_OUTPUT"
