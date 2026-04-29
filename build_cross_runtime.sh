@@ -24,6 +24,7 @@ LIBCXX_LIB_DIR=""
 LIBCXXABI_LIB_DIR=""
 LIBUNWIND_LIB_DIR=""
 RUNTIME_TYPE="shared"
+USE_CUSTOM_NEW_DELETE=0
 
 usage() {
   cat <<'EOF'
@@ -47,6 +48,8 @@ Optional:
   --build-dir <path>         Output build dir, default: ./build-cross-runtime-<sanitized-target>
   --target-cpu <cpu>         Optional -mcpu
   --runtime-type <type>      Runtime output: shared or static, default: shared
+  --use-custom-new-delete    Route EasyJIT's global new/delete through
+                             the platform XXX_MemAlloc/XXX_MemFree hooks
   --gcc-toolchain <path>     GCC toolchain root; script derives bin/lib paths
   --gcc-bin-dir <path>       Explicit GCC bin dir for -B
   --gcc-lib-dir <path>       Explicit GCC libgcc dir for -L/-B
@@ -81,6 +84,7 @@ Static runtime example:
     --target-llvm-dir /opt/llvm15-aarch64be \
     --host-llvm-build /opt/llvm15-host/build-host \
     --runtime-type static \
+    --use-custom-new-delete \
     --gcc-toolchain /opt/gcc-aarch64be
 
 Pure clang + libc++ example:
@@ -190,6 +194,7 @@ while [[ $# -gt 0 ]]; do
     --build-dir) BUILD_DIR="$2"; shift 2 ;;
     --target-cpu) TARGET_CPU="$2"; shift 2 ;;
     --runtime-type) RUNTIME_TYPE="$2"; shift 2 ;;
+    --use-custom-new-delete) USE_CUSTOM_NEW_DELETE=1; shift ;;
     --gcc-toolchain) GCC_TOOLCHAIN="$2"; shift 2 ;;
     --gcc-bin-dir) GCC_BIN_DIR="$2"; shift 2 ;;
     --gcc-lib-dir) GCC_LIB_DIR="$2"; shift 2 ;;
@@ -245,6 +250,7 @@ echo "  sysroot         = $SYSROOT"
 echo "  target_llvm_dir = $TARGET_LLVM_DIR"
 echo "  host_llvm_build = $HOST_LLVM_BUILD"
 echo "  runtime_type    = $RUNTIME_TYPE"
+echo "  custom_new_delete = $USE_CUSTOM_NEW_DELETE"
 if [[ -n "$GCC_TOOLCHAIN" ]]; then
   echo "  gcc_toolchain   = $GCC_TOOLCHAIN"
 fi
@@ -340,6 +346,7 @@ CMAKE_ARGS=(
   -DLLVM_LINK_LLVM_DYLIB=OFF
   -DEASY_JIT_BUILD_PASS=OFF
   -DEASY_JIT_RUNTIME_TYPE="${RUNTIME_TYPE^^}"
+  -DEASYJIT_USE_CUSTOM_NEW_DELETE="$USE_CUSTOM_NEW_DELETE"
   -DCMAKE_BUILD_TYPE="$CMAKE_BUILD_TYPE"
   -DCMAKE_SYSTEM_NAME=Linux
   -DCMAKE_SYSTEM_PROCESSOR="${TARGET_TRIPLE%%-*}"
