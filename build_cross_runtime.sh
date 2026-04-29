@@ -28,6 +28,7 @@ USE_CUSTOM_NEW_DELETE=0
 BUNDLE_LLVM_STATIC=0
 BUNDLE_LLVM_NEEDED_STATIC=0
 STATIC_LIBUNWIND=0
+STRIP_DEBUG=0
 LLVM_COMPONENTS=(
   core
   codegen
@@ -91,6 +92,8 @@ Optional:
   --libunwind-lib-dir <dir>  Extra dir containing libunwind.a/.so
   --static-libunwind         Link libunwind by full path to libunwind.a from
                              --libunwind-lib-dir, avoiding accidental .so use
+  --strip-debug              Compile EasyJIT runtime with -g0 and strip debug
+                             sections from generated static bundle artifacts
   --extra-cflags <flags>     Extra target C compiler flags
   --extra-cxxflags <flags>   Extra target C++ compiler flags
   --extra-ldflags <flags>    Extra target linker flags
@@ -118,6 +121,7 @@ Static runtime example:
     --use-custom-new-delete \
     --bundle-llvm-static \
     --bundle-llvm-needed-static \
+    --strip-debug \
     --gcc-toolchain /opt/gcc-aarch64be
 
 Pure clang + libc++ example:
@@ -241,6 +245,32 @@ find_llvm_ranlib() {
   return 1
 }
 
+find_strip_tool() {
+  local candidate
+  for candidate in \
+      "$HOST_LLVM_BUILD/bin/llvm-strip" \
+      "$(command -v llvm-strip 2>/dev/null || true)" \
+      "$(command -v strip 2>/dev/null || true)"; do
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+strip_debug_file() {
+  local file="$1"
+  local strip_bin
+
+  [[ "$STRIP_DEBUG" -eq 1 ]] || return 0
+  [[ -f "$file" ]] || return 0
+
+  strip_bin="$(find_strip_tool || true)"
+  [[ -n "$strip_bin" ]] || die "--strip-debug requested, but llvm-strip/strip was not found"
+  "$strip_bin" --strip-debug "$file"
+}
+
 write_llvm_static_libs() {
   local out_file="$1"
   local probe_src="$BUILD_DIR/llvm-lib-probe-src"
@@ -335,6 +365,7 @@ bundle_static_runtime_with_llvm() {
 
   rm -f "$bundled_archive"
   "$ar_bin" -M < "$mri_script"
+  strip_debug_file "$bundled_archive"
 
   ranlib_bin="$(find_llvm_ranlib || true)"
   if [[ -n "$ranlib_bin" ]]; then
@@ -397,7 +428,9 @@ bundle_static_runtime_with_needed_llvm() {
     exit 1
   fi
 
+  strip_debug_file "$needed_object"
   "$ar_bin" rcs "$bundled_archive" "$needed_object"
+  strip_debug_file "$bundled_archive"
 
   ranlib_bin="$(find_llvm_ranlib || true)"
   if [[ -n "$ranlib_bin" ]]; then
@@ -449,6 +482,7 @@ while [[ $# -gt 0 ]]; do
     --libcxxabi-lib-dir) LIBCXXABI_LIB_DIR="$2"; shift 2 ;;
     --libunwind-lib-dir) LIBUNWIND_LIB_DIR="$2"; shift 2 ;;
     --static-libunwind) STATIC_LIBUNWIND=1; shift ;;
+    --strip-debug) STRIP_DEBUG=1; shift ;;
     --extra-cflags) EXTRA_CFLAGS="$2"; shift 2 ;;
     --extra-cxxflags) EXTRA_CXXFLAGS="$2"; shift 2 ;;
     --extra-ldflags) EXTRA_LDFLAGS="$2"; shift 2 ;;
@@ -514,6 +548,7 @@ echo "  custom_new_delete = $USE_CUSTOM_NEW_DELETE"
 echo "  bundle_llvm_static = $BUNDLE_LLVM_STATIC"
 echo "  bundle_llvm_needed_static = $BUNDLE_LLVM_NEEDED_STATIC"
 echo "  static_libunwind = $STATIC_LIBUNWIND"
+echo "  strip_debug = $STRIP_DEBUG"
 if [[ -n "$GCC_TOOLCHAIN" ]]; then
   echo "  gcc_toolchain   = $GCC_TOOLCHAIN"
 fi
@@ -553,6 +588,10 @@ BUNDLE_LINKER_FLAGS=""
 if [[ -n "$TARGET_CPU" ]]; then
   C_FLAGS="-mcpu=$TARGET_CPU"
   CXX_FLAGS="-mcpu=$TARGET_CPU"
+fi
+if [[ "$STRIP_DEBUG" -eq 1 ]]; then
+  C_FLAGS="${C_FLAGS:+$C_FLAGS }-g0"
+  CXX_FLAGS="${CXX_FLAGS:+$CXX_FLAGS }-g0"
 fi
 if [[ -n "$GCC_TOOLCHAIN" ]]; then
   if [[ -z "$GCC_BIN_DIR" ]]; then
@@ -642,6 +681,7 @@ cmake --build "$BUILD_DIR" --target EasyJitRuntime --parallel "$JOBS"
 if [[ "$RUNTIME_TYPE" == "static" ]]; then
   RUNTIME_OUTPUT="$BUILD_DIR/bin/libEasyJitRuntime.a"
   [[ -f "$RUNTIME_OUTPUT" ]] || die "static runtime not found: $RUNTIME_OUTPUT"
+  strip_debug_file "$RUNTIME_OUTPUT"
   if [[ "$BUNDLE_LLVM_STATIC" -eq 1 ]]; then
     bundle_static_runtime_with_llvm "$RUNTIME_OUTPUT"
   fi
