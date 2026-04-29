@@ -13,6 +13,7 @@ add_library(EasyJitRuntime ${EASY_JIT_RUNTIME_TYPE}
   Context.cpp
   Function.cpp
   InitNativeTarget.cpp
+  MinimalOrcJIT.cpp
   Utils.cpp
   custom_new_delete.cpp
   easyjit_c.cpp

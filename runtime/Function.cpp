@@ -2,6 +2,7 @@
 #include <easy/runtime/Function.h>
 #include <easy/runtime/RuntimePasses.h>
 #include <easy/runtime/LLVMHolderImpl.h>
+#include <easy/runtime/MinimalOrcJIT.h>
 #include <easy/runtime/Utils.h>
 #include <easy/exceptions.h>
 
@@ -13,11 +14,10 @@
 #include <llvm/ExecutionEngine/JITSymbol.h>
 #include <llvm/ExecutionEngine/Orc/Core.h>
 #include <llvm/ExecutionEngine/Orc/ExecutionUtils.h>
-#include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/ExecutionEngine/Orc/Mangling.h>
-#include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
 #include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
 #include <llvm/IR/LegacyPassManager.h>
+#include <llvm/IR/Constants.h>
 #include <llvm/Support/Host.h> 
 #include <llvm/Support/Error.h>
 #include <llvm/Target/TargetMachine.h> 
@@ -242,19 +242,15 @@ GetJITTargetMachineBuilderForModule(llvm::Module const& M) {
   return JTMB;
 }
 
-static std::unique_ptr<llvm::orc::LLJIT>
+static std::unique_ptr<easy::detail::MinimalOrcJIT>
 CreateJIT(llvm::Module const& M, const char *Name) {
   EASYJIT_RT_LOG("CreateJIT: begin name=%s triple=%s datalayout=%s\n",
                  Name ? Name : "<null>",
                  M.getTargetTriple().c_str(),
                  M.getDataLayoutStr().c_str());
-  llvm::orc::LLJITBuilder Builder;
-  Builder.setPlatformSetUp(llvm::orc::setUpInactivePlatform);
-  Builder.setNumCompileThreads(0);
-  Builder.setJITTargetMachineBuilder(GetJITTargetMachineBuilderForModule(M));
-  Builder.setDataLayout(M.getDataLayout());
 
-  auto JITOrErr = Builder.create();
+  auto JITOrErr = easy::detail::MinimalOrcJIT::Create(
+      GetJITTargetMachineBuilderForModule(M), M.getDataLayout());
   if (!JITOrErr) {
     auto Err = TakeError(JITOrErr.takeError());
     EASYJIT_RT_LOG("CreateJIT: failed name=%s error=%s\n",
@@ -267,7 +263,7 @@ CreateJIT(llvm::Module const& M, const char *Name) {
   return std::move(*JITOrErr);
 }
 
-static void MapGlobals(llvm::orc::LLJIT& JIT, GlobalMapping* Globals) {
+static void MapGlobals(easy::detail::MinimalOrcJIT& JIT, GlobalMapping* Globals) {
   EASYJIT_RT_LOG("MapGlobals: begin jit=%p globals=%p\n", (void*)&JIT, (void*)Globals);
 
   llvm::orc::MangleAndInterner Mangle(JIT.getExecutionSession(), JIT.getDataLayout());
@@ -366,8 +362,7 @@ CompileAndWrap(const char*Name, GlobalMapping* Globals,
     throw easy::JITCreateError(Name);
   }
 
-  if (auto Err = JIT->addIRModule(
-          llvm::orc::ThreadSafeModule(std::move(JITModule), std::move(TSCtx)))) {
+  if (auto Err = JIT->addIRModule(std::move(JITModule), std::move(TSCtx))) {
     auto ErrStr = TakeError(std::move(Err));
     EASYJIT_RT_LOG("CompileAndWrap: addIRModule failed name=%s error=%s\n",
                    Name ? Name : "<null>", ErrStr.c_str());
@@ -384,7 +379,7 @@ CompileAndWrap(const char*Name, GlobalMapping* Globals,
     throw easy::SymbolLookupError(Name);
   }
 
-  void *Address = AddressOrErr->toPtr<void*>();
+  void *Address = llvm::jitTargetAddressToPointer<void *>(AddressOrErr->getAddress());
   EASYJIT_RT_LOG("CompileAndWrap: lookup end name=%s address=%p\n",
                  Name ? Name : "<null>", Address);
 
