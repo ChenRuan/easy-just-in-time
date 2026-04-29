@@ -184,12 +184,15 @@ struct Writer {
   }
 };
 
-// A pointer-typed SSA value either lives in a GPR, or is a (sp + offset)
-// expression (alloca + constant GEP chain).
+// A pointer-typed SSA value either lives in a GPR, is a (sp + offset)
+// expression (alloca + constant GEP chain), or is a fully-baked constant
+// host address (e.g. `inttoptr i64 0xCAFE to ptr`, used by EasyJIT to
+// inline a snapshot/array base after specialization).
 struct PtrLoc {
-  enum Kind { InReg, StackRel } kind;
-  unsigned reg;     // for InReg
-  int32_t  spOff;   // for StackRel
+  enum Kind { InReg, StackRel, Absolute } kind = InReg;
+  unsigned reg = 0;     // for InReg
+  int32_t  spOff = 0;   // for StackRel
+  uint64_t addr = 0;    // for Absolute  (host process address)
 };
 
 struct ICmpFusion {
@@ -236,6 +239,69 @@ static bool constGepOffset(const GEPOperator *GEP, const DataLayout &DL,
   if (off.getActiveBits() > 31) return false;
   offOut = off.getSExtValue();
   return true;
+}
+
+// Recursively resolve a pointer Value into a PtrLoc, walking through
+// inttoptr ConstantExprs, constant- and instruction-form GEPs (constant
+// indices only), and bitcasts. Returns true on success.
+//
+// This is the engine that lets `inttoptr (i64 0xCAFE to ptr)` (used by
+// EasyJIT to bake the snapshot/global host address into the IR after
+// specialization) flow into a normal load/store as PtrLoc::Absolute,
+// possibly with constant offsets applied on top by inline ConstantExpr
+// GEPs (e.g. `getelementptr (%struct, ptr inttoptr(...), 0, 1)`).
+//
+// Endian: the resolved address is just a 64-bit integer baked into the
+// instruction stream via MOVZ/MOVK halfwords (positional, endian-neutral).
+// The subsequent LDR/STR honours target data endian, but the host C++
+// producer wrote target-endian bytes into that same address (same process,
+// same SCTLR_EL1.EE) → symmetric → correct on aarch64 and aarch64_be.
+static bool resolvePtrLocChain(const Value *P, const DataLayout &DL,
+                               const std::unordered_map<const Value *, PtrLoc> &known,
+                               PtrLoc &out) {
+  while (P) {
+    auto it = known.find(P);
+    if (it != known.end()) { out = it->second; return true; }
+
+    if (auto *CE = dyn_cast<ConstantExpr>(P)) {
+      if (CE->getOpcode() == Instruction::IntToPtr) {
+        if (auto *CI = dyn_cast<ConstantInt>(CE->getOperand(0))) {
+          out = PtrLoc{};
+          out.kind = PtrLoc::Absolute;
+          out.addr = CI->getZExtValue();
+          return true;
+        }
+        return false;
+      }
+      // BitCast/AddrSpaceCast falls through to the GEPOperator/BitCastOperator
+      // handling below, since GEPOperator/BitCastOperator wrap ConstantExprs
+      // of the corresponding opcode.
+    }
+
+    if (auto *GEP = dyn_cast<GEPOperator>(P)) {
+      APInt off(64, 0);
+      if (!GEP->accumulateConstantOffset(DL, off)) return false;
+      if (off.getActiveBits() > 32) return false;
+      PtrLoc base;
+      if (!resolvePtrLocChain(GEP->getPointerOperand(), DL, known, base))
+        return false;
+      out = base;
+      switch (out.kind) {
+        case PtrLoc::StackRel: out.spOff += (int32_t)off.getSExtValue(); return true;
+        case PtrLoc::Absolute: out.addr  += (uint64_t)(int64_t)off.getSExtValue(); return true;
+        case PtrLoc::InReg:    return false; // reg+const ptr arithmetic not yet supported
+      }
+      return false;
+    }
+
+    if (auto *BC = dyn_cast<BitCastOperator>(P)) {
+      P = BC->getOperand(0);
+      continue;
+    }
+
+    return false;
+  }
+  return false;
 }
 
 } // namespace
@@ -398,26 +464,45 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
   std::unordered_map<const Value *, PtrLoc> ptrLoc;
   for (const Argument &A : Fn.args()) {
     if (A.getType()->isPointerTy())
-      ptrLoc[&A] = PtrLoc{PtrLoc::InReg, regOf[&A], 0};
+      ptrLoc[&A] = PtrLoc{PtrLoc::InReg, regOf[&A], 0, 0};
   }
   for (const BasicBlock &BB : Fn) {
     for (const Instruction &I : BB) {
       if (auto *AI = dyn_cast<AllocaInst>(&I)) {
-        ptrLoc[AI] = PtrLoc{PtrLoc::StackRel, 0, allocaOff[AI]};
+        ptrLoc[AI] = PtrLoc{PtrLoc::StackRel, 0, allocaOff[AI], 0};
         continue;
       }
       if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
+        // First try the existing StackRel path (alloca-based GEP). This
+        // path also accepts BitCast bases via ptrLoc[BC] propagated below.
         auto it = ptrLoc.find(GEP->getPointerOperand());
-        if (it == ptrLoc.end()) continue; // handled later, error-out when used
-        if (it->second.kind != PtrLoc::StackRel) continue; // reg-based GEP not yet supported for load/store below
-        int64_t off;
-        if (!constGepOffset(cast<GEPOperator>(GEP), DL, off)) continue;
-        ptrLoc[GEP] = PtrLoc{PtrLoc::StackRel, 0, it->second.spOff + (int32_t)off};
+        if (it != ptrLoc.end() && it->second.kind == PtrLoc::StackRel) {
+          int64_t off;
+          if (constGepOffset(cast<GEPOperator>(GEP), DL, off)) {
+            ptrLoc[GEP] = PtrLoc{PtrLoc::StackRel, 0,
+                                 it->second.spOff + (int32_t)off, 0};
+            continue;
+          }
+        }
+        // Otherwise try the general resolver, which handles
+        // inttoptr-ConstantExpr bases (PtrLoc::Absolute) and any chain of
+        // constant-offset GEPs / bitcasts on top of them.
+        PtrLoc loc;
+        if (resolvePtrLocChain(GEP, DL, ptrLoc, loc)) {
+          ptrLoc[GEP] = loc;
+        }
+        // Note: still no entry → load/store user will see the missing
+        // ptrLoc and emit Status::Unsupported (or fall through to its own
+        // resolver below).
         continue;
       }
       if (auto *BC = dyn_cast<BitCastInst>(&I)) {
         auto it = ptrLoc.find(BC->getOperand(0));
         if (it != ptrLoc.end()) ptrLoc[BC] = it->second;
+        else {
+          PtrLoc loc;
+          if (resolvePtrLocChain(BC, DL, ptrLoc, loc)) ptrLoc[BC] = loc;
+        }
         continue;
       }
     }
@@ -492,12 +577,36 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
     return (int)s;
   };
 
+  // Helper: materialize a 64-bit absolute address into x17 via MOVZ/MOVK
+  // halfword chain. Halfwords are positional (hw field), so this is
+  // endian-neutral with respect to data endian. Returns false on emit fail.
+  auto materializeAddrToX17 = [&](uint64_t addr) -> bool {
+    uint16_t c0 = (uint16_t)(addr >>  0);
+    uint16_t c1 = (uint16_t)(addr >> 16);
+    uint16_t c2 = (uint16_t)(addr >> 32);
+    uint16_t c3 = (uint16_t)(addr >> 48);
+    if (!W.emit(encMovzHw64(17, c0, 0))) return false;
+    if (c1 && !W.emit(encMovkHw64(17, c1, 1))) return false;
+    if (c2 && !W.emit(encMovkHw64(17, c2, 2))) return false;
+    if (c3 && !W.emit(encMovkHw64(17, c3, 3))) return false;
+    return true;
+  };
+
   // Helper: emit a load from PtrLoc into reg rt, size in {2,3}.
   auto emitLoad = [&](PtrLoc base, unsigned size, unsigned rt) -> bool {
     if (base.kind == PtrLoc::StackRel) {
       int s = fitsScaled(base.spOff, size);
       if (s < 0) return false;
       return W.emit(encLdrStrUI(true, size, rt, 31 /*sp*/, (unsigned)s));
+    }
+    if (base.kind == PtrLoc::Absolute) {
+      // Materialize host address into x17 then LDR rt, [x17, #0]. We don't
+      // try to split addr into base+uimm12 because the imm12 is multiplied
+      // by access size (1/4/8) and most snapshot addresses aren't aligned
+      // to 4096B; staying with full-width MOVZ/MOVK + offset 0 is simple
+      // and always correct.
+      if (!materializeAddrToX17(base.addr)) return false;
+      return W.emit(encLdrStrUI(true, size, rt, 17, 0));
     }
     // InReg, offset=0 only (we don't currently track reg+offset).
     if (base.spOff != 0) return false;
@@ -508,6 +617,10 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
       int s = fitsScaled(base.spOff, size);
       if (s < 0) return false;
       return W.emit(encLdrStrUI(false, size, rt, 31, (unsigned)s));
+    }
+    if (base.kind == PtrLoc::Absolute) {
+      if (!materializeAddrToX17(base.addr)) return false;
+      return W.emit(encLdrStrUI(false, size, rt, 17, 0));
     }
     if (base.spOff != 0) return false;
     return W.emit(encLdrStrUI(false, size, rt, base.reg, 0));
@@ -602,8 +715,11 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
 
       // Load
       if (auto *LI = dyn_cast<LoadInst>(&I)) {
-        unsigned bits = LI->getType()->isIntegerTy()
-            ? LI->getType()->getIntegerBitWidth() : 0;
+        unsigned bits = 0;
+        if (LI->getType()->isIntegerTy())
+          bits = LI->getType()->getIntegerBitWidth();
+        else if (LI->getType()->isPointerTy())
+          bits = 64;  // pointer load = i64 load (host ABI)
         if (bits != 32 && bits != 64) {
           r.status = Status::Unsupported; r.reason = "load width"; return r;
         }
@@ -726,7 +842,16 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         // Fallback: regular ptr-based load (stack-rel or reg-based)
         auto it = ptrLoc.find(LI->getPointerOperand());
         if (it == ptrLoc.end()) {
-          r.status = Status::Unsupported; r.reason = "load ptr"; return r;
+          // Last-chance resolver: handles inline ConstantExpr GEPs whose
+          // base is an inttoptr (i64 <C>) — used by EasyJIT to bake the
+          // host address of a snapshot/global into the IR after
+          // specialization. (See resolvePtrLocChain doc-comment.)
+          PtrLoc loc;
+          if (!resolvePtrLocChain(LI->getPointerOperand(), DL, ptrLoc, loc)) {
+            r.status = Status::Unsupported; r.reason = "load ptr"; return r;
+          }
+          ptrLoc[LI->getPointerOperand()] = loc;
+          it = ptrLoc.find(LI->getPointerOperand());
         }
         int rd = assignReg(LI);
         if (rd < 0) { r.status = Status::Unsupported; r.reason = "scratch OOM (load)"; return r; }
@@ -738,8 +863,11 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
       // Store
       if (auto *SI = dyn_cast<StoreInst>(&I)) {
         const Value *V = SI->getValueOperand();
-        unsigned bits = V->getType()->isIntegerTy()
-            ? V->getType()->getIntegerBitWidth() : 0;
+        unsigned bits = 0;
+        if (V->getType()->isIntegerTy())
+          bits = V->getType()->getIntegerBitWidth();
+        else if (V->getType()->isPointerTy())
+          bits = 64;  // pointer store = i64 store (host ABI)
         if (bits != 32 && bits != 64) {
           r.status = Status::Unsupported; r.reason = "store width"; return r;
         }
@@ -794,7 +922,13 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
 
         auto it = ptrLoc.find(SI->getPointerOperand());
         if (it == ptrLoc.end()) {
-          r.status = Status::Unsupported; r.reason = "store ptr"; return r;
+          // Last-chance resolver, mirrors the load side.
+          PtrLoc loc;
+          if (!resolvePtrLocChain(SI->getPointerOperand(), DL, ptrLoc, loc)) {
+            r.status = Status::Unsupported; r.reason = "store ptr"; return r;
+          }
+          ptrLoc[SI->getPointerOperand()] = loc;
+          it = ptrLoc.find(SI->getPointerOperand());
         }
         unsigned rs;
         if (!valueInReg(V, bits == 64, rs)) {
