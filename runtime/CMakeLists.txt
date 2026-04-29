@@ -20,6 +20,7 @@ add_library(EasyJitRuntime ${EASY_JIT_RUNTIME_TYPE}
   pass/DevirtualizeConstant.cpp
   pass/InlineParameters.cpp
   pass/InlineParametersHelper.cpp
+  pass/ConstStructPropagate.cpp
 )
 target_compile_definitions(EasyJitRuntime PRIVATE
   EASYJIT_USE_CUSTOM_NEW_DELETE=$<IF:$<BOOL:${EASYJIT_USE_CUSTOM_NEW_DELETE}>,1,0>)

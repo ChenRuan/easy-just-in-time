@@ -8,9 +8,7 @@
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Transforms/IPO.h>
-#include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar.h>
-#include <llvm/Transforms/Scalar/SROA.h>
 #include <llvm/Transforms/Utils.h>
 #include <llvm/ExecutionEngine/JITSymbol.h>
 #include <llvm/ExecutionEngine/Orc/Core.h>
@@ -124,55 +122,58 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
                  M.getTargetTriple().c_str(),
                  M.getDataLayoutStr().c_str());
 
-  // Conservative pass pipeline (llvm15_trim2):
+  // Lightweight optimization pipeline (synced from llvm15_trim).
   //
-  // The previous version used llvm::PassManagerBuilder ::
-  // populateModulePassManager() twice, which pulls in the full O2/O3
-  // legacy optimization pipeline (loop vectorize, SLP vectorize,
-  // ObjCARC, Instrumentation, Coroutines, AggressiveInstCombine,
-  // OpenMP opt, ...). For an embedded JIT runtime that only has to
-  // specialize already-optimized snapshot bitcode, the vast majority
-  // of those passes are unreachable code that nevertheless has to be
-  // linked in.
+  // We replace the legacy O2/O3 PassManagerBuilder pipeline with an
+  // explicit, minimal sequence that exactly covers what EasyJIT needs
+  // to fold the bound snapshot constants:
   //
-  // We replace the broad pipeline with an explicit, hand-picked set
-  // of passes covering exactly what InlineParameters / DevirtualizeConstant
-  // need to actually fold the bound constants:
-  //   - SROA + mem2reg     : break struct-by-value snapshots into SSA
-  //   - SCCP               : propagate the now-constant loads
-  //   - InstCombine        : fold the resulting arithmetic
-  //   - CFG simplification : prune dead branches
-  //   - Function inliner   : inline the wrapper -> original-function call
-  //   - ADCE               : drop the now-dead specialization scaffolding
-  // The same short cleanup runs again after DevirtualizeConstant, so
-  // any new constants exposed by indirect-call rewriting are folded.
+  //   ContextAnalysis        - bind easy::Context to the module
+  //   InlineParameters       - rewrite the wrapper to feed in the
+  //                            captured argument constants
+  //   DevirtualizeConstant   - rewrite indirect calls when the
+  //                            callee is now a known constant
+  //   FunctionInlining       - inline wrapper -> original (critical)
+  //   ConstStructPropagate   - custom lightweight pass that walks
+  //                            alloca -> store(GEP, const) -> load(GEP)
+  //                            chains, propagates the constant to the
+  //                            load, folds resulting branches and ICmps,
+  //                            and removes dead code. Replaces
+  //                            SROA + SCCP + InstCombine + Reassociate
+  //                            + ADCE for the snapshot pattern.
+  //   mem2reg                - lift remaining non-struct allocas to SSA
+  //   ConstStructPropagate   - second round, picks up constants that
+  //                            mem2reg exposed
+  //   CFGSimplification      - prune now-dead branches/blocks
+  //   Internalize            - hide everything but the JIT entry
+  //   GlobalDCE              - drop now-unreachable globals/functions
+  //   StripDeadPrototypes    - drop dangling external decls
   //
-  // Keeps stock LLVM passes only — no custom optimization pass added.
-  // ORC / LLJIT compilation pipeline is unchanged.
-
-  auto AddCleanup = [&](llvm::legacy::PassManager &PM) {
-    PM.add(llvm::createSROAPass());
-    PM.add(llvm::createPromoteMemoryToRegisterPass());
-    PM.add(llvm::createSCCPPass());
-    PM.add(llvm::createInstructionCombiningPass());
-    PM.add(llvm::createCFGSimplificationPass());
-    PM.add(llvm::createAggressiveDCEPass());
-  };
+  // Snapshot/InlineParameters/DevirtualizeConstant/global mapping
+  // mechanics are unchanged; only the *cleanup* pipeline shrinks.
+  // LLJIT/ORC backend (CreateJIT, CompileAndWrap, MapGlobals) is
+  // unchanged.
 
   llvm::legacy::PassManager MPM;
   MPM.add(llvm::createTargetTransformInfoWrapperPass(TM->getTargetIRAnalysis()));
-  MPM.add(new llvm::TargetLibraryInfoWrapperPass(
-      llvm::TargetLibraryInfoImpl(Triple)));
-
-  // Phase 1: inline parameters, then fold the constants they introduced.
   MPM.add(easy::createContextAnalysisPass(C));
   MPM.add(easy::createInlineParametersPass(Name));
-  MPM.add(llvm::createFunctionInliningPass(OptLevel, OptSize, false));
-  AddCleanup(MPM);
-
-  // Phase 2: rewrite indirect calls / device-aware globals, fold again.
   MPM.add(easy::createDevirtualizeConstantPass(Name));
-  AddCleanup(MPM);
+  // Inline the wrapper -> original-function call (critical).
+  MPM.add(llvm::createFunctionInliningPass(OptLevel, OptSize, false));
+  // Custom lightweight propagator: alloca/store/GEP/load -> const.
+  MPM.add(easy::createConstStructPropagatePass(Name));
+  // Promote remaining allocas to SSA.
+  MPM.add(llvm::createPromoteMemoryToRegisterPass());
+  // Second round picks up constants exposed by mem2reg.
+  MPM.add(easy::createConstStructPropagatePass(Name));
+  // Minimal cleanup.
+  MPM.add(llvm::createCFGSimplificationPass());
+  MPM.add(llvm::createInternalizePass([Name](const llvm::GlobalValue &GV) {
+    return GV.getName() == Name || GV.getName() == "__dso_handle";
+  }));
+  MPM.add(llvm::createGlobalDCEPass());
+  MPM.add(llvm::createStripDeadPrototypesPass());
 
 #ifdef NDEBUG
   MPM.add(llvm::createVerifierPass());
@@ -181,6 +182,13 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
   EASYJIT_RT_LOG("Optimize: running pass manager for %s\n", Name ? Name : "<null>");
   MPM.run(M);
   EASYJIT_RT_LOG("Optimize: finished for %s\n", Name ? Name : "<null>");
+
+  // Optional IR dump for benchmarking / debugging the pass pipeline.
+  if (const char *DumpPath = std::getenv("EASYJIT_DUMP_IR")) {
+    std::error_code EC;
+    llvm::raw_fd_ostream OS(DumpPath, EC);
+    if (!EC) M.print(OS, nullptr);
+  }
 }
 
 static void DisableRecursiveJit(llvm::Module &M, const char *EntryName) {

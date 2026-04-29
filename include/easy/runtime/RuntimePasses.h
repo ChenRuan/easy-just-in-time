@@ -65,9 +65,26 @@ namespace easy {
     llvm::StringRef TargetName_;
   };
 
+  struct ConstStructPropagate :
+      public llvm::FunctionPass {
+
+    static char ID;
+
+    ConstStructPropagate()
+      : llvm::FunctionPass(ID) {}
+    ConstStructPropagate(llvm::StringRef TargetName)
+      : llvm::FunctionPass(ID), TargetName_(TargetName) {}
+
+    bool runOnFunction(llvm::Function &F) override;
+
+    private:
+    llvm::StringRef TargetName_;
+  };
+
   llvm::Pass* createContextAnalysisPass(easy::Context const &C);
   llvm::Pass* createInlineParametersPass(llvm::StringRef Name);
   llvm::Pass* createDevirtualizeConstantPass(llvm::StringRef Name);
+  llvm::Pass* createConstStructPropagatePass(llvm::StringRef Name);
 }
 
 #endif
