@@ -502,6 +502,16 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
       std::unique_ptr<Function> lightFn;
       auto rep = easy::light_backend::TryLightCompile(
           Name, Globals, Ctx, M, lightFn, policy);
+
+      // Helper: when we are about to throw out of Function::Compile, the
+      // module must be torn down BEFORE the LLVMContext (M's destructor
+      // calls LLVMContext::removeModule). Reset M here so the implicit
+      // reverse-declaration order of locals (Ctx destroyed before M) does
+      // not crash on the unwind path.
+      auto failCleanup = [&]() {
+        M.reset();
+      };
+
       switch (rep.outcome) {
         case easy::light_backend::Outcome::Succeeded:
           EASYJIT_RT_LOG("Function::Compile: light path used name=%s\n",
@@ -510,11 +520,13 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
         case easy::light_backend::Outcome::FailedForce:
           EASYJIT_RT_LOG("Function::Compile: EASYJIT_LIGHT=force rejected: %s\n",
                          rep.reason.c_str());
+          failCleanup();
           throw easy::JITCreateError(Name);
         case easy::light_backend::Outcome::Unsupported:
 #if EASYJIT_LIGHT_BACKEND_ONLY
           EASYJIT_RT_LOG("Function::Compile: light unsupported in light-only build: %s\n",
                          rep.reason.c_str());
+          failCleanup();
           throw easy::JITCreateError(Name);
 #else
           EASYJIT_RT_LOG("Function::Compile: light unsupported (%s), ORC fallback\n",
@@ -525,6 +537,7 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
 #if EASYJIT_LIGHT_BACKEND_ONLY
           EASYJIT_RT_LOG("Function::Compile: light skipped in light-only build: %s\n",
                          rep.reason.c_str());
+          failCleanup();
           throw easy::JITCreateError(Name);
 #else
           EASYJIT_RT_LOG("Function::Compile: light skipped (%s)\n",
@@ -537,7 +550,10 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
 #endif
 
 #if EASYJIT_LIGHT_BACKEND_ONLY
-  // Light-only build: no ORC fallback compiled in.
+  // Light-only build: no ORC fallback compiled in. Tear down M before
+  // Ctx (locals destroy in reverse declaration order, but ~Module needs
+  // a live LLVMContext).
+  M.reset();
   EASYJIT_RT_LOG("Function::Compile: light-only build cannot fall back\n");
   throw easy::JITCreateError(Name);
 #else
@@ -561,12 +577,6 @@ void easy::Function::serialize(std::ostream& os) const {
 
 std::unique_ptr<easy::Function> easy::Function::deserialize(std::istream& is) {
 
-#if EASYJIT_LIGHT_BACKEND_ONLY
-  // Light-only builds intentionally drop the ORC backend; bitcode
-  // deserialization (which would need full codegen) is not supported.
-  (void)is;
-  return nullptr;
-#else
   auto &BT = BitcodeTracker::GetTracker();
 
   std::string buf(std::istreambuf_iterator<char>(is), {}); // read the entire istream
@@ -587,6 +597,28 @@ std::unique_ptr<easy::Function> easy::Function::deserialize(std::istream& is) {
     std::tie(std::ignore, Globals) = BT.getNameAndGlobalMapping(OrigFunPtr);
   }
 
+#if EASYJIT_LIGHT_BACKEND_ONLY
+  // Light-only build: no ORC fallback. Drive deserialization through
+  // the lightweight backend. Force-mode so that any non-success is a
+  // hard, observable error rather than a silent nullptr.
+#if !EASYJIT_LIGHT_BACKEND_ENABLED
+#error "EASYJIT_LIGHT_BACKEND_ONLY=1 requires EASYJIT_LIGHT_BACKEND_ENABLED=1"
+#endif
+  std::unique_ptr<Function> lightFn;
+  auto rep = easy::light_backend::TryLightCompile(
+      FunName.c_str(), Globals, Ctx, M, lightFn,
+      easy::light_backend::Policy::Force);
+  if (rep.outcome == easy::light_backend::Outcome::Succeeded) {
+    EASYJIT_RT_LOG("Function::deserialize: light path used name=%s\n",
+                   FunName.c_str());
+    return lightFn;
+  }
+  EASYJIT_RT_LOG("Function::deserialize: light path rejected name=%s reason=%s\n",
+                 FunName.c_str(), rep.reason.c_str());
+  // Tear down M before its parent LLVMContext goes out of scope.
+  M.reset();
+  throw easy::JITCreateError(FunName.c_str());
+#else
   return CompileAndWrap(FunName.c_str(), Globals, std::move(Ctx), std::move(M));
 #endif // EASYJIT_LIGHT_BACKEND_ONLY
 }
