@@ -26,6 +26,7 @@ LIBUNWIND_LIB_DIR=""
 RUNTIME_TYPE="shared"
 USE_CUSTOM_NEW_DELETE=0
 BUNDLE_LLVM_STATIC=0
+BUNDLE_LLVM_NEEDED_STATIC=0
 LLVM_COMPONENTS=(
   core
   codegen
@@ -71,6 +72,12 @@ Optional:
                              libEasyJitRuntimeWithLLVM.a containing EasyJIT
                              runtime objects plus LLVM static archive members.
                              C++ runtime libraries are intentionally excluded.
+  --bundle-llvm-needed-static
+                             With --runtime-type static, also emit
+                             libEasyJitRuntimeWithNeededLLVM.a by doing a
+                             relocatable link that pulls only LLVM archive
+                             members needed by EasyJIT. C++ runtime libraries
+                             are intentionally excluded.
   --gcc-toolchain <path>     GCC toolchain root; script derives bin/lib paths
   --gcc-bin-dir <path>       Explicit GCC bin dir for -B
   --gcc-lib-dir <path>       Explicit GCC libgcc dir for -L/-B
@@ -107,6 +114,7 @@ Static runtime example:
     --runtime-type static \
     --use-custom-new-delete \
     --bundle-llvm-static \
+    --bundle-llvm-needed-static \
     --gcc-toolchain /opt/gcc-aarch64be
 
 Pure clang + libc++ example:
@@ -321,6 +329,71 @@ bundle_static_runtime_with_llvm() {
   echo "  bundled LLVM libs list : $llvm_libs_file"
 }
 
+append_shell_words() {
+  local var_name="$1"
+  local words="$2"
+  local -n out_array="$var_name"
+
+  if [[ -n "$words" ]]; then
+    local parsed=()
+    # shellcheck disable=SC2206
+    parsed=( $words )
+    out_array+=( "${parsed[@]}" )
+  fi
+}
+
+bundle_static_runtime_with_needed_llvm() {
+  local runtime_archive="$1"
+  local needed_object="$BUILD_DIR/bin/EasyJitRuntimeWithNeededLLVM.o"
+  local bundled_archive="$BUILD_DIR/bin/libEasyJitRuntimeWithNeededLLVM.a"
+  local llvm_libs_file="$BUILD_DIR/easyjit-llvm-static-libs.txt"
+  local link_log="$BUILD_DIR/easyjit-bundle-needed-llvm-link.log"
+  local ar_bin
+  local ranlib_bin
+  local lib
+  local link_cmd
+
+  [[ "$RUNTIME_TYPE" == "static" ]] || die "--bundle-llvm-needed-static requires --runtime-type static"
+  [[ -f "$runtime_archive" ]] || die "runtime archive not found: $runtime_archive"
+
+  ar_bin="$(find_llvm_ar || true)"
+  [[ -n "$ar_bin" ]] || die "llvm-ar/ar not found"
+
+  write_llvm_static_libs "$llvm_libs_file"
+
+  link_cmd=( "$HOST_CLANGXX" "--target=$TARGET_TRIPLE" "--sysroot=$SYSROOT" )
+  append_shell_words link_cmd "$CXX_FLAGS"
+  append_shell_words link_cmd "$EXE_LINKER_FLAGS"
+  link_cmd+=( -r -nostdlib -o "$needed_object" )
+  link_cmd+=( -Wl,--whole-archive "$runtime_archive" -Wl,--no-whole-archive )
+  link_cmd+=( -Wl,--start-group )
+  while IFS= read -r lib; do
+    [[ -n "$lib" ]] || continue
+    [[ -f "$lib" ]] || die "LLVM static library not found: $lib"
+    link_cmd+=( "$lib" )
+  done < "$llvm_libs_file"
+  link_cmd+=( -Wl,--end-group )
+
+  rm -f "$needed_object" "$bundled_archive" "$link_log"
+  if ! "${link_cmd[@]}" >"$link_log" 2>&1; then
+    echo "error: failed to create needed LLVM relocatable object" >&2
+    echo "link log: $link_log" >&2
+    tail -80 "$link_log" >&2 || true
+    exit 1
+  fi
+
+  "$ar_bin" rcs "$bundled_archive" "$needed_object"
+
+  ranlib_bin="$(find_llvm_ranlib || true)"
+  if [[ -n "$ranlib_bin" ]]; then
+    "$ranlib_bin" "$bundled_archive"
+  fi
+
+  echo "  needed LLVM object : $needed_object"
+  echo "  needed LLVM bundled runtime : $bundled_archive"
+  echo "  needed LLVM libs search list : $llvm_libs_file"
+}
+
 assert_runtime_is_not_linked_against_llvm_shared() {
   local runtime_so="$1"
   local readelf_bin
@@ -350,6 +423,7 @@ while [[ $# -gt 0 ]]; do
     --runtime-type) RUNTIME_TYPE="$2"; shift 2 ;;
     --use-custom-new-delete) USE_CUSTOM_NEW_DELETE=1; shift ;;
     --bundle-llvm-static) BUNDLE_LLVM_STATIC=1; shift ;;
+    --bundle-llvm-needed-static) BUNDLE_LLVM_NEEDED_STATIC=1; shift ;;
     --gcc-toolchain) GCC_TOOLCHAIN="$2"; shift 2 ;;
     --gcc-bin-dir) GCC_BIN_DIR="$2"; shift 2 ;;
     --gcc-lib-dir) GCC_LIB_DIR="$2"; shift 2 ;;
@@ -390,6 +464,9 @@ esac
 if [[ "$BUNDLE_LLVM_STATIC" -eq 1 && "$RUNTIME_TYPE" != "static" ]]; then
   die "--bundle-llvm-static requires --runtime-type static"
 fi
+if [[ "$BUNDLE_LLVM_NEEDED_STATIC" -eq 1 && "$RUNTIME_TYPE" != "static" ]]; then
+  die "--bundle-llvm-needed-static requires --runtime-type static"
+fi
 
 TARGET_LLVM_DIR=$(resolve_llvm_dir "$TARGET_LLVM_DIR" || true)
 [[ -n "$TARGET_LLVM_DIR" ]] || die "could not resolve target LLVM dir; pass a directory containing LLVMConfig.cmake, or an LLVM root with lib/cmake/llvm or lib64/cmake/llvm"
@@ -410,6 +487,7 @@ echo "  host_llvm_build = $HOST_LLVM_BUILD"
 echo "  runtime_type    = $RUNTIME_TYPE"
 echo "  custom_new_delete = $USE_CUSTOM_NEW_DELETE"
 echo "  bundle_llvm_static = $BUNDLE_LLVM_STATIC"
+echo "  bundle_llvm_needed_static = $BUNDLE_LLVM_NEEDED_STATIC"
 if [[ -n "$GCC_TOOLCHAIN" ]]; then
   echo "  gcc_toolchain   = $GCC_TOOLCHAIN"
 fi
@@ -529,6 +607,9 @@ if [[ "$RUNTIME_TYPE" == "static" ]]; then
   [[ -f "$RUNTIME_OUTPUT" ]] || die "static runtime not found: $RUNTIME_OUTPUT"
   if [[ "$BUNDLE_LLVM_STATIC" -eq 1 ]]; then
     bundle_static_runtime_with_llvm "$RUNTIME_OUTPUT"
+  fi
+  if [[ "$BUNDLE_LLVM_NEEDED_STATIC" -eq 1 ]]; then
+    bundle_static_runtime_with_needed_llvm "$RUNTIME_OUTPUT"
   fi
 else
   RUNTIME_OUTPUT="$BUILD_DIR/bin/libEasyJitRuntime.so"
