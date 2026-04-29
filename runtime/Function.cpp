@@ -41,6 +41,8 @@
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/Path.h>
 #include <cstdio>
+#include <cstdlib>
+#include <stdexcept>
 
 #ifdef NDEBUG
 #include <llvm/IR/Verifier.h>
@@ -82,6 +84,58 @@ namespace easy {
 Function::Function(void* Addr, std::unique_ptr<LLVMHolder> H)
   : Address(Addr), Holder(std::move(H)) {
 }
+
+namespace {
+class OriginalFunctionHolder : public easy::LLVMHolder {
+public:
+  explicit OriginalFunctionHolder(std::string Reason)
+      : Reason_(std::move(Reason)) {}
+
+  llvm::Module* getModule() const override { return nullptr; }
+
+  std::string const& reason() const { return Reason_; }
+
+private:
+  std::string Reason_;
+};
+
+static bool CanFallbackToOriginalFunction(easy::Context const& C,
+                                          llvm::Module const& M,
+                                          const char* Name) {
+  if (!Name)
+    return false;
+
+  llvm::Function *F = M.getFunction(Name);
+  if (!F)
+    return false;
+
+  if (C.size() != F->arg_size())
+    return false;
+
+  for (size_t I = 0; I < C.size(); ++I) {
+    auto const *Forward = C.getArgumentMapping(I).as<easy::ForwardArgument>();
+    if (!Forward || Forward->get() != I)
+      return false;
+  }
+
+  return true;
+}
+
+static std::unique_ptr<easy::Function>
+MakeOriginalFunctionFallback(void *Addr, std::string Reason) {
+  EASYJIT_RT_LOG("Function::Compile: using original function fallback: %s\n",
+                 Reason.c_str());
+  if (const char *Verbose = std::getenv("EASYJIT_LIGHT_VERBOSE");
+      Verbose && Verbose[0] != '\0' && Verbose[0] != '0') {
+    std::fprintf(stderr, "[easyjit/light] fallback: %s\n", Reason.c_str());
+    std::fflush(stderr);
+  }
+  std::unique_ptr<easy::LLVMHolder> Holder(
+      new OriginalFunctionHolder(std::move(Reason)));
+  return std::unique_ptr<easy::Function>(
+      new easy::Function(Addr, std::move(Holder)));
+}
+} // namespace
 
 #if !EASYJIT_LIGHT_BACKEND_ONLY
 static std::unique_ptr<llvm::TargetMachine> GetTargetMachineForModule(llvm::Module const& M) {
@@ -436,7 +490,12 @@ CompileAndWrap(const char*Name, GlobalMapping* Globals,
 #endif // !EASYJIT_LIGHT_BACKEND_ONLY
 
 llvm::Module const& Function::getLLVMModule() const {
-  return *this->Holder->getModule();
+  llvm::Module *M = this->Holder->getModule();
+  if (!M)
+    throw std::runtime_error(
+        "easy::Function::getLLVMModule: function has no LLVM module "
+        "(compiled function fell back to the original function pointer)");
+  return *M;
 }
 
 std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) {
@@ -534,11 +593,20 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
 #if EASYJIT_LIGHT_BACKEND_ONLY
           EASYJIT_RT_LOG("Function::Compile: light unsupported in light-only build: %s\n",
                          rep.reason.c_str());
+          if (CanFallbackToOriginalFunction(C, *M, Name)) {
+            std::string reason =
+                std::string(Name ? Name : "<null>") +
+                " (unsupported IR, reason: " + rep.reason +
+                "; light-only runtime fell back to original function pointer)";
+            failCleanup();
+            return MakeOriginalFunctionFallback(Addr, std::move(reason));
+          }
           failCleanup();
           throw easy::LightBackendCompileError(
               std::string(Name ? Name : "<null>") +
               " (unsupported IR, reason: " + rep.reason +
-              "; light-only runtime has no ORC fallback)");
+              "; light-only runtime has no ORC fallback and original function "
+              "fallback is unsafe because the context changes the call signature)");
 #else
           EASYJIT_RT_LOG("Function::Compile: light unsupported (%s), ORC fallback\n",
                          rep.reason.c_str());
