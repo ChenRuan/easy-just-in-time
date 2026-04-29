@@ -71,6 +71,12 @@ namespace easy {
   DefineEasyException(TargetMachineCreateError, "Failed to create target machine for:");
   DefineEasyException(TargetLookupError, "Failed to lookup target for:");
   DefineEasyException(SymbolLookupError, "Failed to lookup JIT symbol for:");
+  // Light-only / LightBackend specific failure. Distinct from JITCreateError
+  // (which is reserved for the ORC fallback path) so users / log scrapers
+  // can tell the two apart and we never claim to have tried ORC when the
+  // runtime was compiled without it.
+  DefineEasyException(LightBackendCompileError,
+                      "Light backend cannot compile function: ");
 }
 
 Function::Function(void* Addr, std::unique_ptr<LLVMHolder> H)
@@ -521,13 +527,18 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
           EASYJIT_RT_LOG("Function::Compile: EASYJIT_LIGHT=force rejected: %s\n",
                          rep.reason.c_str());
           failCleanup();
-          throw easy::JITCreateError(Name);
+          throw easy::LightBackendCompileError(
+              std::string(Name ? Name : "<null>") +
+              " (EASYJIT_LIGHT=force, reason: " + rep.reason + ")");
         case easy::light_backend::Outcome::Unsupported:
 #if EASYJIT_LIGHT_BACKEND_ONLY
           EASYJIT_RT_LOG("Function::Compile: light unsupported in light-only build: %s\n",
                          rep.reason.c_str());
           failCleanup();
-          throw easy::JITCreateError(Name);
+          throw easy::LightBackendCompileError(
+              std::string(Name ? Name : "<null>") +
+              " (unsupported IR, reason: " + rep.reason +
+              "; light-only runtime has no ORC fallback)");
 #else
           EASYJIT_RT_LOG("Function::Compile: light unsupported (%s), ORC fallback\n",
                          rep.reason.c_str());
@@ -538,7 +549,10 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
           EASYJIT_RT_LOG("Function::Compile: light skipped in light-only build: %s\n",
                          rep.reason.c_str());
           failCleanup();
-          throw easy::JITCreateError(Name);
+          throw easy::LightBackendCompileError(
+              std::string(Name ? Name : "<null>") +
+              " (skipped by policy: " + rep.reason +
+              "; light-only runtime has no ORC fallback)");
 #else
           EASYJIT_RT_LOG("Function::Compile: light skipped (%s)\n",
                          rep.reason.c_str());
@@ -555,7 +569,9 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
   // a live LLVMContext).
   M.reset();
   EASYJIT_RT_LOG("Function::Compile: light-only build cannot fall back\n");
-  throw easy::JITCreateError(Name);
+  throw easy::LightBackendCompileError(
+      std::string(Name ? Name : "<null>") +
+      " (light-only runtime, LightBackend not engaged)");
 #else
   EASYJIT_RT_LOG("Function::Compile: CompileAndWrap begin\n");
   return CompileAndWrap(Name, Globals, std::move(Ctx), std::move(M));
@@ -617,7 +633,8 @@ std::unique_ptr<easy::Function> easy::Function::deserialize(std::istream& is) {
                  FunName.c_str(), rep.reason.c_str());
   // Tear down M before its parent LLVMContext goes out of scope.
   M.reset();
-  throw easy::JITCreateError(FunName.c_str());
+  throw easy::LightBackendCompileError(
+      FunName + " (deserialize, light-only runtime, reason: " + rep.reason + ")");
 #else
   return CompileAndWrap(FunName.c_str(), Globals, std::move(Ctx), std::move(M));
 #endif // EASYJIT_LIGHT_BACKEND_ONLY
