@@ -110,7 +110,9 @@ Optional:
                              --libunwind-lib-dir, avoiding accidental .so use
   --strip-debug              Compile EasyJIT runtime with -g0 and strip debug
                              sections from generated static bundle artifacts
-  --enable-light-backend     Force LightBackend ON (-DEASYJIT_ENABLE_LIGHT_BACKEND=ON)
+  --enable-light-backend     Force LightBackend ON (-DEASYJIT_ENABLE_LIGHT_BACKEND=ON).
+                             This still keeps the ORC fallback unless paired
+                             with --light-backend-only.
   --disable-light-backend    Force LightBackend OFF (-DEASYJIT_ENABLE_LIGHT_BACKEND=OFF)
   --light-backend-only       Light-only build: drop MinimalOrcJIT/CodeGen/MC,
                              keep only the LightBackend path. Implies
@@ -143,6 +145,19 @@ Static runtime example:
     --use-custom-new-delete \
     --bundle-llvm-needed-static \
     --strip-debug \
+    --gcc-toolchain /opt/gcc-aarch64be
+
+Light-only static runtime example:
+  ./build_cross_runtime.sh \
+    --target aarch64_be-linux-gnu \
+    --sysroot /opt/sdk/sysroot \
+    --target-llvm-dir /opt/llvm15-aarch64be \
+    --host-llvm-build /opt/llvm15-host/build-host \
+    --runtime-type static \
+    --use-custom-new-delete \
+    --bundle-llvm-needed-static \
+    --strip-debug \
+    --light-backend-only \
     --gcc-toolchain /opt/gcc-aarch64be
 
 Pure clang + libc++ example:
