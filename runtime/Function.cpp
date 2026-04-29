@@ -6,6 +6,10 @@
 #include <easy/runtime/Utils.h>
 #include <easy/exceptions.h>
 
+#if EASYJIT_LIGHT_BACKEND_ENABLED
+#include "LightBackend.h"
+#endif
+
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Transforms/IPO.h>
@@ -391,7 +395,7 @@ CompileAndWrap(const char*Name, GlobalMapping* Globals,
 }
 
 llvm::Module const& Function::getLLVMModule() const {
-  return *static_cast<LLVMHolderImpl const&>(*this->Holder).M_;
+  return *this->Holder->getModule();
 }
 
 std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) {
@@ -450,6 +454,35 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
     M->setModuleInlineAsm("");
   }
 
+#if EASYJIT_LIGHT_BACKEND_ENABLED
+  {
+    auto policy = easy::light_backend::GetPolicyFromEnv();
+    if (policy != easy::light_backend::Policy::Off) {
+      std::unique_ptr<Function> lightFn;
+      auto rep = easy::light_backend::TryLightCompile(
+          Name, Globals, Ctx, M, lightFn, policy);
+      switch (rep.outcome) {
+        case easy::light_backend::Outcome::Succeeded:
+          EASYJIT_RT_LOG("Function::Compile: light path used name=%s\n",
+                         Name ? Name : "<null>");
+          return lightFn;
+        case easy::light_backend::Outcome::FailedForce:
+          EASYJIT_RT_LOG("Function::Compile: EASYJIT_LIGHT=force rejected: %s\n",
+                         rep.reason.c_str());
+          throw easy::JITCreateError(Name);
+        case easy::light_backend::Outcome::Unsupported:
+          EASYJIT_RT_LOG("Function::Compile: light unsupported (%s), ORC fallback\n",
+                         rep.reason.c_str());
+          break;
+        case easy::light_backend::Outcome::SkippedByPolicy:
+          EASYJIT_RT_LOG("Function::Compile: light skipped (%s)\n",
+                         rep.reason.c_str());
+          break;
+      }
+    }
+  }
+#endif
+
   EASYJIT_RT_LOG("Function::Compile: CompileAndWrap begin\n");
   return CompileAndWrap(Name, Globals, std::move(Ctx), std::move(M));
 }
@@ -458,9 +491,11 @@ void easy::Function::serialize(std::ostream& os) const {
   std::string buf;
   llvm::raw_string_ostream stream(buf);
 
-  LLVMHolderImpl const *H = reinterpret_cast<LLVMHolderImpl const*>(Holder.get());
-  llvm::WriteBitcodeToFile(*H->M_, stream);
-  stream.flush();
+  llvm::Module *M = Holder->getModule();
+  if (M) {
+    llvm::WriteBitcodeToFile(*M, stream);
+    stream.flush();
+  }
 
   os << buf;
 }
@@ -491,13 +526,10 @@ std::unique_ptr<easy::Function> easy::Function::deserialize(std::istream& is) {
 }
 
 bool Function::operator==(easy::Function const& other) const {
-  LLVMHolderImpl& This = static_cast<LLVMHolderImpl&>(*this->Holder);
-  LLVMHolderImpl& Other = static_cast<LLVMHolderImpl&>(*other.Holder);
-  return This.M_.get() == Other.M_.get();
+  return this->Holder->getModule() == other.Holder->getModule();
 }
 
 std::hash<easy::Function>::result_type
 std::hash<easy::Function>::operator()(argument_type const& F) const noexcept {
-  LLVMHolderImpl& This = static_cast<LLVMHolderImpl&>(*F.Holder);
-  return std::hash<llvm::Module*>{}(This.M_.get());
+  return std::hash<llvm::Module*>{}(F.Holder->getModule());
 }

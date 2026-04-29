@@ -29,6 +29,7 @@ BUNDLE_LLVM_STATIC=0
 BUNDLE_LLVM_NEEDED_STATIC=0
 STATIC_LIBUNWIND=0
 STRIP_DEBUG=0
+LIGHT_BACKEND="default"   # default | on | off
 LLVM_COMPONENTS=(
   analysis
   bitreader
@@ -94,6 +95,8 @@ Optional:
                              --libunwind-lib-dir, avoiding accidental .so use
   --strip-debug              Compile EasyJIT runtime with -g0 and strip debug
                              sections from generated static bundle artifacts
+  --enable-light-backend     Force LightBackend ON (-DEASYJIT_ENABLE_LIGHT_BACKEND=ON)
+  --disable-light-backend    Force LightBackend OFF (-DEASYJIT_ENABLE_LIGHT_BACKEND=OFF)
   --extra-cflags <flags>     Extra target C compiler flags
   --extra-cxxflags <flags>   Extra target C++ compiler flags
   --extra-ldflags <flags>    Extra target linker flags
@@ -536,6 +539,8 @@ while [[ $# -gt 0 ]]; do
     --libunwind-lib-dir) LIBUNWIND_LIB_DIR="$2"; shift 2 ;;
     --static-libunwind) STATIC_LIBUNWIND=1; shift ;;
     --strip-debug) STRIP_DEBUG=1; shift ;;
+    --enable-light-backend) LIGHT_BACKEND="on"; shift ;;
+    --disable-light-backend) LIGHT_BACKEND="off"; shift ;;
     --extra-cflags) EXTRA_CFLAGS="$2"; shift 2 ;;
     --extra-cxxflags) EXTRA_CXXFLAGS="$2"; shift 2 ;;
     --extra-ldflags) EXTRA_LDFLAGS="$2"; shift 2 ;;
@@ -727,6 +732,13 @@ CMAKE_ARGS=(
   -DCMAKE_EXE_LINKER_FLAGS="$EXE_LINKER_FLAGS"
   -DCMAKE_SHARED_LINKER_FLAGS="$SHARED_LINKER_FLAGS"
 )
+
+case "$LIGHT_BACKEND" in
+  on)  CMAKE_ARGS+=( -DEASYJIT_ENABLE_LIGHT_BACKEND=ON ) ;;
+  off) CMAKE_ARGS+=( -DEASYJIT_ENABLE_LIGHT_BACKEND=OFF ) ;;
+  default) ;;
+esac
+echo "  light_backend = $LIGHT_BACKEND"
 
 cmake -S "$SCRIPT_DIR" -B "$BUILD_DIR" -G Ninja "${CMAKE_ARGS[@]}"
 cmake --build "$BUILD_DIR" --target EasyJitRuntime --parallel "$JOBS"

@@ -21,6 +21,8 @@ class LLVMHolderImpl : public easy::LLVMHolder {
     : Context_(std::move(C)), JIT_(std::move(JIT)), M_(std::move(M)) {
   }
 
+  llvm::Module* getModule() const override { return M_.get(); }
+
   virtual ~LLVMHolderImpl() = default;
 };
 }

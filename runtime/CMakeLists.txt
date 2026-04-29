@@ -8,7 +8,20 @@ if (NOT EASY_JIT_RUNTIME_TYPE MATCHES "^(SHARED|STATIC)$")
   message(FATAL_ERROR "EASY_JIT_RUNTIME_TYPE must be SHARED or STATIC")
 endif()
 
-add_library(EasyJitRuntime ${EASY_JIT_RUNTIME_TYPE}
+# Detect target processor (host or cross). Default LightBackend ON only on
+# AArch64-family targets where the lightweight emitter actually supports
+# the instruction set.
+string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _easyjit_lower_proc)
+if (_easyjit_lower_proc MATCHES "^(aarch64|aarch64_be|arm64)$")
+  set(_easyjit_light_default ON)
+else()
+  set(_easyjit_light_default OFF)
+endif()
+option(EASYJIT_ENABLE_LIGHT_BACKEND
+       "Build the lightweight AArch64 runtime backend (LightBackend)"
+       ${_easyjit_light_default})
+
+set(EASYJIT_RUNTIME_SOURCES
   BitcodeTracker.cpp
   Context.cpp
   Function.cpp
@@ -23,8 +36,18 @@ add_library(EasyJitRuntime ${EASY_JIT_RUNTIME_TYPE}
   pass/InlineParametersHelper.cpp
   pass/ConstStructPropagate.cpp
 )
+if (EASYJIT_ENABLE_LIGHT_BACKEND)
+  list(APPEND EASYJIT_RUNTIME_SOURCES
+    LightBackend.cpp
+    ${CMAKE_SOURCE_DIR}/light_codegen/light_aarch64.cpp)
+endif()
+
+add_library(EasyJitRuntime ${EASY_JIT_RUNTIME_TYPE} ${EASYJIT_RUNTIME_SOURCES})
 target_compile_definitions(EasyJitRuntime PRIVATE
-  EASYJIT_USE_CUSTOM_NEW_DELETE=$<IF:$<BOOL:${EASYJIT_USE_CUSTOM_NEW_DELETE}>,1,0>)
+  EASYJIT_USE_CUSTOM_NEW_DELETE=$<IF:$<BOOL:${EASYJIT_USE_CUSTOM_NEW_DELETE}>,1,0>
+  EASYJIT_LIGHT_BACKEND_ENABLED=$<IF:$<BOOL:${EASYJIT_ENABLE_LIGHT_BACKEND}>,1,0>)
+
+message(STATUS "EasyJIT LightBackend: ${EASYJIT_ENABLE_LIGHT_BACKEND} (target processor: ${CMAKE_SYSTEM_PROCESSOR})")
 
 llvm_config(EasyJitRuntime
   analysis
