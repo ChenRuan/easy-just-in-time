@@ -7,8 +7,11 @@
 
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/Bitcode/BitcodeReader.h>
-#include <llvm/Transforms/IPO/PassManagerBuilder.h>
 #include <llvm/Transforms/IPO.h>
+#include <llvm/Transforms/InstCombine/InstCombine.h>
+#include <llvm/Transforms/Scalar.h>
+#include <llvm/Transforms/Scalar/SROA.h>
+#include <llvm/Transforms/Utils.h>
 #include <llvm/ExecutionEngine/JITSymbol.h>
 #include <llvm/ExecutionEngine/Orc/Core.h>
 #include <llvm/ExecutionEngine/Orc/ExecutionUtils.h>
@@ -110,12 +113,6 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
                  M.getTargetTriple().c_str(),
                  M.getDataLayoutStr().c_str());
 
-  llvm::PassManagerBuilder Builder;
-  Builder.OptLevel = OptLevel;
-  Builder.SizeLevel = OptSize;
-  Builder.LibraryInfo = new llvm::TargetLibraryInfoImpl(Triple);
-  Builder.Inliner = llvm::createFunctionInliningPass(OptLevel, OptSize, false);
-
   std::unique_ptr<llvm::TargetMachine> TM = GetTargetMachineForModule(M);
   if (!TM) {
     EASYJIT_RT_LOG("Optimize: target machine creation failed for %s\n", Name ? Name : "<null>");
@@ -126,20 +123,60 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
   EASYJIT_RT_LOG("Optimize: adjusted module triple=%s datalayout=%s\n",
                  M.getTargetTriple().c_str(),
                  M.getDataLayoutStr().c_str());
-  TM->adjustPassManager(Builder);
+
+  // Conservative pass pipeline (llvm15_trim2):
+  //
+  // The previous version used llvm::PassManagerBuilder ::
+  // populateModulePassManager() twice, which pulls in the full O2/O3
+  // legacy optimization pipeline (loop vectorize, SLP vectorize,
+  // ObjCARC, Instrumentation, Coroutines, AggressiveInstCombine,
+  // OpenMP opt, ...). For an embedded JIT runtime that only has to
+  // specialize already-optimized snapshot bitcode, the vast majority
+  // of those passes are unreachable code that nevertheless has to be
+  // linked in.
+  //
+  // We replace the broad pipeline with an explicit, hand-picked set
+  // of passes covering exactly what InlineParameters / DevirtualizeConstant
+  // need to actually fold the bound constants:
+  //   - SROA + mem2reg     : break struct-by-value snapshots into SSA
+  //   - SCCP               : propagate the now-constant loads
+  //   - InstCombine        : fold the resulting arithmetic
+  //   - CFG simplification : prune dead branches
+  //   - Function inliner   : inline the wrapper -> original-function call
+  //   - ADCE               : drop the now-dead specialization scaffolding
+  // The same short cleanup runs again after DevirtualizeConstant, so
+  // any new constants exposed by indirect-call rewriting are folded.
+  //
+  // Keeps stock LLVM passes only — no custom optimization pass added.
+  // ORC / LLJIT compilation pipeline is unchanged.
+
+  auto AddCleanup = [&](llvm::legacy::PassManager &PM) {
+    PM.add(llvm::createSROAPass());
+    PM.add(llvm::createPromoteMemoryToRegisterPass());
+    PM.add(llvm::createSCCPPass());
+    PM.add(llvm::createInstructionCombiningPass());
+    PM.add(llvm::createCFGSimplificationPass());
+    PM.add(llvm::createAggressiveDCEPass());
+  };
 
   llvm::legacy::PassManager MPM;
   MPM.add(llvm::createTargetTransformInfoWrapperPass(TM->getTargetIRAnalysis()));
+  MPM.add(new llvm::TargetLibraryInfoWrapperPass(
+      llvm::TargetLibraryInfoImpl(Triple)));
+
+  // Phase 1: inline parameters, then fold the constants they introduced.
   MPM.add(easy::createContextAnalysisPass(C));
   MPM.add(easy::createInlineParametersPass(Name));
-  Builder.populateModulePassManager(MPM);
+  MPM.add(llvm::createFunctionInliningPass(OptLevel, OptSize, false));
+  AddCleanup(MPM);
+
+  // Phase 2: rewrite indirect calls / device-aware globals, fold again.
   MPM.add(easy::createDevirtualizeConstantPass(Name));
+  AddCleanup(MPM);
 
 #ifdef NDEBUG
   MPM.add(llvm::createVerifierPass());
 #endif
-
-  Builder.populateModulePassManager(MPM);
 
   EASYJIT_RT_LOG("Optimize: running pass manager for %s\n", Name ? Name : "<null>");
   MPM.run(M);
