@@ -76,8 +76,8 @@ Optional:
                              C++ runtime libraries are intentionally excluded.
   --bundle-llvm-needed-static
                              With --runtime-type static, also emit
-                             libEasyJitRuntimeWithNeededLLVM.a by doing a
-                             relocatable link that pulls only LLVM archive
+                             libEasyJitRuntimeWithNeededLLVM.a by tracing a
+                             relocatable link and repacking only LLVM archive
                              members needed by EasyJIT. C++ runtime libraries
                              are intentionally excluded.
   --gcc-toolchain <path>     GCC toolchain root; script derives bin/lib paths
@@ -119,7 +119,6 @@ Static runtime example:
     --host-llvm-build /opt/llvm15-host/build-host \
     --runtime-type static \
     --use-custom-new-delete \
-    --bundle-llvm-static \
     --bundle-llvm-needed-static \
     --strip-debug \
     --gcc-toolchain /opt/gcc-aarch64be
@@ -391,14 +390,24 @@ append_shell_words() {
 
 bundle_static_runtime_with_needed_llvm() {
   local runtime_archive="$1"
-  local needed_object="$BUILD_DIR/bin/EasyJitRuntimeWithNeededLLVM.o"
+  local probe_object="$BUILD_DIR/bin/EasyJitRuntimeWithNeededLLVM.probe.o"
   local bundled_archive="$BUILD_DIR/bin/libEasyJitRuntimeWithNeededLLVM.a"
   local llvm_libs_file="$BUILD_DIR/easyjit-llvm-static-libs.txt"
+  local selected_members_file="$BUILD_DIR/easyjit-needed-llvm-members.tsv"
+  local needed_map="$BUILD_DIR/easyjit-bundle-needed-llvm.map"
   local link_log="$BUILD_DIR/easyjit-bundle-needed-llvm-link.log"
+  local extract_dir="$BUILD_DIR/easyjit-needed-llvm-objects"
+  local mri_script="$BUILD_DIR/easyjit-bundle-needed-llvm.mri"
   local ar_bin
   local ranlib_bin
   local lib
   local link_cmd
+  local archive
+  local member
+  local base
+  local safe_member
+  local out_obj
+  local count=0
 
   [[ "$RUNTIME_TYPE" == "static" ]] || die "--bundle-llvm-needed-static requires --runtime-type static"
   [[ -f "$runtime_archive" ]] || die "runtime archive not found: $runtime_archive"
@@ -410,7 +419,7 @@ bundle_static_runtime_with_needed_llvm() {
 
   link_cmd=( "$HOST_CLANGXX" "--target=$TARGET_TRIPLE" "--sysroot=$SYSROOT" )
   append_shell_words link_cmd "$BUNDLE_LINKER_FLAGS"
-  link_cmd+=( -r -nostdlib -o "$needed_object" )
+  link_cmd+=( -r -nostdlib "-Wl,-Map,$needed_map" -o "$probe_object" )
   link_cmd+=( -Wl,--whole-archive "$runtime_archive" -Wl,--no-whole-archive )
   link_cmd+=( -Wl,--start-group )
   while IFS= read -r lib; do
@@ -420,7 +429,9 @@ bundle_static_runtime_with_needed_llvm() {
   done < "$llvm_libs_file"
   link_cmd+=( -Wl,--end-group )
 
-  rm -f "$needed_object" "$bundled_archive" "$link_log"
+  rm -f "$probe_object" "$bundled_archive" "$needed_map" "$link_log" "$selected_members_file"
+  rm -rf "$extract_dir"
+  mkdir -p "$extract_dir"
   if ! "${link_cmd[@]}" >"$link_log" 2>&1; then
     echo "error: failed to create needed LLVM relocatable object" >&2
     echo "link log: $link_log" >&2
@@ -428,8 +439,48 @@ bundle_static_runtime_with_needed_llvm() {
     exit 1
   fi
 
-  strip_debug_file "$needed_object"
-  "$ar_bin" rcs "$bundled_archive" "$needed_object"
+  awk '
+    FNR == NR { libs[$0] = 1; next }
+    {
+      line = $0
+      while (match(line, /[^[:space:]]+\.a\([^)]*\)/)) {
+        token = substr(line, RSTART, RLENGTH)
+        archive = token
+        sub(/\(.*/, "", archive)
+        member = token
+        sub(/^[^(]*\(/, "", member)
+        sub(/\)$/, "", member)
+        if (archive in libs) {
+          print archive "\t" member
+        }
+        line = substr(line, RSTART + RLENGTH)
+      }
+    }
+  ' "$llvm_libs_file" "$needed_map" | sort -u > "$selected_members_file"
+
+  [[ -s "$selected_members_file" ]] || die "no LLVM archive members were selected; see map: $needed_map"
+
+  {
+    printf 'CREATE %s\n' "$bundled_archive"
+    printf 'ADDLIB %s\n' "$runtime_archive"
+    while IFS=$'\t' read -r archive member; do
+      [[ -n "$archive" && -n "$member" ]] || continue
+      base="$(basename "$archive" .a)"
+      safe_member="${member//\//_}"
+      out_obj="$extract_dir/${base}__${count}__${safe_member}"
+      if ! "$ar_bin" p "$archive" "$member" > "$out_obj"; then
+        echo "error: failed to extract $member from $archive" >&2
+        exit 1
+      fi
+      strip_debug_file "$out_obj"
+      printf 'ADDMOD %s\n' "$out_obj"
+      count=$((count + 1))
+    done < "$selected_members_file"
+    printf 'SAVE\n'
+    printf 'END\n'
+  } > "$mri_script"
+
+  "$ar_bin" -M < "$mri_script"
   strip_debug_file "$bundled_archive"
 
   ranlib_bin="$(find_llvm_ranlib || true)"
@@ -437,8 +488,10 @@ bundle_static_runtime_with_needed_llvm() {
     "$ranlib_bin" "$bundled_archive"
   fi
 
-  echo "  needed LLVM object : $needed_object"
   echo "  needed LLVM bundled runtime : $bundled_archive"
+  echo "  needed LLVM member count : $count"
+  echo "  needed LLVM members list : $selected_members_file"
+  echo "  needed LLVM link map : $needed_map"
   echo "  needed LLVM libs search list : $llvm_libs_file"
 }
 
