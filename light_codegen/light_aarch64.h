@@ -1,17 +1,19 @@
 // light_aarch64.h — experimental narrow codegen for post-EasyJIT-specialized IR.
 //
-// Supports a narrow subset (round-6 extension on top of round-5 PoC):
+// Supports a narrow subset (light-backend-only extension):
 //   - one function, multi-BB with forward/backward branches
-//   - integer or pointer params in x0..x7 (<=8 args)
+//   - integer or pointer params in x0..x7, float params in s0..s7
 //   - static alloca with fixed layout; constant-offset GEP on alloca
-//   - load/store i32/i64 with uimm12-scaled offset from sp or from a
-//     pointer-arg register (offset 0 only for reg-based pointers)
+//   - load/store i8/i16/i32/i64 with uimm12-scaled offset from sp or from a
+//     pointer-arg register; one dynamic scaled index is supported
 //   - llvm.memcpy.p0.p0.i64 with ConstantInt size <= 32 bytes, no overlap
 //   - icmp (eq/ne/slt/sle/sgt/sge/ult/ule/ugt/uge) — must be fused into
 //     the following conditional br; icmp-as-GPR is not supported
 //   - br i1 / br label, phi (lowered via predecessor-edge copy)
 //   - add/sub/mul/and/or/xor/shl/lshr/ashr
-//   - sext/zext/trunc between i1/i8/i16/i32/i64 (reg alias, no-op)
+//   - narrow scalar-float subset: load/store float, llvm.fmuladd.f32,
+//     fptosi float->i32
+//   - sext/zext/trunc between i1/i8/i16/i32/i64
 //   - ret i32 / ret i64 / ret void  (with sp restore)
 // Everything else -> Status::Unsupported.
 //

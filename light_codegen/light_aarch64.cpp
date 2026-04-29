@@ -1,12 +1,11 @@
 // Experimental narrow AArch64 emitter — round-6 extension.
 //
 // Target IR shape (derived from actual post-EasyJIT-specialization dumps):
-//   - 1 function, ≤8 integer args in x0..x7, 1 pointer arg is allowed and
-//     lives in its param register for the duration of the function
+//   - 1 function, ≤8 integer/pointer args in x0..x7, float args in s0..s7
 //   - multi-BB with forward/backward branches
 //   - single alloca (fixed size, compile-time known), GEP of alloca with
 //     constant offsets only
-//   - load/store i32 and i64 from/to alloca-relative addresses or from a
+//   - load/store i8/i16/i32/i64 from/to alloca-relative addresses or from a
 //     pointer-arg register (with constant offset)
 //   - llvm.memcpy.p0.p0.i64 with ConstantInt size, no overlap, lowered to
 //     a sequence of LDR/STR pairs (at most 32 bytes; else Unsupported)
@@ -17,7 +16,9 @@
 //     register and copying at each predecessor's terminator
 //   - add/sub/mul/and/or/xor/shl/lshr/ashr  (reg-reg or reg-imm12; small
 //     immediates up to 16 bits are materialized via MOVZ into x16)
-//   - sext/zext/trunc between i1/i8/i16/i32/i64 (register aliases, no-op)
+//   - narrow scalar-float subset: load/store float, llvm.fmuladd.f32,
+//     and fptosi float->i32
+//   - sext/zext/trunc between i1/i8/i16/i32/i64
 //   - ret (restores sp if a frame was allocated)
 //
 // Everything else -> Status::Unsupported. No register spilling (fail fast).
@@ -30,7 +31,9 @@
 //      needed in the emitter.
 //   C. MOVZ/MOVK halfwords are positional (hw field), not byte-
 //      addressed → endian-neutral.
-//   D. Sub-word (i8/i16) load/store remains UNSUPPORTED on any endian.
+//   D. Sub-word (i8/i16) load/store uses LDRB/LDRH/STRB/STRH. ZExt is a
+//      no-op after those loads; SExt emits SBFM so signed fields are handled
+//      explicitly rather than relying on target endian details.
 // See AARCH64_BE.md for the full correctness argument.
 
 #include "light_aarch64.h"
@@ -87,6 +90,10 @@ static uint32_t encMovz16(bool is64, unsigned rd, uint16_t imm16) {
   uint32_t op = 0x52800000u;
   if (is64) op |= 0x80000000u;
   return op | ((uint32_t)imm16 << 5) | (rd & 0x1Fu);
+}
+static uint32_t encMovkHw32(unsigned rd, uint16_t imm16, unsigned hw) {
+  return 0x72800000u | ((hw & 1u) << 21)
+       | ((uint32_t)imm16 << 5) | (rd & 0x1Fu);
 }
 // MOVZ with hw-shift (hw ∈ {0,1,2,3}; shift = hw * 16). 64-bit form only.
 // LE-neutral: address value is just a 64-bit integer; the instruction
@@ -146,7 +153,19 @@ static uint32_t encAsrImm(bool is64, unsigned rd, unsigned rn, unsigned sh) {
            | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
 }
 
-// LDR/STR (unsigned-offset, uimm12). size: 2=32b, 3=64b. Reads/writes
+// SBFM/UBFM aliases for sign/zero extension of sub-word values.
+// SXT[BH] Wd, Wn = SBFM Wd, Wn, #0, #(7|15)
+// UXT[BH] Wd, Wn = UBFM Wd, Wn, #0, #(7|15)
+static uint32_t encExtendBits(bool sign, bool to64, unsigned rd, unsigned rn,
+                              unsigned fromBits) {
+  uint32_t op = sign ? 0x13000000u : 0x53000000u;
+  if (to64) op |= 0x80400000u;
+  unsigned imms = fromBits - 1;
+  return op | ((0u & 0x3Fu) << 16) | ((imms & 0x3Fu) << 10)
+            | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+
+// LDR/STR (unsigned-offset, uimm12). size: 0=8b, 1=16b, 2=32b, 3=64b. Reads/writes
 // happen in target data-endian (SCTLR_EL1.EE). Because JIT'd code reads
 // the same bytes its producer wrote (same process, same endian), this is
 // correct on both aarch64 and aarch64_be.
@@ -156,6 +175,30 @@ static uint32_t encLdrStrUI(bool load, unsigned size, unsigned rt,
   op |= ((uint32_t)size << 30);       // 10=32b, 11=64b
   op |= (load ? 0x00400000u : 0u);
   return op | ((imm12 & 0xFFFu) << 10) | ((rn & 0x1Fu) << 5) | (rt & 0x1Fu);
+}
+static uint32_t encFpLdrStrUIS(bool load, unsigned rt, unsigned rn,
+                               unsigned imm12) {
+  uint32_t op = load ? 0xBD400000u : 0xBD000000u;
+  return op | ((imm12 & 0xFFFu) << 10) | ((rn & 0x1Fu) << 5) | (rt & 0x1Fu);
+}
+static uint32_t encFmaddS(unsigned rd, unsigned rn, unsigned rm, unsigned ra) {
+  return 0x1F000000u | ((rm & 0x1Fu) << 16) | ((ra & 0x1Fu) << 10)
+                    | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+static uint32_t encFcvtzsWS(unsigned rd, unsigned rn) {
+  return 0x1E380000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+static uint32_t encFmovImm2S(unsigned rd) {
+  return 0x1E201000u | (rd & 0x1Fu);
+}
+static uint32_t encFmovZeroS(unsigned rd) {
+  return 0x1E2703E0u | (rd & 0x1Fu);
+}
+static uint32_t encFmovRegS(unsigned rd, unsigned rn) {
+  return 0x1E204000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+static uint32_t encFmovSFromW(unsigned rd, unsigned rn) {
+  return 0x1E270000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
 }
 // SUBS (imm) — used for CMP imm. 32-bit form.
 static uint32_t encSubsImm32(unsigned rn, unsigned imm12) {
@@ -205,22 +248,21 @@ struct Writer {
 // expression (alloca + constant GEP chain), is a fully-baked constant
 // host address (e.g. `inttoptr i64 0xCAFE to ptr`, used by EasyJIT to
 // inline a snapshot/array base after specialization), or is an Absolute
-// base plus one runtime-variable scaled index (used for
-// `array[idx]`-style access into a host buffer whose base is known).
+// base plus one runtime-variable scaled index (used for `array[idx]`-style
+// access into a host buffer whose base is known, or into a forwarded pointer
+// argument).
 //
-// AbsoluteScaledIndex is the minimum increment over Absolute that lets
-// us serve `getelementptr T, ptr <abs-base>, i64 %idx` patterns — the
-// shape EasyJIT emits when a `bind_global_array` / `bind_array` snapshot
-// is read with a runtime index. We deliberately keep this to ONE runtime
+// The scaled-index forms are the minimum increment that lets us serve
+// `getelementptr T, ptr <base>, i64 %idx` patterns. We deliberately keep this to ONE runtime
 // index per pointer and a power-of-two element scale so the emitter
 // can lower it with a single `ADD x17, x17, Wm/Xm, ext #shift`.
 struct PtrLoc {
-  enum Kind { InReg, StackRel, Absolute, AbsoluteScaledIndex } kind = InReg;
+  enum Kind { InReg, StackRel, Absolute, AbsoluteScaledIndex, InRegScaledIndex } kind = InReg;
   unsigned reg = 0;     // for InReg
   int32_t  spOff = 0;   // for StackRel
-  uint64_t addr = 0;    // for Absolute / AbsoluteScaledIndex (addr+const_off)
+  uint64_t addr = 0;    // for Absolute* forms (addr+const_off)
 
-  // For AbsoluteScaledIndex only:
+  // For *ScaledIndex only:
   const llvm::Value *idxValue = nullptr;  // non-constant index Value (i32 or i64)
   uint32_t  scaleLog2 = 0;                // 0..3 (scale=1,2,4,8); only PoT
   bool      idxIs64 = false;              // true: idx is i64; false: i32
@@ -352,7 +394,12 @@ static bool resolvePtrLocChain(const Value *P, const DataLayout &DL,
           // base just shifts the constant part. Keeps idxValue/scale.
           out.addr += (uint64_t)(int64_t)off.getSExtValue();
           return true;
-        case PtrLoc::InReg:    return false; // reg+const ptr arithmetic not yet supported
+        case PtrLoc::InRegScaledIndex:
+          out.spOff += (int32_t)off.getSExtValue();
+          return true;
+        case PtrLoc::InReg:
+          out.spOff += (int32_t)off.getSExtValue();
+          return true;
       }
       return false;
     }
@@ -388,14 +435,14 @@ static bool resolveDynScaledGep(const GEPOperator *GEP, const DataLayout &DL,
                                 const std::unordered_map<const Value *, PtrLoc> &known,
                                 const GlobalSymbol *globals, size_t nglobals,
                                 PtrLoc &out) {
-  // Resolve the base. The base must NOT itself already be an
-  // AbsoluteScaledIndex (we only support one runtime index per pointer
-  // location). It must reduce to a flat Absolute address.
+  // Resolve the base. The base must NOT itself already be a scaled-index
+  // form (we only support one runtime index per pointer location). It
+  // must reduce to a flat Absolute address or a forwarded pointer in a GPR.
   PtrLoc base;
   if (!resolvePtrLocChain(GEP->getPointerOperand(), DL, known,
                           globals, nglobals, base))
     return false;
-  if (base.kind != PtrLoc::Absolute) return false;
+  if (base.kind != PtrLoc::Absolute && base.kind != PtrLoc::InReg) return false;
 
   Type *Cur = GEP->getSourceElementType();
   // First index applies to the source element type as if it were an
@@ -499,7 +546,11 @@ static bool resolveDynScaledGep(const GEPOperator *GEP, const DataLayout &DL,
 
   // Build the result.
   out = PtrLoc{};
-  out.kind       = PtrLoc::AbsoluteScaledIndex;
+  out.kind       = (base.kind == PtrLoc::Absolute)
+      ? PtrLoc::AbsoluteScaledIndex
+      : PtrLoc::InRegScaledIndex;
+  out.reg        = base.reg;
+  out.spOff      = base.spOff + (int32_t)constOff;
   out.addr       = base.addr + (uint64_t)constOff;
   out.idxValue   = idxV;
   uint64_t s = dynScale;
@@ -610,26 +661,32 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
   // them before visiting the phi's block.
 
   std::unordered_map<const Value *, unsigned> regOf;
+  std::unordered_map<const Value *, unsigned> fpRegOf;
 
-  // Params: integers go into x{argIdx}; pointer args too (same ABI slot).
-  // We must count args FIRST so the scratch allocator starts above them,
-  // rather than the prior hard-coded x9 floor (which wasted x{argCount}..x8
-  // for any function with fewer than 9 args, i.e. nearly every function).
+  // Params: integer/pointer arguments use x0..x7; float arguments use
+  // s0..s7. The register classes have independent AAPCS allocation.
   unsigned argCount = 0;
+  unsigned fpArgCount = 0;
   {
     for (const Argument &A : Fn.args()) {
       Type *T = A.getType();
       if (T->isIntegerTy() || T->isPointerTy()) {
         regOf[&A] = argCount;
+        argCount++;
+      } else if (T->isFloatTy()) {
+        fpRegOf[&A] = fpArgCount;
+        fpArgCount++;
       } else {
-        r.status = Status::Unsupported; r.reason = "non-int/ptr arg"; return r;
+        r.status = Status::Unsupported; r.reason = "non-int/ptr/float arg"; return r;
       }
-      argCount++;
     }
     if (argCount > 8) {
       // AArch64 AAPCS: x0..x7 are integer arg regs; beyond that args come
       // in on the stack. Light emitter does not handle stack-passed args.
       r.status = Status::Unsupported; r.reason = "too many args"; return r;
+    }
+    if (fpArgCount > 8) {
+      r.status = Status::Unsupported; r.reason = "too many fp args"; return r;
     }
   }
 
@@ -640,6 +697,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
   // what lets e.g. partial_struct_binding (which produces 8 live values
   // due to an uncsed struct-field load) fit in the pool.
   unsigned nextReg = argCount;
+  unsigned nextFpReg = 16;
   auto assignReg = [&](const Value *V) -> int {
     // Skip x16; it is our imm materialization scratch.
     if (nextReg == 16) ++nextReg;
@@ -648,11 +706,24 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
     regOf[V] = r;
     return (int)r;
   };
+  auto assignFpReg = [&](const Value *V) -> int {
+    // s31 is reserved as a transient FP-immediate scratch register.
+    if (nextFpReg > 30) return -1;
+    unsigned r = nextFpReg++;
+    fpRegOf[V] = r;
+    return (int)r;
+  };
 
   // Pre-assign phi regs.
   for (const BasicBlock &BB : Fn) {
     for (const Instruction &I : BB) {
       if (auto *PN = dyn_cast<PHINode>(&I)) {
+        if (PN->getType()->isFloatTy()) {
+          if (assignFpReg(PN) < 0) {
+            r.status = Status::Unsupported; r.reason = "out of fp scratch (phi)"; return r;
+          }
+          continue;
+        }
         if (!PN->getType()->isIntegerTy()) {
           r.status = Status::Unsupported; r.reason = "non-int phi"; return r;
         }
@@ -783,9 +854,39 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
     return false;
   };
 
+  auto valueInFpReg = [&](const Value *V, unsigned &outReg) -> bool {
+    auto it = fpRegOf.find(V);
+    if (it != fpRegOf.end()) { outReg = it->second; return true; }
+    if (auto *CFP = dyn_cast<ConstantFP>(V)) {
+      const APFloat &APF = CFP->getValueAPF();
+      if (&APF.getSemantics() != &APFloat::IEEEsingle())
+        return false;
+      if (APF.isZero()) {
+        outReg = 31;
+        return W.emit(encFmovZeroS(outReg));
+      }
+      bool losesInfo = false;
+      APFloat V2(APF);
+      V2.convert(APFloat::IEEEsingle(), APFloat::rmNearestTiesToEven, &losesInfo);
+      if (!losesInfo && V2.convertToFloat() == 2.0f) {
+        outReg = 31;
+        return W.emit(encFmovImm2S(outReg));
+      }
+      uint32_t raw = (uint32_t)APF.bitcastToAPInt().getZExtValue();
+      outReg = 31;
+      if (!W.emit(encMovz16(false, 16, (uint16_t)(raw & 0xFFFFu))))
+        return false;
+      uint16_t hi = (uint16_t)(raw >> 16);
+      if (hi && !W.emit(encMovkHw32(16, hi, 1)))
+        return false;
+      return W.emit(encFmovSFromW(outReg, 16));
+    }
+    return false;
+  };
+
   // Helper: load uimm12-scaled offset check.
   auto fitsScaled = [](int32_t off, unsigned size) -> int {
-    unsigned scale = 1u << size; // size=2→4, size=3→8
+    unsigned scale = 1u << size; // size=0→1, size=1→2, size=2→4, size=3→8
     if (off < 0) return -1;
     if ((uint32_t)off & (scale - 1)) return -1;
     uint32_t s = (uint32_t)off / scale;
@@ -823,7 +924,17 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
   // operates on register values, not memory, so it is endian-neutral. The
   // subsequent LDR/STR honours target data endian (handled by hardware).
   auto materializeScaledAddrToX17 = [&](const PtrLoc &P) -> bool {
-    if (!materializeAddrToX17(P.addr)) return false;
+    if (P.kind == PtrLoc::AbsoluteScaledIndex) {
+      if (!materializeAddrToX17(P.addr)) return false;
+    } else if (P.kind == PtrLoc::InRegScaledIndex) {
+      if ((P.reg) != 17 && !W.emit(encMovReg(true, 17, P.reg))) return false;
+      if (P.spOff != 0) {
+        if (P.spOff < 0 || P.spOff > 0xFFF) return false;
+        if (!W.emit(encAddSubImm(false, true, 17, 17, (unsigned)P.spOff))) return false;
+      }
+    } else {
+      return false;
+    }
     unsigned idxReg;
     if (!valueInReg(P.idxValue, P.idxIs64, idxReg)) return false;
     unsigned option;
@@ -833,7 +944,17 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
     return W.emit(encAddExtReg64(17, 17, idxReg, option, P.scaleLog2));
   };
 
-  // Helper: emit a load from PtrLoc into reg rt, size in {2,3}.
+  auto accessSizeForBits = [](unsigned bits, unsigned &size) -> bool {
+    switch (bits) {
+      case 8:  size = 0; return true;
+      case 16: size = 1; return true;
+      case 32: size = 2; return true;
+      case 64: size = 3; return true;
+      default: return false;
+    }
+  };
+
+  // Helper: emit a load from PtrLoc into reg rt, size in {0,1,2,3}.
   auto emitLoad = [&](PtrLoc base, unsigned size, unsigned rt) -> bool {
     if (base.kind == PtrLoc::StackRel) {
       int s = fitsScaled(base.spOff, size);
@@ -849,13 +970,14 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
       if (!materializeAddrToX17(base.addr)) return false;
       return W.emit(encLdrStrUI(true, size, rt, 17, 0));
     }
-    if (base.kind == PtrLoc::AbsoluteScaledIndex) {
+    if (base.kind == PtrLoc::AbsoluteScaledIndex ||
+        base.kind == PtrLoc::InRegScaledIndex) {
       if (!materializeScaledAddrToX17(base)) return false;
       return W.emit(encLdrStrUI(true, size, rt, 17, 0));
     }
-    // InReg, offset=0 only (we don't currently track reg+offset).
-    if (base.spOff != 0) return false;
-    return W.emit(encLdrStrUI(true, size, rt, base.reg, 0));
+    int s = fitsScaled(base.spOff, size);
+    if (s < 0) return false;
+    return W.emit(encLdrStrUI(true, size, rt, base.reg, (unsigned)s));
   };
   auto emitStore = [&](PtrLoc base, unsigned size, unsigned rt) -> bool {
     if (base.kind == PtrLoc::StackRel) {
@@ -867,12 +989,14 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
       if (!materializeAddrToX17(base.addr)) return false;
       return W.emit(encLdrStrUI(false, size, rt, 17, 0));
     }
-    if (base.kind == PtrLoc::AbsoluteScaledIndex) {
+    if (base.kind == PtrLoc::AbsoluteScaledIndex ||
+        base.kind == PtrLoc::InRegScaledIndex) {
       if (!materializeScaledAddrToX17(base)) return false;
       return W.emit(encLdrStrUI(false, size, rt, 17, 0));
     }
-    if (base.spOff != 0) return false;
-    return W.emit(encLdrStrUI(false, size, rt, base.reg, 0));
+    int s = fitsScaled(base.spOff, size);
+    if (s < 0) return false;
+    return W.emit(encLdrStrUI(false, size, rt, base.reg, (unsigned)s));
   };
 
   // Lower memcpy(dst, src, N, false) with N <= 32 into 1–4 LDR/STR pairs.
@@ -934,6 +1058,25 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
 
       // memcpy intrinsic
       if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
+        if (II->getIntrinsicID() == Intrinsic::fmuladd) {
+          if (!II->getType()->isFloatTy()) {
+            r.status = Status::Unsupported; r.reason = "fmuladd non-f32"; return r;
+          }
+          int rd = assignFpReg(II);
+          if (rd < 0) {
+            r.status = Status::Unsupported; r.reason = "fp scratch OOM (fmuladd)"; return r;
+          }
+          unsigned rn, rm, ra;
+          if (!valueInFpReg(II->getArgOperand(0), rn) ||
+              !valueInFpReg(II->getArgOperand(1), rm) ||
+              !valueInFpReg(II->getArgOperand(2), ra)) {
+            r.status = Status::Unsupported; r.reason = "fmuladd operands"; return r;
+          }
+          if (!W.emit(encFmaddS((unsigned)rd, rn, rm, ra))) {
+            r.status = Status::TooLarge; return r;
+          }
+          continue;
+        }
         if (II->getIntrinsicID() == Intrinsic::memcpy) {
           auto dit = ptrLoc.find(II->getArgOperand(0));
           auto sit = ptrLoc.find(II->getArgOperand(1));
@@ -964,12 +1107,56 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
 
       // Load
       if (auto *LI = dyn_cast<LoadInst>(&I)) {
+        if (LI->getType()->isFloatTy()) {
+          auto it = ptrLoc.find(LI->getPointerOperand());
+          if (it == ptrLoc.end()) {
+            PtrLoc loc;
+            if (!resolvePtrLocChain(LI->getPointerOperand(), DL, ptrLoc,
+                                    globals, nglobals, loc) &&
+                !(isa<GEPOperator>(LI->getPointerOperand()) &&
+                  resolveDynScaledGep(cast<GEPOperator>(LI->getPointerOperand()),
+                                      DL, ptrLoc, globals, nglobals, loc))) {
+              r.status = Status::Unsupported; r.reason = "float load ptr"; return r;
+            }
+            ptrLoc[LI->getPointerOperand()] = loc;
+            it = ptrLoc.find(LI->getPointerOperand());
+          }
+          int rd = assignFpReg(LI);
+          if (rd < 0) {
+            r.status = Status::Unsupported; r.reason = "fp scratch OOM (load)"; return r;
+          }
+          PtrLoc base = it->second;
+          unsigned baseReg = 0;
+          unsigned imm = 0;
+          if (base.kind == PtrLoc::StackRel) {
+            int s = fitsScaled(base.spOff, 2);
+            if (s < 0) { r.status = Status::Unsupported; r.reason = "float load offset"; return r; }
+            baseReg = 31; imm = (unsigned)s;
+          } else if (base.kind == PtrLoc::Absolute) {
+            if (!materializeAddrToX17(base.addr)) { r.status = Status::TooLarge; return r; }
+            baseReg = 17; imm = 0;
+          } else if (base.kind == PtrLoc::AbsoluteScaledIndex ||
+                     base.kind == PtrLoc::InRegScaledIndex) {
+            if (!materializeScaledAddrToX17(base)) { r.status = Status::Unsupported; r.reason = "float dyn addr"; return r; }
+            baseReg = 17; imm = 0;
+          } else {
+            int s = fitsScaled(base.spOff, 2);
+            if (s < 0) { r.status = Status::Unsupported; r.reason = "float load reg+off"; return r; }
+            baseReg = base.reg; imm = 0;
+            imm = (unsigned)s;
+          }
+          if (!W.emit(encFpLdrStrUIS(true, (unsigned)rd, baseReg, imm))) {
+            r.status = Status::TooLarge; return r;
+          }
+          continue;
+        }
         unsigned bits = 0;
         if (LI->getType()->isIntegerTy())
           bits = LI->getType()->getIntegerBitWidth();
         else if (LI->getType()->isPointerTy())
           bits = 64;  // pointer load = i64 load (host ABI)
-        if (bits != 32 && bits != 64) {
+        unsigned accessSize = 0;
+        if (!accessSizeForBits(bits, accessSize)) {
           r.status = Status::Unsupported; r.reason = "load width"; return r;
         }
 
@@ -1059,7 +1246,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
           }
           if (GV) {
             if (const void *Host = resolveGlobal(GV)) {
-              int scaled = fitsScaled((int32_t)off, bits == 64 ? 3u : 2u);
+              int scaled = fitsScaled((int32_t)off, accessSize);
               if (scaled < 0) {
                 r.status = Status::Unsupported; r.reason = "global load uimm12 overflow"; return r;
               }
@@ -1075,8 +1262,8 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
               if (c1 && !W.emit(encMovkHw64(17, c1, 1))) { r.status=Status::TooLarge; return r; }
               if (c2 && !W.emit(encMovkHw64(17, c2, 2))) { r.status=Status::TooLarge; return r; }
               if (c3 && !W.emit(encMovkHw64(17, c3, 3))) { r.status=Status::TooLarge; return r; }
-              if (!W.emit(encLdrStrUI(true, bits == 64 ? 3u : 2u,
-                                      (unsigned)rd, 17, (unsigned)scaled))) {
+              if (!W.emit(encLdrStrUI(true, accessSize, (unsigned)rd, 17,
+                                      (unsigned)scaled))) {
                 r.status=Status::TooLarge; return r;
               }
               continue;
@@ -1108,7 +1295,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         }
         int rd = assignReg(LI);
         if (rd < 0) { r.status = Status::Unsupported; r.reason = "scratch OOM (load)"; return r; }
-        if (!emitLoad(it->second, bits == 64 ? 3u : 2u, (unsigned)rd)) {
+        if (!emitLoad(it->second, accessSize, (unsigned)rd)) {
           r.status = Status::Unsupported; r.reason = "load offset/encoding"; return r;
         }
         continue;
@@ -1116,12 +1303,56 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
       // Store
       if (auto *SI = dyn_cast<StoreInst>(&I)) {
         const Value *V = SI->getValueOperand();
+        if (V->getType()->isFloatTy()) {
+          auto it = ptrLoc.find(SI->getPointerOperand());
+          if (it == ptrLoc.end()) {
+            PtrLoc loc;
+            if (!resolvePtrLocChain(SI->getPointerOperand(), DL, ptrLoc,
+                                    globals, nglobals, loc) &&
+                !(isa<GEPOperator>(SI->getPointerOperand()) &&
+                  resolveDynScaledGep(cast<GEPOperator>(SI->getPointerOperand()),
+                                      DL, ptrLoc, globals, nglobals, loc))) {
+              r.status = Status::Unsupported; r.reason = "float store ptr"; return r;
+            }
+            ptrLoc[SI->getPointerOperand()] = loc;
+            it = ptrLoc.find(SI->getPointerOperand());
+          }
+          unsigned rs;
+          if (!valueInFpReg(V, rs)) {
+            r.status = Status::Unsupported; r.reason = "float store value"; return r;
+          }
+          PtrLoc base = it->second;
+          unsigned baseReg = 0;
+          unsigned imm = 0;
+          if (base.kind == PtrLoc::StackRel) {
+            int s = fitsScaled(base.spOff, 2);
+            if (s < 0) { r.status = Status::Unsupported; r.reason = "float store offset"; return r; }
+            baseReg = 31; imm = (unsigned)s;
+          } else if (base.kind == PtrLoc::Absolute) {
+            if (!materializeAddrToX17(base.addr)) { r.status = Status::TooLarge; return r; }
+            baseReg = 17; imm = 0;
+          } else if (base.kind == PtrLoc::AbsoluteScaledIndex ||
+                     base.kind == PtrLoc::InRegScaledIndex) {
+            if (!materializeScaledAddrToX17(base)) { r.status = Status::Unsupported; r.reason = "float dyn addr"; return r; }
+            baseReg = 17; imm = 0;
+          } else {
+            int s = fitsScaled(base.spOff, 2);
+            if (s < 0) { r.status = Status::Unsupported; r.reason = "float store reg+off"; return r; }
+            baseReg = base.reg; imm = 0;
+            imm = (unsigned)s;
+          }
+          if (!W.emit(encFpLdrStrUIS(false, rs, baseReg, imm))) {
+            r.status = Status::TooLarge; return r;
+          }
+          continue;
+        }
         unsigned bits = 0;
         if (V->getType()->isIntegerTy())
           bits = V->getType()->getIntegerBitWidth();
         else if (V->getType()->isPointerTy())
           bits = 64;  // pointer store = i64 store (host ABI)
-        if (bits != 32 && bits != 64) {
+        unsigned accessSize = 0;
+        if (!accessSizeForBits(bits, accessSize)) {
           r.status = Status::Unsupported; r.reason = "store width"; return r;
         }
 
@@ -1144,7 +1375,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
           }
           if (GV) {
             if (const void *Host = resolveGlobal(GV)) {
-              int scaled = fitsScaled((int32_t)off, bits == 64 ? 3u : 2u);
+              int scaled = fitsScaled((int32_t)off, accessSize);
               if (scaled < 0) {
                 r.status = Status::Unsupported; r.reason = "global store uimm12 overflow"; return r;
               }
@@ -1161,8 +1392,8 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
               if (c1 && !W.emit(encMovkHw64(17, c1, 1))) { r.status=Status::TooLarge; return r; }
               if (c2 && !W.emit(encMovkHw64(17, c2, 2))) { r.status=Status::TooLarge; return r; }
               if (c3 && !W.emit(encMovkHw64(17, c3, 3))) { r.status=Status::TooLarge; return r; }
-              if (!W.emit(encLdrStrUI(false, bits == 64 ? 3u : 2u,
-                                      rs, 17, (unsigned)scaled))) {
+              if (!W.emit(encLdrStrUI(false, accessSize, rs, 17,
+                                      (unsigned)scaled))) {
                 r.status=Status::TooLarge; return r;
               }
               continue;
@@ -1191,7 +1422,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         if (!valueInReg(V, bits == 64, rs)) {
           r.status = Status::Unsupported; r.reason = "store value"; return r;
         }
-        if (!emitStore(it->second, bits == 64 ? 3u : 2u, rs)) {
+        if (!emitStore(it->second, accessSize, rs)) {
           r.status = Status::Unsupported; r.reason = "store offset/encoding"; return r;
         }
         continue;
@@ -1344,8 +1575,28 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         continue;
       }
 
-      // Cast (trunc/zext/sext): w/x register alias — reuse source reg.
+      // Cast (trunc/zext/sext): trunc is a register alias; zext from
+      // sub-word values is already satisfied by LDRB/LDRH or 32-bit ops
+      // clearing high bits; sext from i8/i16 needs an explicit SBFM.
       if (auto *CI = dyn_cast<CastInst>(&I)) {
+        if (CI->getOpcode() == Instruction::FPToSI) {
+          if (!CI->getOperand(0)->getType()->isFloatTy() ||
+              !CI->getType()->isIntegerTy(32)) {
+            r.status = Status::Unsupported; r.reason = "fptosi shape"; return r;
+          }
+          auto it = fpRegOf.find(CI->getOperand(0));
+          if (it == fpRegOf.end()) {
+            r.status = Status::Unsupported; r.reason = "fptosi src"; return r;
+          }
+          int rd = assignReg(&I);
+          if (rd < 0) {
+            r.status = Status::Unsupported; r.reason = "scratch OOM (fptosi)"; return r;
+          }
+          if (!W.emit(encFcvtzsWS((unsigned)rd, it->second))) {
+            r.status = Status::TooLarge; return r;
+          }
+          continue;
+        }
         if (CI->getOpcode() == Instruction::Trunc ||
             CI->getOpcode() == Instruction::ZExt  ||
             CI->getOpcode() == Instruction::SExt) {
@@ -1353,7 +1604,39 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
           if (it == regOf.end()) {
             r.status = Status::Unsupported; r.reason = "cast src not in reg"; return r;
           }
-          regOf[&I] = it->second;
+          unsigned srcReg = it->second;
+          Type *SrcTy = CI->getOperand(0)->getType();
+          Type *DstTy = CI->getType();
+          if (!SrcTy->isIntegerTy() || !DstTy->isIntegerTy()) {
+            r.status = Status::Unsupported; r.reason = "cast non-int"; return r;
+          }
+          unsigned srcBits = SrcTy->getIntegerBitWidth();
+          unsigned dstBits = DstTy->getIntegerBitWidth();
+          if (CI->getOpcode() == Instruction::SExt &&
+              (srcBits == 8 || srcBits == 16) &&
+              (dstBits == 32 || dstBits == 64)) {
+            int rd = assignReg(&I);
+            if (rd < 0) {
+              r.status = Status::Unsupported; r.reason = "scratch OOM (sext)"; return r;
+            }
+            if (!W.emit(encExtendBits(true, dstBits == 64, (unsigned)rd, srcReg, srcBits))) {
+              r.status = Status::TooLarge; return r;
+            }
+            continue;
+          }
+          if (CI->getOpcode() == Instruction::ZExt &&
+              (srcBits == 8 || srcBits == 16) &&
+              (dstBits == 32 || dstBits == 64)) {
+            int rd = assignReg(&I);
+            if (rd < 0) {
+              r.status = Status::Unsupported; r.reason = "scratch OOM (zext)"; return r;
+            }
+            if (!W.emit(encExtendBits(false, dstBits == 64, (unsigned)rd, srcReg, srcBits))) {
+              r.status = Status::TooLarge; return r;
+            }
+            continue;
+          }
+          regOf[&I] = srcReg;
           continue;
         }
         r.status = Status::Unsupported; r.reason = "cast kind"; return r;
@@ -1376,6 +1659,17 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
             auto *PN = dyn_cast<PHINode>(&J);
             if (!PN) break;
             Value *inc = PN->getIncomingValueForBlock(&BB);
+            if (PN->getType()->isFloatTy()) {
+              auto itR = fpRegOf.find(PN);
+              if (itR == fpRegOf.end()) return false;
+              unsigned phiReg = itR->second;
+              unsigned srcReg;
+              if (!valueInFpReg(inc, srcReg)) return false;
+              if (srcReg != phiReg) {
+                if (!W.emit(encFmovRegS(phiReg, srcReg))) return false;
+              }
+              continue;
+            }
             bool is64 = PN->getType()->isIntegerTy(64);
             auto itR = regOf.find(PN);
             if (itR == regOf.end()) return false;
