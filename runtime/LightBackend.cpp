@@ -14,6 +14,8 @@
 
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/Constants.h>
+#include <llvm/IR/GlobalVariable.h>
 #include <llvm/Support/Host.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/ADT/Triple.h>
@@ -24,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -88,6 +91,15 @@ const char *PolicyName(Policy p) {
 // ----------------------------------------------------------------- holder
 // The light emitter returns a raw mmap'd RX page. We need an RAII holder
 // so the page is munmap'd when the easy::Function is destroyed.
+//
+// Round-12: the holder also owns any data buffers materialized for
+// PrivateLinkage GVs (e.g. `@__easy_snapshot_struct_array` produced by
+// the bind_global_array IR rewrite, which is a private GV with a
+// ConstantDataArray initializer baked into the IR). The light emitter
+// can't generate code that reads those bytes from the IR directly; we
+// allocate a heap buffer per GV, copy the initializer, and pass the
+// buffer's host address as an extra GlobalSymbol. The buffers live as
+// long as the compiled function does.
 
 namespace {
 class LightCodeHolder : public ::easy::LLVMHolder {
@@ -101,6 +113,15 @@ public:
   // a complete module. Matches LLVMHolderImpl's ownership pattern.
   std::unique_ptr<llvm::LLVMContext> Context_;
   std::unique_ptr<llvm::Module>      M_;
+
+  // Owned data slabs for materialized PrivateLinkage GVs. Each entry's
+  // address was published in the GlobalSymbol vector passed to the
+  // emitter; freeing happens automatically here on destruction.
+  std::vector<std::unique_ptr<uint8_t[]>> dataBuffers_;
+  // Owned strdup'd names — GlobalSymbol::name is a const char*; we keep
+  // the storage backing those pointers alive too (the original GV
+  // names live in the Module/Context so this is a defensive copy).
+  std::vector<std::unique_ptr<char[]>>    nameBuffers_;
 
   LightCodeHolder(void *p, size_t sz,
                   std::unique_ptr<llvm::LLVMContext> Ctx,
@@ -120,6 +141,94 @@ public:
   }
 };
 } // anonymous namespace
+
+// Walk the module for PrivateLinkage GVs whose initializer is a
+// ConstantData (raw byte buffer — ConstantDataArray, ConstantDataVector,
+// or simple ConstantInt scalar). For each such GV we allocate a heap
+// buffer, copy the initializer bytes into it (using the target
+// DataLayout to size correctly), and append a GlobalSymbol mapping the
+// GV's name to the buffer's host address.
+//
+// Why "PrivateLinkage with ConstantData": this is the precise shape
+// EasyJIT's `bind_global_array` rewrite produces (see
+// runtime/pass/InlineParametersHelper.cpp's GetRawByteArrayPointer).
+// We deliberately do NOT touch ExternalLinkage GVs (those are real host
+// globals already in EasyJIT's GlobalMapping table) or GVs with
+// non-constant initialisers.
+//
+// Returns the number of newly added GVs. The data buffers + name backing
+// storage are appended to the supplied vectors; on a successful compile
+// they are moved into the LightCodeHolder so they outlive the call.
+static size_t MaterializePrivateGlobals(llvm::Module &M,
+                                        std::vector<::light::GlobalSymbol> &syms,
+                                        std::vector<std::unique_ptr<uint8_t[]>> &dataBufs,
+                                        std::vector<std::unique_ptr<char[]>>    &nameBufs) {
+  using namespace llvm;
+  size_t added = 0;
+  const DataLayout &DL = M.getDataLayout();
+  for (GlobalVariable &GV : M.globals()) {
+    if (!GV.hasInitializer()) continue;
+    if (!GV.hasPrivateLinkage() && !GV.hasInternalLinkage()) continue;
+    Constant *Init = GV.getInitializer();
+    // Skip if already in the supplied user-globals table (by name).
+    StringRef N = GV.getName();
+    bool already = false;
+    for (auto &s : syms) {
+      if (s.name && N == s.name) { already = true; break; }
+    }
+    if (already) continue;
+
+    // Only handle "raw byte" initializers for now. ConstantDataArray /
+    // ConstantDataVector store bytes directly (DL alloc-size = element
+    // count * element size). ConstantAggregateZero is also fine
+    // (zero-fill of known size). Anything else (ConstantStruct,
+    // ConstantArray of ConstantExpr, etc.) is left to the existing
+    // const-fold fast-paths in the emitter; we don't need to (and don't
+    // know how to) reify those into a flat byte buffer here.
+    Type *EltTy = GV.getValueType();
+    uint64_t sz = DL.getTypeAllocSize(EltTy);
+    if (sz == 0) continue;
+    if (sz > (1ull << 20)) continue; // 1 MiB cap; sanity guard
+
+    std::unique_ptr<uint8_t[]> buf(new uint8_t[sz]());
+
+    if (auto *CDS = dyn_cast<ConstantDataSequential>(Init)) {
+      StringRef raw = CDS->getRawDataValues();
+      if (raw.size() > sz) continue;
+      std::memcpy(buf.get(), raw.data(), raw.size());
+      // Trailing alloc-size padding is already zero from value-init.
+    } else if (isa<ConstantAggregateZero>(Init)) {
+      // buf is already zero-initialised.
+    } else if (auto *CI = dyn_cast<ConstantInt>(Init)) {
+      uint64_t v = CI->getZExtValue();
+      uint64_t bits = std::min<uint64_t>(sz * 8, 64);
+      for (uint64_t i = 0; i < (bits + 7) / 8; ++i)
+        buf[i] = (uint8_t)(v >> (i * 8));
+      // ConstantInt scalar init is rare (real array data uses
+      // ConstantDataSequential). The host C++ producer and host C++
+      // reader are in the same process and same endian, so no byte
+      // swap is needed — even on aarch64_be the SCTLR_EL1.EE-controlled
+      // LDR sees the same bytes the host stored.
+    } else {
+      continue; // structurally interesting initialiser; skip.
+    }
+
+    // Stash a stable name copy — GlobalSymbol::name is a const char*.
+    std::unique_ptr<char[]> nameCopy(new char[N.size() + 1]);
+    std::memcpy(nameCopy.get(), N.data(), N.size());
+    nameCopy[N.size()] = '\0';
+
+    ::light::GlobalSymbol s;
+    s.name    = nameCopy.get();
+    s.address = (const void *)buf.get();
+    syms.push_back(s);
+
+    dataBufs.push_back(std::move(buf));
+    nameBufs.push_back(std::move(nameCopy));
+    ++added;
+  }
+  return added;
+}
 
 // ----------------------------------------------------------------- impl
 
@@ -196,10 +305,24 @@ Report TryLightCompile(const char *Name,
   // Build a light-globals view from EasyJIT's own mapping table.
   size_t nsyms = 0;
   std::vector<::light::GlobalSymbol> syms = BuildLightGlobals(Globals, nsyms);
+
+  // Reify any PrivateLinkage GVs whose initializer is raw byte data
+  // (e.g. the @__easy_snapshot_struct_array buffer that
+  // bind_global_array's IR rewrite plants in the module). The light
+  // backend only knows how to address GVs through its globals table —
+  // so we materialize the IR-embedded constant bytes into heap buffers
+  // here, register them under the GV's name, and let the emitter
+  // resolve them just like any user-bound global. Buffer ownership is
+  // moved into the LightCodeHolder on success.
+  std::vector<std::unique_ptr<uint8_t[]>> dataBufs;
+  std::vector<std::unique_ptr<char[]>>    nameBufs;
+  size_t addedPriv = MaterializePrivateGlobals(*M, syms, dataBufs, nameBufs);
+  nsyms = syms.size();
+  (void)addedPriv;
   const ::light::GlobalSymbol *symsP = syms.empty() ? nullptr : syms.data();
 
-  EASYJIT_RT_LOG("[light] trying fn=%s policy=%s ngv=%zu triple=%s dl=%s\n",
-                 Name, PolicyName(policy), nsyms,
+  EASYJIT_RT_LOG("[light] trying fn=%s policy=%s ngv=%zu (priv+%zu) triple=%s dl=%s\n",
+                 Name, PolicyName(policy), nsyms, addedPriv,
                  M->getTargetTriple().c_str(),
                  M->getDataLayoutStr().c_str());
 
@@ -239,8 +362,10 @@ Report TryLightCompile(const char *Name,
 
   // Transfer ownership of the code page + module into the holder.
   const size_t pageSize = (size_t)sysconf(_SC_PAGESIZE);
-  std::unique_ptr<LLVMHolder> Holder(
-      new LightCodeHolder(code, pageSize, std::move(Ctx), std::move(M)));
+  auto *holderRaw = new LightCodeHolder(code, pageSize, std::move(Ctx), std::move(M));
+  holderRaw->dataBuffers_ = std::move(dataBufs);
+  holderRaw->nameBuffers_ = std::move(nameBufs);
+  std::unique_ptr<LLVMHolder> Holder(holderRaw);
 
   out.reset(new Function(code, std::move(Holder)));
   rep.outcome = Outcome::Succeeded;

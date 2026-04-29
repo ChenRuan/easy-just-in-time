@@ -98,6 +98,23 @@ static uint32_t encMovzHw64(unsigned rd, uint16_t imm16, unsigned hw) {
 static uint32_t encMovkHw64(unsigned rd, uint16_t imm16, unsigned hw) {
   return 0xF2800000u | ((hw & 3u) << 21) | ((uint32_t)imm16 << 5) | (rd & 0x1Fu);
 }
+// ADD (extended register), 64-bit. option ∈ {2=UXTW, 6=SXTW, 3=UXTX (no-op
+// for 64-bit), 7=SXTX (signed no-op for 64-bit)}; imm3 is the LSL applied
+// AFTER the extension, ∈ 0..4. Used to lower `base + idx * scale` where
+// base is a 64-bit GPR (x17), idx is a 32- or 64-bit GPR, and scale is a
+// power of two (idx is shifted by log2(scale)).
+//
+// Encoding ref: ARM ARM C6.2.5 ADD (extended register).
+//   sf=1 op=0 S=0 | 01011 001 | Rm | option(3) | imm3(3) | Rn | Rd
+static uint32_t encAddExtReg64(unsigned rd, unsigned rn, unsigned rm,
+                               unsigned option, unsigned imm3) {
+  return 0x8B200000u
+       | ((rm & 0x1Fu) << 16)
+       | ((option & 7u) << 13)
+       | ((imm3 & 7u) << 10)
+       | ((rn & 0x1Fu) << 5)
+       | (rd & 0x1Fu);
+}
 static uint32_t encMovReg(bool is64, unsigned rd, unsigned rm) {
   return encLogicReg(1, is64, rd, 31u, rm);
 }
@@ -185,14 +202,29 @@ struct Writer {
 };
 
 // A pointer-typed SSA value either lives in a GPR, is a (sp + offset)
-// expression (alloca + constant GEP chain), or is a fully-baked constant
+// expression (alloca + constant GEP chain), is a fully-baked constant
 // host address (e.g. `inttoptr i64 0xCAFE to ptr`, used by EasyJIT to
-// inline a snapshot/array base after specialization).
+// inline a snapshot/array base after specialization), or is an Absolute
+// base plus one runtime-variable scaled index (used for
+// `array[idx]`-style access into a host buffer whose base is known).
+//
+// AbsoluteScaledIndex is the minimum increment over Absolute that lets
+// us serve `getelementptr T, ptr <abs-base>, i64 %idx` patterns — the
+// shape EasyJIT emits when a `bind_global_array` / `bind_array` snapshot
+// is read with a runtime index. We deliberately keep this to ONE runtime
+// index per pointer and a power-of-two element scale so the emitter
+// can lower it with a single `ADD x17, x17, Wm/Xm, ext #shift`.
 struct PtrLoc {
-  enum Kind { InReg, StackRel, Absolute } kind = InReg;
+  enum Kind { InReg, StackRel, Absolute, AbsoluteScaledIndex } kind = InReg;
   unsigned reg = 0;     // for InReg
   int32_t  spOff = 0;   // for StackRel
-  uint64_t addr = 0;    // for Absolute  (host process address)
+  uint64_t addr = 0;    // for Absolute / AbsoluteScaledIndex (addr+const_off)
+
+  // For AbsoluteScaledIndex only:
+  const llvm::Value *idxValue = nullptr;  // non-constant index Value (i32 or i64)
+  uint32_t  scaleLog2 = 0;                // 0..3 (scale=1,2,4,8); only PoT
+  bool      idxIs64 = false;              // true: idx is i64; false: i32
+  bool      idxSigned = true;             // SXT vs UXT when extending i32 to i64
 };
 
 struct ICmpFusion {
@@ -243,13 +275,17 @@ static bool constGepOffset(const GEPOperator *GEP, const DataLayout &DL,
 
 // Recursively resolve a pointer Value into a PtrLoc, walking through
 // inttoptr ConstantExprs, constant- and instruction-form GEPs (constant
-// indices only), and bitcasts. Returns true on success.
+// indices only), and bitcasts. A GlobalVariable base whose host address
+// is registered in the EasyJIT globals table is also resolved, since
+// from the emitter's point of view it is just another absolute address
+// (round-9 generalisation: matches the ad-hoc external-global path the
+// load/store handlers used to do inline). Returns true on success.
 //
-// This is the engine that lets `inttoptr (i64 0xCAFE to ptr)` (used by
-// EasyJIT to bake the snapshot/global host address into the IR after
-// specialization) flow into a normal load/store as PtrLoc::Absolute,
-// possibly with constant offsets applied on top by inline ConstantExpr
-// GEPs (e.g. `getelementptr (%struct, ptr inttoptr(...), 0, 1)`).
+// This is the engine that lets `inttoptr (i64 0xCAFE to ptr)` and
+// `@__easy_snapshot_struct_array` (registered host address) flow into a
+// normal load/store as PtrLoc::Absolute, possibly with constant offsets
+// applied on top by inline ConstantExpr GEPs (e.g.
+// `getelementptr (%struct, ptr inttoptr(...), 0, 1)`).
 //
 // Endian: the resolved address is just a 64-bit integer baked into the
 // instruction stream via MOVZ/MOVK halfwords (positional, endian-neutral).
@@ -258,10 +294,31 @@ static bool constGepOffset(const GEPOperator *GEP, const DataLayout &DL,
 // same SCTLR_EL1.EE) → symmetric → correct on aarch64 and aarch64_be.
 static bool resolvePtrLocChain(const Value *P, const DataLayout &DL,
                                const std::unordered_map<const Value *, PtrLoc> &known,
+                               const GlobalSymbol *globals, size_t nglobals,
                                PtrLoc &out) {
+  auto resolveGV = [&](const GlobalVariable *GV) -> const void * {
+    if (!globals || nglobals == 0) return nullptr;
+    llvm::StringRef N = GV->getName();
+    for (size_t i = 0; i < nglobals; ++i) {
+      if (!globals[i].name) continue;
+      if (N == globals[i].name) return globals[i].address;
+    }
+    return nullptr;
+  };
+
   while (P) {
     auto it = known.find(P);
     if (it != known.end()) { out = it->second; return true; }
+
+    if (auto *GV = dyn_cast<GlobalVariable>(P)) {
+      if (const void *Host = resolveGV(GV)) {
+        out = PtrLoc{};
+        out.kind = PtrLoc::Absolute;
+        out.addr = (uint64_t)reinterpret_cast<uintptr_t>(Host);
+        return true;
+      }
+      return false;
+    }
 
     if (auto *CE = dyn_cast<ConstantExpr>(P)) {
       if (CE->getOpcode() == Instruction::IntToPtr) {
@@ -283,12 +340,18 @@ static bool resolvePtrLocChain(const Value *P, const DataLayout &DL,
       if (!GEP->accumulateConstantOffset(DL, off)) return false;
       if (off.getActiveBits() > 32) return false;
       PtrLoc base;
-      if (!resolvePtrLocChain(GEP->getPointerOperand(), DL, known, base))
+      if (!resolvePtrLocChain(GEP->getPointerOperand(), DL, known,
+                              globals, nglobals, base))
         return false;
       out = base;
       switch (out.kind) {
         case PtrLoc::StackRel: out.spOff += (int32_t)off.getSExtValue(); return true;
         case PtrLoc::Absolute: out.addr  += (uint64_t)(int64_t)off.getSExtValue(); return true;
+        case PtrLoc::AbsoluteScaledIndex:
+          // Layering a constant-offset GEP on top of an already-indexed
+          // base just shifts the constant part. Keeps idxValue/scale.
+          out.addr += (uint64_t)(int64_t)off.getSExtValue();
+          return true;
         case PtrLoc::InReg:    return false; // reg+const ptr arithmetic not yet supported
       }
       return false;
@@ -302,6 +365,150 @@ static bool resolvePtrLocChain(const Value *P, const DataLayout &DL,
     return false;
   }
   return false;
+}
+
+// Inspect a GEP and decide whether it can be expressed as
+//
+//   base_addr + const_off + idx * scale
+//
+// where base_addr is some PtrLoc::Absolute (after going through
+// resolvePtrLocChain), at most ONE GEP index is non-constant, all other
+// indices are constant, the non-constant index is an i32/i64 integer
+// Value, and the scale at the dynamic index is a power of two ≤ 8.
+//
+// On success fills `out` with kind=AbsoluteScaledIndex and returns true.
+// On any miss returns false (caller falls back / emits Unsupported).
+//
+// We use gep_type_iterator from llvm/IR/GetElementPtrTypeIterator.h-style
+// walking via GEP->getSourceElementType() + getIndexedType(). To keep
+// dependencies minimal we walk indices ourselves: at each step the
+// "indexed type" tells us the stride (struct member offset for struct,
+// element size for array/vector/pointer-element).
+static bool resolveDynScaledGep(const GEPOperator *GEP, const DataLayout &DL,
+                                const std::unordered_map<const Value *, PtrLoc> &known,
+                                const GlobalSymbol *globals, size_t nglobals,
+                                PtrLoc &out) {
+  // Resolve the base. The base must NOT itself already be an
+  // AbsoluteScaledIndex (we only support one runtime index per pointer
+  // location). It must reduce to a flat Absolute address.
+  PtrLoc base;
+  if (!resolvePtrLocChain(GEP->getPointerOperand(), DL, known,
+                          globals, nglobals, base))
+    return false;
+  if (base.kind != PtrLoc::Absolute) return false;
+
+  Type *Cur = GEP->getSourceElementType();
+  // First index applies to the source element type as if it were an
+  // array. Subsequent indices walk into structs/arrays/vectors.
+  int64_t constOff = 0;
+  const Value *dynIdx = nullptr;
+  uint64_t dynScale = 0;
+
+  unsigned NumIdx = GEP->getNumIndices();
+  if (NumIdx == 0) return false;
+
+  for (unsigned i = 0; i < NumIdx; ++i) {
+    Value *Idx = GEP->getOperand(1 + i);
+    if (i == 0) {
+      // Stride = sizeof(SourceElementType).
+      uint64_t elemSize = DL.getTypeAllocSize(Cur);
+      if (auto *CI = dyn_cast<ConstantInt>(Idx)) {
+        constOff += (int64_t)CI->getSExtValue() * (int64_t)elemSize;
+      } else {
+        if (dynIdx) return false; // already have one runtime index
+        // Only PoT scale, ≤ 8.
+        if (elemSize == 0) return false;
+        if (elemSize & (elemSize - 1)) return false;
+        if (elemSize > 8) return false;
+        dynIdx = Idx;
+        dynScale = elemSize;
+      }
+      // After indexing into the source-element type as an array, the
+      // current type stays the same (index into outer array → element).
+      // For multi-index GEPs the next index walks INTO Cur.
+      continue;
+    }
+    // Subsequent indices walk into Cur.
+    if (auto *ST = dyn_cast<StructType>(Cur)) {
+      auto *CI = dyn_cast<ConstantInt>(Idx);
+      if (!CI) return false; // struct indices must be constant
+      const StructLayout *SL = DL.getStructLayout(ST);
+      uint64_t fi = CI->getZExtValue();
+      if (fi >= ST->getNumElements()) return false;
+      constOff += (int64_t)SL->getElementOffset((unsigned)fi);
+      Cur = ST->getElementType((unsigned)fi);
+      continue;
+    }
+    if (auto *AT = dyn_cast<ArrayType>(Cur)) {
+      uint64_t elemSize = DL.getTypeAllocSize(AT->getElementType());
+      if (auto *CI = dyn_cast<ConstantInt>(Idx)) {
+        constOff += (int64_t)CI->getSExtValue() * (int64_t)elemSize;
+      } else {
+        if (dynIdx) return false;
+        if (elemSize == 0) return false;
+        if (elemSize & (elemSize - 1)) return false;
+        if (elemSize > 8) return false;
+        dynIdx = Idx;
+        dynScale = elemSize;
+      }
+      Cur = AT->getElementType();
+      continue;
+    }
+    // Vector / scalable / other: out of scope.
+    return false;
+  }
+
+  if (!dynIdx) {
+    // No runtime index — caller should have used the const-offset path.
+    return false;
+  }
+
+  // Inspect the dynamic index. We accept i32 or i64. If it's a sext/zext
+  // from i32, look through it: the underlying GPR holds the i32 value
+  // (the cast in this emitter is a no-op alias), so we should emit
+  // SXTW/UXTW with that GPR. If it's already i64, use UXTX/SXTX (no-op
+  // for 64-bit) — pick UXTX for simplicity since the upper bits are
+  // already valid in a true i64 register.
+  bool idxIs64 = false;
+  bool idxSigned = true; // default: signed
+  const Value *idxV = dynIdx;
+  if (auto *Sx = dyn_cast<SExtInst>(idxV)) {
+    Value *Src = Sx->getOperand(0);
+    if (Src->getType()->isIntegerTy(32)) {
+      idxV = Src; idxIs64 = false; idxSigned = true;
+    } else if (Src->getType()->isIntegerTy(64)) {
+      idxV = Src; idxIs64 = true; idxSigned = true;
+    } else {
+      return false;
+    }
+  } else if (auto *Zx = dyn_cast<ZExtInst>(idxV)) {
+    Value *Src = Zx->getOperand(0);
+    if (Src->getType()->isIntegerTy(32)) {
+      idxV = Src; idxIs64 = false; idxSigned = false;
+    } else if (Src->getType()->isIntegerTy(64)) {
+      idxV = Src; idxIs64 = true; idxSigned = false;
+    } else {
+      return false;
+    }
+  } else {
+    Type *T = idxV->getType();
+    if (T->isIntegerTy(32))      { idxIs64 = false; idxSigned = true; }
+    else if (T->isIntegerTy(64)) { idxIs64 = true;  idxSigned = false; }
+    else return false;
+  }
+
+  // Build the result.
+  out = PtrLoc{};
+  out.kind       = PtrLoc::AbsoluteScaledIndex;
+  out.addr       = base.addr + (uint64_t)constOff;
+  out.idxValue   = idxV;
+  uint64_t s = dynScale;
+  unsigned log2 = 0;
+  while (s > 1) { s >>= 1; ++log2; }
+  out.scaleLog2  = log2;
+  out.idxIs64    = idxIs64;
+  out.idxSigned  = idxSigned;
+  return true;
 }
 
 } // namespace
@@ -488,7 +695,15 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         // inttoptr-ConstantExpr bases (PtrLoc::Absolute) and any chain of
         // constant-offset GEPs / bitcasts on top of them.
         PtrLoc loc;
-        if (resolvePtrLocChain(GEP, DL, ptrLoc, loc)) {
+        if (resolvePtrLocChain(GEP, DL, ptrLoc, globals, nglobals, loc)) {
+          ptrLoc[GEP] = loc;
+          continue;
+        }
+        // Last resort: dynamic-scaled GEP (one runtime index, PoT scale).
+        // This serves the `array[idx]` pattern where the array base is an
+        // absolute address (inttoptr or registered GlobalVariable).
+        if (resolveDynScaledGep(cast<GEPOperator>(GEP), DL, ptrLoc,
+                                globals, nglobals, loc)) {
           ptrLoc[GEP] = loc;
         }
         // Note: still no entry → load/store user will see the missing
@@ -501,7 +716,8 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         if (it != ptrLoc.end()) ptrLoc[BC] = it->second;
         else {
           PtrLoc loc;
-          if (resolvePtrLocChain(BC, DL, ptrLoc, loc)) ptrLoc[BC] = loc;
+          if (resolvePtrLocChain(BC, DL, ptrLoc, globals, nglobals, loc))
+            ptrLoc[BC] = loc;
         }
         continue;
       }
@@ -592,6 +808,31 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
     return true;
   };
 
+  // Helper: materialize the address of a PtrLoc::AbsoluteScaledIndex into
+  // x17 (final base register). Sequence:
+  //   MOVZ/MOVK x17, addr           (addr already includes any const_off)
+  //   ADD x17, x17, Wm/Xm, ext #log2(scale)
+  //
+  // ext is one of {UXTW=2, SXTW=6, UXTX=3} depending on idxIs64/idxSigned.
+  // For idxIs64=true we use UXTX (option=3) so a 64-bit register is taken
+  // as-is; sign of the value is irrelevant for the mod-2^64 add. For
+  // idxIs64=false we use SXTW or UXTW based on idxSigned, mirroring the
+  // sext/zext semantics of the IR's index-typing cast.
+  //
+  // Endian: addr → x17 path is MOVZ/MOVK halfwords (positional). The ADD
+  // operates on register values, not memory, so it is endian-neutral. The
+  // subsequent LDR/STR honours target data endian (handled by hardware).
+  auto materializeScaledAddrToX17 = [&](const PtrLoc &P) -> bool {
+    if (!materializeAddrToX17(P.addr)) return false;
+    unsigned idxReg;
+    if (!valueInReg(P.idxValue, P.idxIs64, idxReg)) return false;
+    unsigned option;
+    if (P.idxIs64)         option = 3; // UXTX (64-bit no-op)
+    else if (P.idxSigned)  option = 6; // SXTW
+    else                   option = 2; // UXTW
+    return W.emit(encAddExtReg64(17, 17, idxReg, option, P.scaleLog2));
+  };
+
   // Helper: emit a load from PtrLoc into reg rt, size in {2,3}.
   auto emitLoad = [&](PtrLoc base, unsigned size, unsigned rt) -> bool {
     if (base.kind == PtrLoc::StackRel) {
@@ -608,6 +849,10 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
       if (!materializeAddrToX17(base.addr)) return false;
       return W.emit(encLdrStrUI(true, size, rt, 17, 0));
     }
+    if (base.kind == PtrLoc::AbsoluteScaledIndex) {
+      if (!materializeScaledAddrToX17(base)) return false;
+      return W.emit(encLdrStrUI(true, size, rt, 17, 0));
+    }
     // InReg, offset=0 only (we don't currently track reg+offset).
     if (base.spOff != 0) return false;
     return W.emit(encLdrStrUI(true, size, rt, base.reg, 0));
@@ -620,6 +865,10 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
     }
     if (base.kind == PtrLoc::Absolute) {
       if (!materializeAddrToX17(base.addr)) return false;
+      return W.emit(encLdrStrUI(false, size, rt, 17, 0));
+    }
+    if (base.kind == PtrLoc::AbsoluteScaledIndex) {
+      if (!materializeScaledAddrToX17(base)) return false;
       return W.emit(encLdrStrUI(false, size, rt, 17, 0));
     }
     if (base.spOff != 0) return false;
@@ -847,7 +1096,11 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
           // host address of a snapshot/global into the IR after
           // specialization. (See resolvePtrLocChain doc-comment.)
           PtrLoc loc;
-          if (!resolvePtrLocChain(LI->getPointerOperand(), DL, ptrLoc, loc)) {
+          if (!resolvePtrLocChain(LI->getPointerOperand(), DL, ptrLoc,
+                                  globals, nglobals, loc) &&
+              !(isa<GEPOperator>(LI->getPointerOperand()) &&
+                resolveDynScaledGep(cast<GEPOperator>(LI->getPointerOperand()),
+                                    DL, ptrLoc, globals, nglobals, loc))) {
             r.status = Status::Unsupported; r.reason = "load ptr"; return r;
           }
           ptrLoc[LI->getPointerOperand()] = loc;
@@ -924,7 +1177,11 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         if (it == ptrLoc.end()) {
           // Last-chance resolver, mirrors the load side.
           PtrLoc loc;
-          if (!resolvePtrLocChain(SI->getPointerOperand(), DL, ptrLoc, loc)) {
+          if (!resolvePtrLocChain(SI->getPointerOperand(), DL, ptrLoc,
+                                  globals, nglobals, loc) &&
+              !(isa<GEPOperator>(SI->getPointerOperand()) &&
+                resolveDynScaledGep(cast<GEPOperator>(SI->getPointerOperand()),
+                                    DL, ptrLoc, globals, nglobals, loc))) {
             r.status = Status::Unsupported; r.reason = "store ptr"; return r;
           }
           ptrLoc[SI->getPointerOperand()] = loc;
