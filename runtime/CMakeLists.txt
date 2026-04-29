@@ -25,20 +25,20 @@ target_compile_definitions(EasyJitRuntime PRIVATE
   EASYJIT_USE_CUSTOM_NEW_DELETE=$<IF:$<BOOL:${EASYJIT_USE_CUSTOM_NEW_DELETE}>,1,0>)
 
 llvm_config(EasyJitRuntime
+  analysis
+  bitreader
+  bitwriter
   core
   codegen
-  interpreter
-  support
-  mcjit
+  instcombine
+  ipo
+  linker
   native
   nativecodegen
-  executionengine
-  passes
-  objcarcopts
-  jitlink
   orcjit
-  orcshared
-  orctargetprocess)
+  scalaropts
+  support
+  transformutils)
 
 
 if (EASY_JIT_RUNTIME_TYPE STREQUAL "STATIC")

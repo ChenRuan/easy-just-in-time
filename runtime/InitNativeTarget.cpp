@@ -1,8 +1,5 @@
 #include <llvm/Support/TargetSelect.h>
-
-#include <llvm/LinkAllIR.h>
-#include <llvm/LinkAllPasses.h>
-#include <llvm/ExecutionEngine/MCJIT.h>
+#include <llvm/Support/DynamicLibrary.h>
 
 using namespace llvm;
 

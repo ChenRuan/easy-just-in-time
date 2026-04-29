@@ -30,20 +30,20 @@ BUNDLE_LLVM_NEEDED_STATIC=0
 STATIC_LIBUNWIND=0
 STRIP_DEBUG=0
 LLVM_COMPONENTS=(
+  analysis
+  bitreader
+  bitwriter
   core
   codegen
-  interpreter
-  support
-  mcjit
+  instcombine
+  ipo
+  linker
   native
   nativecodegen
-  executionengine
-  passes
-  objcarcopts
-  jitlink
   orcjit
-  orcshared
-  orctargetprocess
+  scalaropts
+  support
+  transformutils
 )
 
 usage() {
