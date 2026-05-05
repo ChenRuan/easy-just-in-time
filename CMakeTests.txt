@@ -14,6 +14,9 @@ add_custom_target(check
 if (TARGET check-light-endian)
   add_dependencies(check check-light-endian)
 endif()
+if (TARGET check-light-fp)
+  add_dependencies(check check-light-fp)
+endif()
 
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/tests/lit.cfg.in" "${CMAKE_CURRENT_BINARY_DIR}/tests/lit.cfg")
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/tests/doc/lit.cfg.in" "${CMAKE_CURRENT_BINARY_DIR}/tests/doc/lit.cfg")

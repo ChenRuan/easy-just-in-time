@@ -143,4 +143,26 @@ if (EASYJIT_ENABLE_LIGHT_BACKEND)
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running light backend endian/triple parity test"
     VERBATIM)
+
+  # FP capability test — covers the round-8f f32 arithmetic / fcmp +
+  # branch / fcmp + select paths AND the round-8g hardening of fcmp
+  # deferred-operand lifetime (stale-S31 reproducer). On AArch64 hosts
+  # the emitted code is mmap+executed; on non-AArch64 hosts only the
+  # emit step + opcode-mask coverage guards run, which is still useful
+  # cross-build coverage.
+  add_executable(light_fp_ops_test
+    ${CMAKE_SOURCE_DIR}/light_codegen/test_fp_ops.cpp
+    ${CMAKE_SOURCE_DIR}/light_codegen/light_aarch64.cpp)
+  target_include_directories(light_fp_ops_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/light_codegen)
+  llvm_config(light_fp_ops_test core support)
+  set_target_properties(light_fp_ops_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+  add_custom_target(check-light-fp
+    COMMAND $<TARGET_FILE:light_fp_ops_test>
+    DEPENDS light_fp_ops_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Running light backend f32 ops test"
+    VERBATIM)
 endif()

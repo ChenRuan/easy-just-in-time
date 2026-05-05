@@ -120,17 +120,25 @@ final-mile claim is deferred to a target-machine validation pass.
   single FP binop being unmaterialized `ConstantFP` is rejected
   ("fp binop both ops are scratch consts") because they would both
   land in `s31`.
-- Scalar single-precision ordered comparisons (round 8f), fused into the
-  immediately-following conditional branch or `select`. Supported
-  predicates: `FCMP_OEQ` (EQ), `FCMP_OGT` (GT), `FCMP_OGE` (GE),
-  `FCMP_OLT` (MI — *not* AArch64 LT, which fires on NaN since V==1
-  inverts N), `FCMP_OLE` (LS). Unordered predicates and `FCMP_ONE`
-  are intentionally rejected — see Known Unsupported Areas.
+- Scalar single-precision ordered comparisons (round 8f, hardened in
+  round 8g), fused into the immediately-following conditional branch
+  or `select`. Supported predicates: `FCMP_OEQ` (EQ), `FCMP_OGT` (GT),
+  `FCMP_OGE` (GE), `FCMP_OLT` (MI — *not* AArch64 LT, which fires on
+  NaN since V==1 inverts N), `FCMP_OLE` (LS). Unordered predicates
+  and `FCMP_ONE` are intentionally rejected — see Known Unsupported
+  Areas. Round 8g hardening: fcmp operands are *not* materialized at
+  the FCmp node; the consumer (br/select) calls `valueInFpReg` for
+  both operands immediately before emitting `FCMP`. This guarantees
+  the `s31` scratch is fresh, even if any FP-constant materialization
+  occurs between the FCmp and its consumer (e.g. an intervening
+  `%t = fadd float %x, 2.0` no longer corrupts the FCMP RHS).
 - `select` with float result type, driven by either an icmp or an
   ordered fcmp (round 8f).
-- `ret float` of an SSA float value already materialized in an
-  FP register (round 8f). The result is moved to `s0` via
-  `FMOV s0, sN` if not already there.
+- `ret float` of either an SSA float value already in an FP register
+  (FMOV S0, Sn) **or** a `ConstantFP` directly (round 8g). Constants
+  are materialized straight into `s0` via the shared
+  `materializeFpConstToReg` helper: FMOV-imm fast path for `0.0f` and
+  `2.0f`, otherwise MOVZ/MOVK on `w16` + `FMOV s0, w16`.
 - `fptosi float -> i32`.
 - `sext/zext/trunc` over integer widths used by current tests.
 
@@ -148,11 +156,14 @@ final-mile claim is deferred to a target-machine validation pass.
   encoding; emitting it correctly would require either two branches or
   a `CCMP` chain. Frontends should canonicalize to `!FCMP_UEQ` ahead of
   the light backend or accept rejection.
-- `ret` of a `ConstantFP` directly (no SSA producer). Frontends almost
-  always materialize the constant first; supporting this would require
-  reordering helpers in `light_aarch64.cpp` (lambda-ordering issue).
+- `ret` of a `ConstantFP` directly is now supported (round 8g) for
+  `float`. `double` / `f64` constant returns remain unsupported with
+  the rest of the f64 family.
 - An FP binop or FCmp where *both* operands are unmaterialized
-  `ConstantFP` (`s31` scratch clobber).
+  `ConstantFP` (`s31` scratch clobber). The FCmp pre-flight check
+  catches this at the FCmp node (reason `"fcmp both ops are scratch
+  consts"`); the binop check stays at the binop site (reason `"fp
+  binop both ops are scratch consts"`).
 - Stack-passed arguments beyond the first eight integer/pointer or float
   argument registers.
 - Register spilling under high pressure.
@@ -201,4 +212,21 @@ one MOVK opcode word in the LE stream as a coverage guard, so any
 future change that silently bypasses the wide-immediate path will be
 caught here. (MOVZ/MOVK halfwords are also exercised independently by
 the absolute-address path used for snapshot bases.)
+
+A second standalone target `light_fp_ops_test` covers the round-8f
+f32 capability extension (fadd/fsub/fmul/fdiv, ordered fcmp +
+branch/select on float result, `ret` of an SSA float or a
+`ConstantFP`) AND the round-8g hardening of fcmp deferred-operand
+lifetime (a dedicated reproducer asserts the FCMP RHS does not get
+clobbered by an intervening FP-constant materialization). The test
+includes opcode-mask coverage guards (`FADD-S` / `FSUB-S` / `FMUL-S`
+/ `FDIV-S` / `FCMP-S`) that run on any host, plus full
+`mmap`+execute correctness on AArch64 hosts.
+
+Run it directly:
+
+    cmake --build <build-dir> --target check-light-fp
+
+Like `check-light-endian`, it is pulled in automatically by the
+top-level `check` target when the light backend is enabled.
 

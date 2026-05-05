@@ -340,8 +340,14 @@ static int asImm12(const Value *V) {
 struct FCmpFusion {
   const FCmpInst *I = nullptr;
   CmpInst::Predicate pred = CmpInst::FCMP_OEQ;
-  unsigned lhsReg = 0;
-  unsigned rhsReg = 0;
+  // Operands are stored as IR Values (NOT pre-materialized FP regs) so
+  // that any FP-constant materialization that happens *between* the
+  // FCmp and its consumer (br/select) cannot clobber the S31 scratch
+  // slot used by `valueInFpReg`. The consumer materializes lhs/rhs
+  // immediately before emitting FCMP, when we know the scratch is
+  // fresh. Round 8g hardening — see LightBackend_LIMITATIONS.md.
+  const Value *lhs = nullptr;
+  const Value *rhs = nullptr;
 };
 
 // Translate an ordered LLVM FCmp predicate to an AArch64 condition code
@@ -936,22 +942,48 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
     return true;
   };
 
+  // Materialize an `f32` ConstantFP into the destination FP register
+  // `rd`. Fast paths for 0.0f and 2.0f use FMOV-imm; everything else
+  // goes through `MOVZ Wx16,#lo (+ MOVK Wx16,#hi,lsl#16)` followed by
+  // `FMOV Sd, W16`. Defined here (above `epilogueRet`) so both
+  // `epilogueRet` (for `ret <ConstantFP>`) and `valueInFpReg` can
+  // share it. Returns false on encode/buffer failure or non-IEEEsingle
+  // semantics.
+  auto materializeFpConstToReg = [&](const ConstantFP *CFP,
+                                     unsigned rd) -> bool {
+    const APFloat &APF = CFP->getValueAPF();
+    if (&APF.getSemantics() != &APFloat::IEEEsingle()) return false;
+    if (APF.isZero()) return W.emit(encFmovZeroS(rd));
+    bool losesInfo = false;
+    APFloat V2(APF);
+    V2.convert(APFloat::IEEEsingle(), APFloat::rmNearestTiesToEven,
+               &losesInfo);
+    if (!losesInfo && V2.convertToFloat() == 2.0f)
+      return W.emit(encFmovImm2S(rd));
+    uint32_t raw = (uint32_t)APF.bitcastToAPInt().getZExtValue();
+    if (!W.emit(encMovz16(false, 16, (uint16_t)(raw & 0xFFFFu)))) return false;
+    uint16_t hi = (uint16_t)(raw >> 16);
+    if (hi && !W.emit(encMovkHw32(16, hi, 1))) return false;
+    return W.emit(encFmovSFromW(rd, 16));
+  };
+
   auto epilogueRet = [&](const Value *retVal) -> bool {
     if (retVal) {
-      // Float return — place the value in S0 (FMOV S0, Sn) when it is
-      // already in an FP register from earlier lowering. ConstantFP
-      // returns are intentionally NOT handled here: they are rare in
-      // practice (the frontend typically materializes the constant
-      // first and then returns the SSA value), and supporting them
-      // would require reaching forward to the `valueInFpReg` lambda
-      // which is declared later in this scope. If we ever want it,
-      // the cleanest fix is to move the helpers above this lambda
-      // — same approach used for integer constants in round 8d.
+      // Float return — place the value in S0. SSA values that already
+      // live in `fpRegOf` are moved with FMOV S0, Sn. ConstantFP
+      // returns are handled directly here (round 8g): we materialize
+      // the constant straight into S0 so callers like `ret float 1.5`
+      // work without going through an intermediate SSA producer.
       if (retVal->getType()->isFloatTy()) {
         auto itf = fpRegOf.find(retVal);
-        if (itf == fpRegOf.end()) return false;
-        if (itf->second != 0) {
-          if (!W.emit(encFmovRegS(0, itf->second))) return false;
+        if (itf != fpRegOf.end()) {
+          if (itf->second != 0) {
+            if (!W.emit(encFmovRegS(0, itf->second))) return false;
+          }
+        } else if (auto *CFP = dyn_cast<ConstantFP>(retVal)) {
+          if (!materializeFpConstToReg(CFP, 0)) return false;
+        } else {
+          return false;
         }
       } else {
       auto itr = regOf.find(retVal);
@@ -1004,28 +1036,12 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
     auto it = fpRegOf.find(V);
     if (it != fpRegOf.end()) { outReg = it->second; return true; }
     if (auto *CFP = dyn_cast<ConstantFP>(V)) {
-      const APFloat &APF = CFP->getValueAPF();
-      if (&APF.getSemantics() != &APFloat::IEEEsingle())
-        return false;
-      if (APF.isZero()) {
-        outReg = 31;
-        return W.emit(encFmovZeroS(outReg));
-      }
-      bool losesInfo = false;
-      APFloat V2(APF);
-      V2.convert(APFloat::IEEEsingle(), APFloat::rmNearestTiesToEven, &losesInfo);
-      if (!losesInfo && V2.convertToFloat() == 2.0f) {
-        outReg = 31;
-        return W.emit(encFmovImm2S(outReg));
-      }
-      uint32_t raw = (uint32_t)APF.bitcastToAPInt().getZExtValue();
+      // ConstantFP path always lands in the S31 scratch slot. Callers
+      // that need to mix two ConstantFPs in one operation (FCMP, FP
+      // binop) are responsible for detecting the rn==rm==31 collision
+      // and rejecting it with a clear reason.
       outReg = 31;
-      if (!W.emit(encMovz16(false, 16, (uint16_t)(raw & 0xFFFFu))))
-        return false;
-      uint16_t hi = (uint16_t)(raw >> 16);
-      if (hi && !W.emit(encMovkHw32(16, hi, 1)))
-        return false;
-      return W.emit(encFmovSFromW(outReg, 16));
+      return materializeFpConstToReg(CFP, outReg);
     }
     return false;
   };
@@ -1607,12 +1623,18 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         continue;
       }
 
-      // fcmp — record, fuse with following br/select. Only scalar f32 is
-      // supported in this round; double / vector / NaN-sensitive
+      // fcmp — record, fuse with following br/select. Only scalar f32
+      // is supported in this round; double / vector / NaN-sensitive
       // unordered predicates and ONE are rejected with "fcmp predicate"
-      // / "fcmp shape". We defer the FCMP emit to the consumer (same
-      // pattern as integer pendingCmp) since none of the instructions
-      // we may emit between an FCmp and its branch/select clobber NZCV.
+      // / "fcmp shape".
+      //
+      // IMPORTANT (round 8g): we do NOT materialize the operands here.
+      // If we did, an intervening instruction that materializes another
+      // ConstantFP (e.g. `%t = fadd float %x, 2.0` between this fcmp
+      // and its consumer) would clobber the S31 scratch slot, and the
+      // deferred FCMP would compare against a stale value. Instead we
+      // record the IR Values and let the consumer call `valueInFpReg`
+      // immediately before emitting FCMP, when the scratch is fresh.
       if (auto *FC = dyn_cast<FCmpInst>(&I)) {
         if (!FC->getOperand(0)->getType()->isFloatTy() ||
             !FC->getOperand(1)->getType()->isFloatTy()) {
@@ -1622,24 +1644,23 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         if (condCheck == 0xFFu) {
           r.status = Status::Unsupported; r.reason = "fcmp predicate"; return r;
         }
-        unsigned rn, rm;
-        if (!valueInFpReg(FC->getOperand(0), rn)) {
-          r.status = Status::Unsupported; r.reason = "fcmp lhs"; return r;
-        }
-        if (!valueInFpReg(FC->getOperand(1), rm)) {
-          r.status = Status::Unsupported; r.reason = "fcmp rhs"; return r;
-        }
-        if (rn == 31 && rm == 31) {
-          // Both operands materialized through the S31 scratch, so the
-          // first is already clobbered. Constant-fold or restructure.
+        // Pre-flight scratch-collision check: if BOTH operands are raw
+        // ConstantFPs (no SSA producer), they would both materialize
+        // through S31 at the consumer. Reject early with a clear
+        // reason; the frontend would normally constant-fold this.
+        const Value *L = FC->getOperand(0);
+        const Value *R = FC->getOperand(1);
+        bool lhsIsConst = isa<ConstantFP>(L) && !fpRegOf.count(L);
+        bool rhsIsConst = isa<ConstantFP>(R) && !fpRegOf.count(R);
+        if (lhsIsConst && rhsIsConst) {
           r.status = Status::Unsupported;
           r.reason = "fcmp both ops are scratch consts";
           return r;
         }
         pendingFCmp.I = FC;
         pendingFCmp.pred = FC->getPredicate();
-        pendingFCmp.lhsReg = rn;
-        pendingFCmp.rhsReg = rm;
+        pendingFCmp.lhs = L;
+        pendingFCmp.rhs = R;
         continue;
       }
       
@@ -1677,7 +1698,23 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         // emit CMP / FCMP based on which compare drives this select.
         unsigned cond;
         if (isFcmp) {
-          if (!W.emit(encFcmpS(pendingFCmp.lhsReg, pendingFCmp.rhsReg))) {
+          // Round 8g: materialize fcmp operands HERE, not at the FCmp
+          // node. Any intervening FP-constant materialization may have
+          // clobbered S31 since the FCmp; redoing the materialization
+          // immediately before FCMP guarantees a fresh scratch.
+          unsigned rn, rm;
+          if (!valueInFpReg(pendingFCmp.lhs, rn)) {
+            r.status = Status::Unsupported; r.reason = "fcmp lhs"; return r;
+          }
+          if (!valueInFpReg(pendingFCmp.rhs, rm)) {
+            r.status = Status::Unsupported; r.reason = "fcmp rhs"; return r;
+          }
+          if (rn == 31 && rm == 31) {
+            r.status = Status::Unsupported;
+            r.reason = "fcmp both ops are scratch consts";
+            return r;
+          }
+          if (!W.emit(encFcmpS(rn, rm))) {
             r.status = Status::TooLarge; return r;
           }
           cond = fcmpToCond(pendingFCmp.pred);
@@ -1985,7 +2022,22 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         }
         // emit CMP / FCMP.
         if (brIsFcmp) {
-          if (!W.emit(encFcmpS(pendingFCmp.lhsReg, pendingFCmp.rhsReg))) {
+          // Round 8g: materialize fcmp operands HERE so we use a fresh
+          // S31 scratch even if intervening FP-constant materialization
+          // happened between the FCmp and this branch.
+          unsigned rn, rm;
+          if (!valueInFpReg(pendingFCmp.lhs, rn)) {
+            r.status = Status::Unsupported; r.reason = "fcmp lhs"; return r;
+          }
+          if (!valueInFpReg(pendingFCmp.rhs, rm)) {
+            r.status = Status::Unsupported; r.reason = "fcmp rhs"; return r;
+          }
+          if (rn == 31 && rm == 31) {
+            r.status = Status::Unsupported;
+            r.reason = "fcmp both ops are scratch consts";
+            return r;
+          }
+          if (!W.emit(encFcmpS(rn, rm))) {
             r.status=Status::TooLarge; return r;
           }
         } else if (pendingCmp.rhsImm >= 0) {
