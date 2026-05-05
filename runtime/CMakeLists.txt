@@ -207,4 +207,51 @@ if (EASYJIT_ENABLE_LIGHT_BACKEND)
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running light backend dynamic-GEP test"
     VERBATIM)
+
+  # Optional aarch64_be user-mode smoke. This does not need a BE sysroot:
+  # the test is a freestanding static BE ELF assembled from explicit
+  # Writer::emit-style instruction bytes, then run under qemu-aarch64_be.
+  set(EASYJIT_QEMU_AARCH64_BE "" CACHE FILEPATH
+      "Path to qemu-aarch64_be or qemu-aarch64_be-static for optional BE smoke")
+  if (NOT EASYJIT_QEMU_AARCH64_BE)
+    find_program(EASYJIT_QEMU_AARCH64_BE
+      NAMES qemu-aarch64_be-static qemu-aarch64_be
+      HINTS /tmp/easyjit-qemu-user/root/usr/bin)
+  endif()
+  find_program(EASYJIT_LIGHT_BE_CLANG
+    NAMES clang
+    HINTS ${LLVM_TOOLS_BINARY_DIR})
+  find_program(EASYJIT_LIGHT_BE_LLD
+    NAMES ld.lld)
+  if (EASYJIT_QEMU_AARCH64_BE AND EXISTS ${EASYJIT_QEMU_AARCH64_BE}
+      AND EASYJIT_LIGHT_BE_CLANG AND EASYJIT_LIGHT_BE_LLD)
+    set(_easyjit_be_smoke ${CMAKE_BINARY_DIR}/bin/light_be_smoke)
+    add_custom_command(
+      OUTPUT ${_easyjit_be_smoke}
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/bin
+      COMMAND ${EASYJIT_LIGHT_BE_CLANG}
+              --target=aarch64_be-linux-gnu
+              -fuse-ld=lld
+              -nostdlib
+              -static
+              ${CMAKE_SOURCE_DIR}/light_codegen/test_be_smoke.S
+              -o ${_easyjit_be_smoke}
+      DEPENDS ${CMAKE_SOURCE_DIR}/light_codegen/test_be_smoke.S
+      COMMENT "Building freestanding aarch64_be light backend smoke"
+      VERBATIM)
+    add_custom_target(light_be_smoke_binary DEPENDS ${_easyjit_be_smoke})
+    add_custom_target(check-light-be-smoke
+      COMMAND ${EASYJIT_QEMU_AARCH64_BE} ${_easyjit_be_smoke}
+      DEPENDS light_be_smoke_binary
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+      COMMENT "Running qemu-user aarch64_be light backend smoke"
+      VERBATIM)
+  else()
+    add_custom_target(check-light-be-smoke
+      COMMAND ${CMAKE_COMMAND} -E echo
+              "Skipping check-light-be-smoke: need qemu-aarch64_be, clang, and ld.lld"
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+      COMMENT "Skipping optional qemu-user aarch64_be smoke"
+      VERBATIM)
+  endif()
 endif()

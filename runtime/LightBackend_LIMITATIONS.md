@@ -375,3 +375,22 @@ exercised. Run it directly:
 It is also pulled in automatically by the top-level `check` target
 when the light backend is enabled.
 
+A fifth optional target `check-light-be-smoke` builds a freestanding
+static `aarch64_be` ELF from `light_codegen/test_be_smoke.S` and runs
+it under `qemu-aarch64_be` or `qemu-aarch64_be-static` when one is
+available. This smoke test does not require an `aarch64_be` libc or
+sysroot: the BE ELF uses Linux `exit` directly, and the test routines
+inside it are encoded with explicit `Writer::emit`-style little-endian
+instruction bytes. It validates the most endian-sensitive runtime
+paths under QEMU user mode: `LDR W`, `LDRH`, `STR W`, `LDR S` +
+`FMOV W,S`, `LDR D` + `FMOV X,D`, `MOVZ/MOVK` + `FMOV` for f32/f64
+bit patterns, and an 8-byte `LDR X` / `STR X` memcpy-like copy. Run it
+directly:
+
+    cmake --build <build-dir> --target check-light-be-smoke
+
+If no suitable QEMU binary, clang, or `ld.lld` is found, the target
+prints a skip message and succeeds so normal local `check` remains
+portable. Passing this smoke is stronger than emit-time parity, but it
+is still QEMU user-mode coverage rather than execution on real
+`aarch64_be` silicon.
