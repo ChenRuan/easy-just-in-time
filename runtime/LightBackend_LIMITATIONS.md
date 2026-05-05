@@ -25,6 +25,48 @@ instead.
 When fallback is used and `EASYJIT_LIGHT_VERBOSE` is non-zero, the runtime prints
 the light-backend rejection reason to stderr.
 
+## Currently Supported Triples
+
+The light backend's triple gate (`light::emit`) accepts:
+
+- `aarch64-*`            — AArch64 LP64 little-endian.
+- `aarch64_be-*`         — AArch64 LP64 big-endian.
+- `arm64-*`              — Apple-style alias for AArch64 LP64 LE.
+
+It rejects with `Status::NotAarch64`:
+
+- `aarch64_32-*`, `arm64_32-*` — ILP32 AArch64 variants.
+- Anything else (`x86_64-*`, `riscv64-*`, ...).
+
+The status name `Status::NotAarch64LE` is preserved as a deprecated alias
+of `Status::NotAarch64` for source-level back-compat with rounds 7 and
+earlier; new code should match `NotAarch64`.
+
+### Endian model (round 8)
+
+- AArch64 instruction encoding is unconditionally little-endian (ARM ARM
+  B2.6.2). `Writer::emit` writes explicit LE bytes for every 32-bit
+  instruction word, so emission is correct on any host.
+- `LDR`/`STR` honour target data endian (SCTLR_EL1.EE). The light
+  backend always JIT-runs the code it produces in the same process, so
+  target data endian == host endian; producer and consumer of any data
+  buffer agree by construction.
+- `MOVZ`/`MOVK` halfwords address `hw` positions, not bytes, so
+  immediate materialization is endian-neutral.
+- Sub-word loads use `LDRB`/`LDRH`; sign extension is encoded explicitly
+  via `SBFM`, so signed sub-word fields work on both endians.
+- `MaterializePrivateGlobals` (in `runtime/LightBackend.cpp`) reifies
+  PrivateLinkage `ConstantData*` initializers into heap buffers using
+  host byte order (`memcpy` of the underlying value). The `LDR` reading
+  those bytes uses target data endian, which equals host endian, so
+  the bytes line up on both `aarch64-*` and `aarch64_be-*`.
+
+The triple-acceptance and instruction-byte-stream parity claims are
+checked in-tree by `light_endian_parity_test` (built whenever
+`EASYJIT_ENABLE_LIGHT_BACKEND=ON`). End-to-end execution on a real
+`aarch64_be` machine is **not** part of the regression set; that
+final-mile claim is deferred to a target-machine validation pass.
+
 ## Currently Supported IR Shape
 
 - AArch64/aarch64_be target only.
@@ -57,6 +99,12 @@ the light-backend rejection reason to stderr.
   dispatch that is not devirtualized, and non-trivial object lifetime code.
 - Serialization fallback: deserialized bitcode has no original function pointer
   to call, so unsupported deserialized modules still throw.
+- Live execution on a real `aarch64_be` machine is not part of the
+  in-tree regression set. The triple gate, encoder LE byte stream, and
+  emit-time output parity are checked by `light_endian_parity_test`,
+  but the runtime side has never been exercised on a BE CPU; if the
+  light backend is ported to BE silicon this should be the first
+  targeted validation pass.
 
 ## Validation Notes
 
@@ -72,4 +120,8 @@ The light-only C API regression set currently covers:
 - `pointer_field_snapshot`
 - `struct_snapshot`
 - `wireless_beamform`
+
+In addition, `light_endian_parity_test` (built under
+`EASYJIT_ENABLE_LIGHT_BACKEND=ON`) covers the triple gate and the
+emit-time LE / BE / arm64 instruction-byte-stream parity claim.
 

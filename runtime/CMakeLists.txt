@@ -114,3 +114,20 @@ endif()
 install(TARGETS EasyJitRuntime 
         ARCHIVE DESTINATION lib
         LIBRARY DESTINATION lib)
+
+# Optional: a tiny standalone unit test that calls light::emit directly
+# under several triples (aarch64-*, aarch64_be-*, arm64-*, plus the
+# rejected ILP32 / non-aarch64 triples). It does not depend on
+# EasyJitRuntime, only on light_aarch64.cpp + LLVM IR; lets us check the
+# round-8 BE-enablement claim without building the whole pass plugin.
+# Built only when the light backend itself is enabled.
+if (EASYJIT_ENABLE_LIGHT_BACKEND)
+  add_executable(light_endian_parity_test
+    ${CMAKE_SOURCE_DIR}/light_codegen/test_endian_parity.cpp
+    ${CMAKE_SOURCE_DIR}/light_codegen/light_aarch64.cpp)
+  target_include_directories(light_endian_parity_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/light_codegen)
+  llvm_config(light_endian_parity_test core support)
+  set_target_properties(light_endian_parity_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+endif()

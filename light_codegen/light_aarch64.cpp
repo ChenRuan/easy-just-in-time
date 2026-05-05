@@ -599,12 +599,12 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
     isBE = true;
   } else if (Triple.rfind("aarch64_32", 0) == 0 ||
              Triple.rfind("arm64_32", 0)   == 0) {
-    r.status = Status::NotAarch64LE;
+    r.status = Status::NotAarch64;
     r.reason = "ILP32 aarch64 variants not supported";
     return r;
   } else if (Triple.rfind("aarch64", 0) != 0 &&
              Triple.rfind("arm64", 0)   != 0) {
-    r.status = Status::NotAarch64LE;
+    r.status = Status::NotAarch64;
     r.reason = "triple is not aarch64*";
     return r;
   }

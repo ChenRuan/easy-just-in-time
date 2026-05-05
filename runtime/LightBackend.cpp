@@ -200,15 +200,21 @@ static size_t MaterializePrivateGlobals(llvm::Module &M,
     } else if (isa<ConstantAggregateZero>(Init)) {
       // buf is already zero-initialised.
     } else if (auto *CI = dyn_cast<ConstantInt>(Init)) {
+      // Write the integer in HOST byte order. The reader is JIT'd code
+      // doing LDR with target data endian; in the light backend the JIT
+      // process always runs the code it produces (same SCTLR_EL1.EE),
+      // so target data endian == host endian. memcpy of a host uint64_t
+      // therefore lands the right byte pattern on both aarch64-* (LE
+      // host) and aarch64_be-* (BE host). The previous `(v >> i*8)`
+      // extraction was implicitly little-endian and would have placed
+      // bytes in the wrong order on a BE host.
       uint64_t v = CI->getZExtValue();
-      uint64_t bits = std::min<uint64_t>(sz * 8, 64);
-      for (uint64_t i = 0; i < (bits + 7) / 8; ++i)
-        buf[i] = (uint8_t)(v >> (i * 8));
-      // ConstantInt scalar init is rare (real array data uses
-      // ConstantDataSequential). The host C++ producer and host C++
-      // reader are in the same process and same endian, so no byte
-      // swap is needed — even on aarch64_be the SCTLR_EL1.EE-controlled
-      // LDR sees the same bytes the host stored.
+      uint64_t nbytes = std::min<uint64_t>(sz, 8);
+      std::memcpy(buf.get(), &v, (size_t)nbytes);
+      // Trailing alloc-size padding (if sz > 8) is already zero from
+      // value-init. ConstantInt scalar init is rare in practice (real
+      // array data uses ConstantDataSequential, which already stores
+      // host-endian raw bytes — see the CDS branch above).
     } else {
       continue; // structurally interesting initialiser; skip.
     }

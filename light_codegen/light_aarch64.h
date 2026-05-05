@@ -35,7 +35,18 @@ namespace llvm { class Function; }
 
 namespace light {
 
-enum class Status { Ok, Unsupported, TooLarge, NotAarch64LE };
+// Return code for the light AArch64 emitter. `NotAarch64` covers any
+// triple the emitter refuses (non-aarch64* OR ILP32 aarch64_32/arm64_32).
+// Both `aarch64-*` and `aarch64_be-*` are accepted, so this status is NOT
+// an "endian rejection". `NotAarch64LE` is kept as a deprecated alias for
+// source-level back compat with rounds 7 and earlier.
+enum class Status {
+  Ok,
+  Unsupported,
+  TooLarge,
+  NotAarch64,
+  NotAarch64LE = NotAarch64,
+};
 
 struct Result {
   Status status = Status::Ok;
