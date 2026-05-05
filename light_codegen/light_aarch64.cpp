@@ -810,6 +810,42 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
 
   // For the retval-bearing ret, we need to know frameSize. Already have it.
 
+  // Helper: emit a MOVZ/MOVK chain that places a non-negative integer
+  // constant into Wrd (is64=false) or Xrd (is64=true). Halfword
+  // selection uses the positional `hw` field of MOVZ/MOVK (ARM ARM
+  // C6.2.193 / C6.2.194) — endian-neutral by construction. Negative
+  // values return false (no MOVN-style materialization yet); values
+  // that do not fit the requested width also return false.
+  //
+  // Encoding choice:
+  //   - 32-bit form: at most one MOVZ W,#lo + optional MOVK W,#hi,lsl#16.
+  //   - 64-bit form: MOVZ X,#hw0 + up to three MOVK X,#hwN,lsl#(N*16);
+  //     the leading MOVZ is always emitted (even if hw0==0) so the upper
+  //     halfwords start from a known zero state. This is at most 4
+  //     instructions for any 64-bit constant — small enough that we do
+  //     not bother with MOVZ-at-first-nonzero-halfword optimisations.
+  auto emitMovImm = [&](unsigned rd, bool is64, const APInt &AP) -> bool {
+    if (AP.isNegative()) return false;
+    uint64_t v = AP.getZExtValue();
+    if (!is64) {
+      if (AP.getActiveBits() > 32) return false;
+      uint16_t lo = (uint16_t)(v & 0xFFFFu);
+      uint16_t hi = (uint16_t)((v >> 16) & 0xFFFFu);
+      if (!W.emit(encMovz16(false, rd, lo))) return false;
+      if (hi && !W.emit(encMovkHw32(rd, hi, 1))) return false;
+      return true;
+    }
+    uint16_t hw0 = (uint16_t)(v        & 0xFFFFu);
+    uint16_t hw1 = (uint16_t)((v >> 16) & 0xFFFFu);
+    uint16_t hw2 = (uint16_t)((v >> 32) & 0xFFFFu);
+    uint16_t hw3 = (uint16_t)((v >> 48) & 0xFFFFu);
+    if (!W.emit(encMovzHw64(rd, hw0, 0))) return false;
+    if (hw1 && !W.emit(encMovkHw64(rd, hw1, 1))) return false;
+    if (hw2 && !W.emit(encMovkHw64(rd, hw2, 2))) return false;
+    if (hw3 && !W.emit(encMovkHw64(rd, hw3, 3))) return false;
+    return true;
+  };
+
   auto epilogueRet = [&](const Value *retVal) -> bool {
     if (retVal) {
       auto itr = regOf.find(retVal);
@@ -819,10 +855,11 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
           if (!W.emit(encMovReg(is64, 0, itr->second))) return false;
         }
       } else if (auto *CI = dyn_cast<ConstantInt>(retVal)) {
-        if (CI->getValue().getActiveBits() > 16 || CI->getValue().isNegative())
-          return false;
+        // Materialize a non-negative integer return constant directly
+        // into x0/w0 via the shared MOVZ/MOVK helper above. Negative
+        // immediates still fail (no MOVN path yet).
         bool is64 = CI->getType()->isIntegerTy(64);
-        if (!W.emit(encMovz16(is64, 0, (uint16_t)CI->getZExtValue()))) return false;
+        if (!emitMovImm(0, is64, CI->getValue())) return false;
       } else {
         return false;
       }
@@ -833,14 +870,14 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
     return W.emit(kRet);
   };
 
-  // Helper: materialize a small immediate (≤16-bit, non-negative) into x16
-  // and return its reg number. Only used as a "slot" register; not tracked.
-  auto materializeImm16 = [&](const ConstantInt *CI, bool is64,
-                              unsigned &outReg) -> bool {
-    if (CI->getValue().isNegative() || CI->getValue().getActiveBits() > 16)
-      return false;
+  // Helper: materialize a non-negative integer immediate into x16/w16
+  // (the binop scratch slot). Width follows the binop request: i32 →
+  // up to 32-bit MOVZ+MOVK; i64 → up to 4-halfword MOVZ+MOVK chain.
+  // Negative values are still rejected (kept narrow; round-9 leftover).
+  auto materializeImmAny = [&](const ConstantInt *CI, bool is64,
+                               unsigned &outReg) -> bool {
     outReg = 16;
-    return W.emit(encMovz16(is64, 16, (uint16_t)CI->getZExtValue()));
+    return emitMovImm(16, is64, CI->getValue());
   };
 
   // Helper: get a value into a register (returns true on success). Uses x16
@@ -850,7 +887,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
     auto it = regOf.find(V);
     if (it != regOf.end()) { outReg = it->second; return true; }
     if (auto *CI = dyn_cast<ConstantInt>(V))
-      return materializeImm16(CI, is64, outReg);
+      return materializeImmAny(CI, is64, outReg);
     return false;
   };
 
@@ -1178,7 +1215,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
                         int rd = assignReg(LI);
                         if (rd < 0) { r.status = Status::Unsupported; r.reason = "scratch OOM (load const global)"; return r; }
                         unsigned outReg;
-                        if (!materializeImm16(CE, bits==64, outReg)) {
+                        if (!materializeImmAny(CE, bits==64, outReg)) {
                           r.status = Status::Unsupported; r.reason = "global const too large"; return r;
                         }
                         // if assignReg allocated a different reg, move into it
@@ -1205,7 +1242,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
                   int rd = assignReg(LI);
                   if (rd < 0) { r.status = Status::Unsupported; r.reason = "scratch OOM (load const global)"; return r; }
                   unsigned outReg;
-                  if (!materializeImm16(CE, bits==64, outReg)) {
+                  if (!materializeImmAny(CE, bits==64, outReg)) {
                     r.status = Status::Unsupported; r.reason = "global const too large"; return r;
                   }
                   if ((unsigned)rd != outReg) {

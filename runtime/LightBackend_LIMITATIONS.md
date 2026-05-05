@@ -77,6 +77,13 @@ final-mile claim is deferred to a target-machine validation pass.
 - `i8/i16/i32/i64` loads and stores.
 - `float` loads and stores.
 - Integer arithmetic: `add/sub/mul/and/or/xor/shl/lshr/ashr`.
+- Non-negative `i32` / `i64` integer constants used as binop RHS or as
+  the value of an integer `ret` are materialized through a generic
+  MOVZ + (optional) MOVK halfword chain (`emitMovImm` /
+  `materializeImmAny` in `light_codegen/light_aarch64.cpp`):
+  one MOVZ for `0..0xFFFF`; MOVZ + MOVK,lsl#16 for `0x10000..0xFFFFFFFF`;
+  up to four MOVZ/MOVK halfwords for full 64-bit constants. The 12-bit
+  immediate ADD/SUB fast path still wins when the constant fits.
 - Integer comparisons when fused into a following conditional branch.
 - Integer and float phi copies.
 - `llvm.memcpy` with constant size up to 32 bytes.
@@ -87,6 +94,12 @@ final-mile claim is deferred to a target-machine validation pass.
 ## Known Unsupported Areas
 
 - `double` / `f64` arithmetic and conversion.
+- Negative integer immediate materialization (no MOVN-style chain yet);
+  `emitMovImm` returns false for `APInt::isNegative()` constants and the
+  caller falls back to the generic backend. Sign-extending a small
+  positive constant into a 64-bit register followed by a binop also
+  isn't matched as a "small immediate" — it goes through the generic
+  path.
 - Vector IR.
 - Standalone floating-point `fadd`, `fsub`, `fmul`, `fdiv` when optimization
   does not lower the pattern to `llvm.fmuladd.f32`.
@@ -130,10 +143,13 @@ Run it directly:
     cmake --build <build-dir> --target check-light-endian
 
 It is also pulled in automatically by the top-level `check` target when
-the light backend is enabled. The test exercises LDR/LDRH/STR and the
-12-bit-immediate ADD path; it does not currently cover the >16-bit
-MOVZ+MOVK integer-constant materialization (the binop RHS materializer
-caps at 16 bits today — see `materializeImm16` in `light_aarch64.cpp`),
-though MOVZ/MOVK halfwords are still exercised by the absolute-address
-path used for snapshot bases.
+the light backend is enabled. The test exercises LDR/LDRH/STR, the
+12-bit-immediate ADD fast path, **and** a >16-bit constant ADD that
+forces the binop RHS through `materializeImmAny` →  `emitMovImm`,
+producing a real `MOVZ Wd,#lo` + `MOVK Wd,#hi,lsl #16` halfword chain
+in the byte stream. The test asserts presence of at least one MOVZ and
+one MOVK opcode word in the LE stream as a coverage guard, so any
+future change that silently bypasses the wide-immediate path will be
+caught here. (MOVZ/MOVK halfwords are also exercised independently by
+the absolute-address path used for snapshot bases.)
 

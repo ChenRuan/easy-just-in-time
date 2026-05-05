@@ -21,14 +21,17 @@
 //         endian == host endian → producer and consumer of any data
 //         buffer agree by construction.
 //
-// Scope note: the IR sample below specifically exercises LDR/LDRH/STR
-// and 12-bit-immediate ADD, which is what the binop fast path emits.
-// Wider integer constants would route through MOVZ+MOVK in
-// materializeImm16, but the binop RHS materializer currently caps at
-// 16 bits, so this test does not cover the >16-bit MOVZ/MOVK case
-// directly. The MOVZ/MOVK halfword encoding IS still exercised
-// indirectly elsewhere in the emitter (absolute-address resolution)
-// and remains positional/endian-neutral by ARM ARM C6.2.193.
+// Scope note: the IR sample below exercises LDR/LDRH/STR and the
+// 12-bit-immediate ADD fast path, AND deliberately includes a wider
+// constant (0x12345 — does not fit imm12 = 0xFFF) so that the binop
+// RHS routes through `materializeImmAny` → `emitMovImm`, producing a
+// real MOVZ + MOVK,lsl#16 halfword chain in the emitted stream. This
+// is what makes the parity claim non-trivial: MOVZ/MOVK use the
+// positional `hw` field (ARM ARM C6.2.193 / C6.2.194), so any LE/BE
+// divergence would necessarily come from either the triple gate or
+// the host-endian-agnostic `Writer::emit`. The test asserts presence
+// of at least one MOVZ and one MOVK opcode word in the LE stream as
+// a guard against the materializer being silently bypassed.
 //
 // What it does NOT prove:
 //   * That code emitted with the BE module actually runs correctly on a
@@ -59,15 +62,12 @@ namespace {
 //   - i32 store back to that pointer (STR Wt, [Xn, #imm12])
 //   - i16 load + zext (LDRH + ZExt no-op)
 //   - 12-bit immediate add (encAddSubImm: imm12 positional field)
+//   - >16-bit constant add — falls out of the imm12 fast path and
+//     routes through `materializeImmAny` → `emitMovImm`, producing
+//     MOVZ W16,#lo + MOVK W16,#hi,lsl#16 + ADD reg-reg. This is the
+//     halfword-positional encoding (ARM ARM C6.2.193 / C6.2.194) that
+//     the round-8 endian-parity claim hinges on.
 //   - i32 add reg-reg and ret
-//
-// Note: the current light backend's integer-binop RHS materialization
-// caps at 16-bit MOVZ (see `materializeImm16` in light_aarch64.cpp), and
-// values that fit in imm12 take the encAddSubImm fast path before that
-// even applies. So this test deliberately sticks to imm12-sized
-// constants. Wider integer constants (32-bit MOVZ+MOVK in a binop RHS)
-// are not currently supported by the emitter and would need a small
-// extension to `materializeImm16` before they could be exercised here.
 static std::unique_ptr<llvm::Module>
 BuildSampleModule(llvm::LLVMContext &C, const char *Triple, const char *DL) {
   using namespace llvm;
@@ -96,8 +96,13 @@ BuildSampleModule(llvm::LLVMContext &C, const char *Triple, const char *DL) {
   // 12-bit immediate add — exercises encAddSubImm (positional-imm12,
   // endian-neutral instruction encoding).
   Value *k   = B.CreateAdd(sum, B.getInt32(0x123), "k");
-  B.CreateAlignedStore(k, P, MaybeAlign(4));
-  B.CreateRet(k);
+  // Wide-immediate add — does NOT fit imm12 (max 0xFFF = 4095) so the
+  // binop RHS routes through valueInReg → materializeImmAny →
+  // emitMovImm, producing MOVZ W16,#0x2345 + MOVK W16,#0x1,lsl#16 +
+  // ADD reg-reg. This is the path round 8d wants endian-parity-tested.
+  Value *k2  = B.CreateAdd(k, B.getInt32(0x12345), "k2");
+  B.CreateAlignedStore(k2, P, MaybeAlign(4));
+  B.CreateRet(k2);
   return M;
 }
 
@@ -204,6 +209,48 @@ int main() {
       ++failures;
     } else {
       std::printf("OK: aarch64 vs arm64 byte streams identical\n");
+    }
+  }
+
+  // Coverage guard: the sample module includes a >16-bit ADD constant
+  // (0x12345) that must route through `materializeImmAny` →
+  // `emitMovImm` and produce at least one MOVZ + at least one MOVK
+  // halfword instruction in the LE stream. If a future change silently
+  // sidesteps this path (e.g. by folding the constant or by widening
+  // the imm12 fast path beyond what AArch64 actually supports), this
+  // test should fail loudly so the >16-bit MOVZ/MOVK encoding remains
+  // covered. Opcode masks per ARM ARM C6.2.193 / C6.2.194:
+  //   MOVZ (32/64-bit) : top 9 bits = 0b?10100101  → mask 0x7F800000,
+  //                                                  value 0x52800000
+  //   MOVK (32/64-bit) : top 9 bits = 0b?11100101  → mask 0x7F800000,
+  //                                                  value 0x72800000
+  // We intentionally accept both 32-bit (sf=0) and 64-bit (sf=1)
+  // forms — only the opcode family matters here.
+  if (!codeLE.empty()) {
+    if ((codeLE.size() % 4) != 0) {
+      std::printf("FAIL: code size %zu is not a multiple of 4\n",
+                  codeLE.size());
+      ++failures;
+    } else {
+      unsigned movzCount = 0, movkCount = 0;
+      for (size_t i = 0; i < codeLE.size(); i += 4) {
+        uint32_t w = (uint32_t)codeLE[i]
+                   | ((uint32_t)codeLE[i+1] << 8)
+                   | ((uint32_t)codeLE[i+2] << 16)
+                   | ((uint32_t)codeLE[i+3] << 24);
+        if ((w & 0x7F800000u) == 0x52800000u) ++movzCount;
+        if ((w & 0x7F800000u) == 0x72800000u) ++movkCount;
+      }
+      if (movzCount == 0 || movkCount == 0) {
+        std::printf("FAIL: expected MOVZ+MOVK in stream, got "
+                    "movz=%u movk=%u (the wide-immediate path was "
+                    "not exercised)\n", movzCount, movkCount);
+        ++failures;
+      } else {
+        std::printf("OK: stream contains MOVZ x%u + MOVK x%u "
+                    "(materializeImmAny exercised)\n",
+                    movzCount, movkCount);
+      }
     }
   }
 
