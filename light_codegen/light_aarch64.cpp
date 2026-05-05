@@ -204,6 +204,100 @@ static uint32_t encFcvtzsWS(unsigned rd, unsigned rn) {
 static uint32_t encFcvtzsWD(unsigned rd, unsigned rn) {
   return 0x1E780000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
 }
+// Round-8i: scalar FP<->int conversion family completed below.
+// Encoding template (ARM ARM C4-1, "Floating-point <-> integer
+// conversions"):
+//   sf [bit31] | 0011110 [30:24] | type [23:22] | 1 [21] |
+//   rmode [20:19] | opc [18:16] | 000000 [15:10] | Rn [9:5] | Rd [4:0]
+//
+//   FCVTZS:  rmode=11 opc=000   (signed truncate)
+//   FCVTZU:  rmode=11 opc=001   (unsigned truncate)
+//   SCVTF :  rmode=00 opc=010   (signed int -> FP)
+//   UCVTF :  rmode=00 opc=011   (unsigned int -> FP)
+//   FMOV  :  rmode=00 opc=110/111 (reinterpret int<->FP, no conversion)
+//
+// `type=00` selects the single-precision FP register class (S);
+// `type=01` selects double (D). `sf=0` selects the 32-bit GPR class
+// (W); `sf=1` selects the 64-bit class (X).
+//
+// FCVTZS Xd,Sn  (sf=1 type=00 rmode=11 opc=000)
+static uint32_t encFcvtzsXS(unsigned rd, unsigned rn) {
+  return 0x9E380000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+// FCVTZS Xd,Dn  (sf=1 type=01 rmode=11 opc=000)
+static uint32_t encFcvtzsXD(unsigned rd, unsigned rn) {
+  return 0x9E780000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+// FCVTZU Wd,Sn  (sf=0 type=00 rmode=11 opc=001)
+static uint32_t encFcvtzuWS(unsigned rd, unsigned rn) {
+  return 0x1E390000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+// FCVTZU Wd,Dn  (sf=0 type=01 rmode=11 opc=001)
+static uint32_t encFcvtzuWD(unsigned rd, unsigned rn) {
+  return 0x1E790000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+// FCVTZU Xd,Sn  (sf=1 type=00 rmode=11 opc=001)
+static uint32_t encFcvtzuXS(unsigned rd, unsigned rn) {
+  return 0x9E390000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+// FCVTZU Xd,Dn  (sf=1 type=01 rmode=11 opc=001)
+static uint32_t encFcvtzuXD(unsigned rd, unsigned rn) {
+  return 0x9E790000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+// SCVTF Sd,Wn  (sf=0 type=00 rmode=00 opc=010)
+static uint32_t encScvtfSW(unsigned rd, unsigned rn) {
+  return 0x1E220000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+// SCVTF Sd,Xn  (sf=1 type=00 rmode=00 opc=010)
+static uint32_t encScvtfSX(unsigned rd, unsigned rn) {
+  return 0x9E220000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+// SCVTF Dd,Wn  (sf=0 type=01 rmode=00 opc=010)
+static uint32_t encScvtfDW(unsigned rd, unsigned rn) {
+  return 0x1E620000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+// SCVTF Dd,Xn  (sf=1 type=01 rmode=00 opc=010)
+static uint32_t encScvtfDX(unsigned rd, unsigned rn) {
+  return 0x9E620000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+// UCVTF Sd,Wn  (sf=0 type=00 rmode=00 opc=011)
+static uint32_t encUcvtfSW(unsigned rd, unsigned rn) {
+  return 0x1E230000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+// UCVTF Sd,Xn  (sf=1 type=00 rmode=00 opc=011)
+static uint32_t encUcvtfSX(unsigned rd, unsigned rn) {
+  return 0x9E230000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+// UCVTF Dd,Wn  (sf=0 type=01 rmode=00 opc=011)
+static uint32_t encUcvtfDW(unsigned rd, unsigned rn) {
+  return 0x1E630000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+// UCVTF Dd,Xn  (sf=1 type=01 rmode=00 opc=011)
+static uint32_t encUcvtfDX(unsigned rd, unsigned rn) {
+  return 0x9E630000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+// FCVT — change FP precision (ARM ARM C6.2.62).
+// Encoding: 0001 1110 0 type[1] 1 0001 opc[2] 10000 Rn Rd
+//   FCVT Dd,Sn  (single -> double): type=00 opc=01 → 0x1E22_C000
+//   FCVT Sd,Dn  (double -> single): type=01 opc=00 → 0x1E62_4000
+static uint32_t encFcvtDS(unsigned rd, unsigned rn) {
+  return 0x1E22C000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+static uint32_t encFcvtSD(unsigned rd, unsigned rn) {
+  return 0x1E624000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+// FMOV reinterpret (no value change), int <- FP.
+//   FMOV Wd,Sn  (sf=0 type=00 rmode=00 opc=110) → 0x1E26_0000
+//   FMOV Xd,Dn  (sf=1 type=01 rmode=00 opc=110) → 0x9E66_0000
+// (The reverse direction — FMOV Sd,Wn / FMOV Dd,Xn — already exists
+// as `encFmovSFromW` / `encFmovDFromX` since the ConstantFP path needs
+// them.)
+static uint32_t encFmovWFromS(unsigned rd, unsigned rn) {
+  return 0x1E260000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+static uint32_t encFmovXFromD(unsigned rd, unsigned rn) {
+  return 0x9E660000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
 static uint32_t encFmovImm2S(unsigned rd) {
   return 0x1E201000u | (rd & 0x1Fu);
 }
@@ -228,8 +322,8 @@ static uint32_t encFmovRegD(unsigned rd, unsigned rn) {
 static uint32_t encFmovDFromX(unsigned rd, unsigned rn) {
   return 0x9E670000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
 }
-// (FMOV Xd from Dn is not currently needed by any IR shape we lower,
-// so we don't define it. Add when fptoui/bitcast double->i64 lands.)
+// (FMOV Xd from Dn lives above as `encFmovXFromD`, used by both
+// bitcast double->i64 and fptoui-via-bitcast lowerings.)
 // Single-precision scalar FP arithmetic (ARM ARM C6.2.79..C6.2.82).
 // Encoding family: 0001_1110_0010_mmmmm_<op>_nnnnn_ddddd, type=00 → single.
 //   FADD: opc=001010 → 0x1E20_2800 base
@@ -1288,7 +1382,14 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
     for (const Instruction &I : BB) {
       // Skip instructions whose effect was already modeled in passes 0/2.
       if (isa<AllocaInst>(&I)) continue;
-      if (isa<BitCastInst>(&I)) continue;
+      // Pointer-shaped bitcasts have already been folded into ptrLoc in
+      // pass 2 — skip them here. FP/int bitcasts (round 8i: float<->i32,
+      // double<->i64) fall through to the CastInst handler below where
+      // they emit FMOV W,S / FMOV S,W / FMOV X,D / FMOV D,X.
+      if (auto *BCI = dyn_cast<BitCastInst>(&I)) {
+        Type *st = BCI->getSrcTy(), *dt = BCI->getDestTy();
+        if (st->isPointerTy() && dt->isPointerTy()) continue;
+      }
       if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
         // Must have been lowered to a PtrLoc in pass 2, otherwise the load/
         // store that uses it will fail. Only accept fully-constant GEPs.
@@ -2001,34 +2102,207 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         continue;
       }
 
-      // Cast (trunc/zext/sext): trunc is a register alias; zext from
-      // sub-word values is already satisfied by LDRB/LDRH or 32-bit ops
-      // clearing high bits; sext from i8/i16 needs an explicit SBFM.
+      // Cast (trunc/zext/sext/FP-int conv/FP-precision/bitcast).
+      // trunc is a register alias; zext from sub-word values is already
+      // satisfied by LDRB/LDRH or 32-bit ops clearing high bits; sext
+      // from i8/i16 needs an explicit SBFM. FP-int conversions and
+      // bitcasts (round 8i) lower to AArch64 FCVTZS/FCVTZU/SCVTF/UCVTF
+      // /FCVT/FMOV-reinterpret encoders defined near the top of this
+      // file.
       if (auto *CI = dyn_cast<CastInst>(&I)) {
-        if (CI->getOpcode() == Instruction::FPToSI) {
-          // Supported shapes: float -> i32 (FCVTZS Wd, Sn) and
-          // double -> i32 (FCVTZS Wd, Dn). Other widths/types are
-          // rejected with "fptosi shape".
+        // -------- FPToSI / FPToUI (FP -> GPR with truncation) --------
+        if (CI->getOpcode() == Instruction::FPToSI ||
+            CI->getOpcode() == Instruction::FPToUI) {
+          bool isUnsigned = (CI->getOpcode() == Instruction::FPToUI);
+          const char *kind = isUnsigned ? "fptoui" : "fptosi";
           Type *srcTy = CI->getOperand(0)->getType();
+          Type *dstTy = CI->getType();
           bool srcIsFloat  = srcTy->isFloatTy();
           bool srcIsDouble = srcTy->isDoubleTy();
-          if ((!srcIsFloat && !srcIsDouble) ||
-              !CI->getType()->isIntegerTy(32)) {
-            r.status = Status::Unsupported; r.reason = "fptosi shape"; return r;
+          bool dstIs32 = dstTy->isIntegerTy(32);
+          bool dstIs64 = dstTy->isIntegerTy(64);
+          if ((!srcIsFloat && !srcIsDouble) || (!dstIs32 && !dstIs64)) {
+            r.status = Status::Unsupported;
+            r.reason = std::string(kind) + " shape"; return r;
           }
           auto it = fpRegOf.find(CI->getOperand(0));
           if (it == fpRegOf.end()) {
-            r.status = Status::Unsupported; r.reason = "fptosi src"; return r;
+            r.status = Status::Unsupported;
+            r.reason = std::string(kind) + " src"; return r;
           }
           int rd = assignReg(&I);
           if (rd < 0) {
-            r.status = Status::Unsupported; r.reason = "scratch OOM (fptosi)"; return r;
+            r.status = Status::Unsupported;
+            r.reason = std::string("scratch OOM (") + kind + ")"; return r;
           }
-          if (!W.emit(srcIsDouble ? encFcvtzsWD((unsigned)rd, it->second)
-                                  : encFcvtzsWS((unsigned)rd, it->second))) {
+          uint32_t opc = 0;
+          if (isUnsigned) {
+            opc = srcIsDouble
+                    ? (dstIs64 ? encFcvtzuXD((unsigned)rd, it->second)
+                               : encFcvtzuWD((unsigned)rd, it->second))
+                    : (dstIs64 ? encFcvtzuXS((unsigned)rd, it->second)
+                               : encFcvtzuWS((unsigned)rd, it->second));
+          } else {
+            opc = srcIsDouble
+                    ? (dstIs64 ? encFcvtzsXD((unsigned)rd, it->second)
+                               : encFcvtzsWD((unsigned)rd, it->second))
+                    : (dstIs64 ? encFcvtzsXS((unsigned)rd, it->second)
+                               : encFcvtzsWS((unsigned)rd, it->second));
+          }
+          if (!W.emit(opc)) { r.status = Status::TooLarge; return r; }
+          continue;
+        }
+        // -------- SIToFP / UIToFP (GPR -> FP) --------
+        if (CI->getOpcode() == Instruction::SIToFP ||
+            CI->getOpcode() == Instruction::UIToFP) {
+          bool isUnsigned = (CI->getOpcode() == Instruction::UIToFP);
+          const char *kind = isUnsigned ? "uitofp" : "sitofp";
+          Type *srcTy = CI->getOperand(0)->getType();
+          Type *dstTy = CI->getType();
+          bool srcIs32 = srcTy->isIntegerTy(32);
+          bool srcIs64 = srcTy->isIntegerTy(64);
+          bool dstIsFloat  = dstTy->isFloatTy();
+          bool dstIsDouble = dstTy->isDoubleTy();
+          if ((!srcIs32 && !srcIs64) || (!dstIsFloat && !dstIsDouble)) {
+            r.status = Status::Unsupported;
+            r.reason = std::string(kind) + " shape"; return r;
+          }
+          unsigned srcReg;
+          if (!valueInReg(CI->getOperand(0), srcIs64, srcReg)) {
+            r.status = Status::Unsupported;
+            r.reason = std::string(kind) + " src"; return r;
+          }
+          int rd = assignFpReg(&I);
+          if (rd < 0) {
+            r.status = Status::Unsupported;
+            r.reason = std::string("fp scratch OOM (") + kind + ")"; return r;
+          }
+          uint32_t opc = 0;
+          if (isUnsigned) {
+            opc = dstIsDouble
+                    ? (srcIs64 ? encUcvtfDX((unsigned)rd, srcReg)
+                               : encUcvtfDW((unsigned)rd, srcReg))
+                    : (srcIs64 ? encUcvtfSX((unsigned)rd, srcReg)
+                               : encUcvtfSW((unsigned)rd, srcReg));
+          } else {
+            opc = dstIsDouble
+                    ? (srcIs64 ? encScvtfDX((unsigned)rd, srcReg)
+                               : encScvtfDW((unsigned)rd, srcReg))
+                    : (srcIs64 ? encScvtfSX((unsigned)rd, srcReg)
+                               : encScvtfSW((unsigned)rd, srcReg));
+          }
+          if (!W.emit(opc)) { r.status = Status::TooLarge; return r; }
+          continue;
+        }
+        // -------- FPExt (float -> double) --------
+        if (CI->getOpcode() == Instruction::FPExt) {
+          if (!CI->getOperand(0)->getType()->isFloatTy() ||
+              !CI->getType()->isDoubleTy()) {
+            r.status = Status::Unsupported; r.reason = "fpext shape"; return r;
+          }
+          auto it = fpRegOf.find(CI->getOperand(0));
+          if (it == fpRegOf.end()) {
+            r.status = Status::Unsupported; r.reason = "fpext src"; return r;
+          }
+          int rd = assignFpReg(&I);
+          if (rd < 0) {
+            r.status = Status::Unsupported; r.reason = "fp scratch OOM (fpext)"; return r;
+          }
+          if (!W.emit(encFcvtDS((unsigned)rd, it->second))) {
             r.status = Status::TooLarge; return r;
           }
           continue;
+        }
+        // -------- FPTrunc (double -> float) --------
+        if (CI->getOpcode() == Instruction::FPTrunc) {
+          if (!CI->getOperand(0)->getType()->isDoubleTy() ||
+              !CI->getType()->isFloatTy()) {
+            r.status = Status::Unsupported; r.reason = "fptrunc shape"; return r;
+          }
+          auto it = fpRegOf.find(CI->getOperand(0));
+          if (it == fpRegOf.end()) {
+            r.status = Status::Unsupported; r.reason = "fptrunc src"; return r;
+          }
+          int rd = assignFpReg(&I);
+          if (rd < 0) {
+            r.status = Status::Unsupported; r.reason = "fp scratch OOM (fptrunc)"; return r;
+          }
+          if (!W.emit(encFcvtSD((unsigned)rd, it->second))) {
+            r.status = Status::TooLarge; return r;
+          }
+          continue;
+        }
+        // -------- BitCast (FP <-> int reinterpret only) --------
+        // Pointer bitcasts have already been folded into the pointer-
+        // location chain in pass 2 (see the `BitCastInst` handler that
+        // forwards `ptrLoc[BC->getOperand(0)]` to `ptrLoc[BC]`); they
+        // never reach this site as a CastInst that needs lowering.
+        // Pointer bitcasts that DO reach us would only occur if the
+        // bitcast result is used somewhere we don't model as a ptr
+        // operand — in that case the user (load/store) will already
+        // have failed with a more specific reason.
+        if (CI->getOpcode() == Instruction::BitCast) {
+          Type *srcTy = CI->getOperand(0)->getType();
+          Type *dstTy = CI->getType();
+          // Pointer<->pointer bitcasts: forward ptr-loc transparently
+          // (already done in pass 2). The IR value still needs to map
+          // to its source's GPR/FP register (or to nothing if it's
+          // pointer-only). Skip silently for pointer-shaped bitcasts
+          // so chained bitcasts on alloca/global pointers continue to
+          // work without consuming a scratch reg.
+          if (srcTy->isPointerTy() && dstTy->isPointerTy()) continue;
+          // float <-> i32
+          bool floatToI32  = srcTy->isFloatTy()       && dstTy->isIntegerTy(32);
+          bool i32ToFloat  = srcTy->isIntegerTy(32)   && dstTy->isFloatTy();
+          // double <-> i64
+          bool doubleToI64 = srcTy->isDoubleTy()      && dstTy->isIntegerTy(64);
+          bool i64ToDouble = srcTy->isIntegerTy(64)   && dstTy->isDoubleTy();
+          if (floatToI32 || doubleToI64) {
+            // FP -> GPR. FMOV Wd,Sn / FMOV Xd,Dn.
+            auto it = fpRegOf.find(CI->getOperand(0));
+            if (it == fpRegOf.end()) {
+              r.status = Status::Unsupported; r.reason = "bitcast src"; return r;
+            }
+            int rd = assignReg(&I);
+            if (rd < 0) {
+              r.status = Status::Unsupported; r.reason = "scratch OOM (bitcast)"; return r;
+            }
+            if (!W.emit(doubleToI64
+                          ? encFmovXFromD((unsigned)rd, it->second)
+                          : encFmovWFromS((unsigned)rd, it->second))) {
+              r.status = Status::TooLarge; return r;
+            }
+            continue;
+          }
+          if (i32ToFloat || i64ToDouble) {
+            // GPR -> FP. FMOV Sd,Wn / FMOV Dd,Xn.
+            unsigned srcReg;
+            if (!valueInReg(CI->getOperand(0), i64ToDouble, srcReg)) {
+              r.status = Status::Unsupported; r.reason = "bitcast src"; return r;
+            }
+            int rd = assignFpReg(&I);
+            if (rd < 0) {
+              r.status = Status::Unsupported; r.reason = "fp scratch OOM (bitcast)"; return r;
+            }
+            if (!W.emit(i64ToDouble
+                          ? encFmovDFromX((unsigned)rd, srcReg)
+                          : encFmovSFromW((unsigned)rd, srcReg))) {
+              r.status = Status::TooLarge; return r;
+            }
+            continue;
+          }
+          // Same-class same-width int<->int bitcasts (rare but valid):
+          // forward the source register without emitting code.
+          if (srcTy->isIntegerTy() && dstTy->isIntegerTy() &&
+              srcTy->getIntegerBitWidth() == dstTy->getIntegerBitWidth()) {
+            auto it = regOf.find(CI->getOperand(0));
+            if (it == regOf.end()) {
+              r.status = Status::Unsupported; r.reason = "bitcast src"; return r;
+            }
+            regOf[&I] = it->second;
+            continue;
+          }
+          r.status = Status::Unsupported; r.reason = "bitcast shape"; return r;
         }
         if (CI->getOpcode() == Instruction::Trunc ||
             CI->getOpcode() == Instruction::ZExt  ||

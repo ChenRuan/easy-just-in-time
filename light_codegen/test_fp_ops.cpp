@@ -127,6 +127,35 @@ static constexpr uint32_t kFMovDX_val  = 0x9E670000u;
 static constexpr uint32_t kMaskFcvtzs   = 0xFFFFFC00u;
 static constexpr uint32_t kFcvtzsWD_val = 0x1E780000u;
 
+// Round-8i: full FP<->int conversion family. Each instruction shares
+// the FP-int conversion bit slot layout, so a single mask `kMaskFcvtzs`
+// (drop Rn/Rd only) catches all of them by exact opc/rmode/sf/type
+// match.  Distinct masks are introduced where the canonical name in
+// the test case is different.
+static constexpr uint32_t kFcvtzsXS_val = 0x9E380000u;
+static constexpr uint32_t kFcvtzsXD_val = 0x9E780000u;
+static constexpr uint32_t kFcvtzuWS_val = 0x1E390000u;
+static constexpr uint32_t kFcvtzuWD_val = 0x1E790000u;
+static constexpr uint32_t kFcvtzuXS_val = 0x9E390000u;
+static constexpr uint32_t kFcvtzuXD_val = 0x9E790000u;
+static constexpr uint32_t kScvtfSW_val  = 0x1E220000u;
+static constexpr uint32_t kScvtfSX_val  = 0x9E220000u;
+static constexpr uint32_t kScvtfDW_val  = 0x1E620000u;
+static constexpr uint32_t kScvtfDX_val  = 0x9E620000u;
+static constexpr uint32_t kUcvtfSW_val  = 0x1E230000u;
+static constexpr uint32_t kUcvtfSX_val  = 0x9E230000u;
+static constexpr uint32_t kUcvtfDW_val  = 0x1E630000u;
+static constexpr uint32_t kUcvtfDX_val  = 0x9E630000u;
+// FCVT precision change uses bits 16:15 (opc) inside the conversion
+// family slot; the mask still drops only Rn/Rd.
+static constexpr uint32_t kFcvtDS_val   = 0x1E22C000u;
+static constexpr uint32_t kFcvtSD_val   = 0x1E624000u;
+// FMOV reinterpret (W<->S, X<->D). Mask drops Rn/Rd.
+static constexpr uint32_t kFmovWFromS_val = 0x1E260000u;
+static constexpr uint32_t kFmovXFromD_val = 0x9E660000u;
+static constexpr uint32_t kFmovSFromW_val = 0x1E270000u;
+// (kFMovDX_val above already aliases FMOV Dd,Xn for the dret_15 test.)
+
 bool StreamHasOpcode(const std::vector<uint8_t> &code, uint32_t mask,
                      uint32_t value) {
   if ((code.size() % 4) != 0) return false;
@@ -371,6 +400,21 @@ Function *BuildDtoi(Module &M) {
   return F;
 }
 
+// ====================== Round-8i: scalar FP conversions ====================
+// Generic helper: build a function `name : (srcTy) -> dstTy` whose
+// body is `ret CastOp(arg)`. Used for nearly every conversion case.
+template <Instruction::CastOps Op>
+Function *BuildCast1(Module &M, const char *name, Type *srcTy, Type *dstTy) {
+  LLVMContext &C = M.getContext();
+  FunctionType *FT = FunctionType::get(dstTy, {srcTy}, false);
+  Function *F = Function::Create(FT, GlobalValue::ExternalLinkage, name, &M);
+  BasicBlock *BB = BasicBlock::Create(C, "entry", F);
+  IRBuilder<> B(BB);
+  Value *r = B.CreateCast(Op, F->getArg(0), dstTy, "r");
+  B.CreateRet(r);
+  return F;
+}
+
 // =============================== Reference =================================
 
 float refCalc(float a, float b)  { return (a + b) * 2.0f - a / b; }
@@ -453,6 +497,42 @@ int main() {
   Function *Fdret15  = BuildDretConst(*M, "dret_15", 1.5);
   Function *Fdtoi    = BuildDtoi(*M);
 
+  // Round-8i: scalar FP conversions (fptosi64, fptoui, sitofp, uitofp,
+  // fpext, fptrunc, FP/int bitcasts). Each one is built as a single-
+  // instruction wrapper so opcode coverage exactly identifies which
+  // conversion encoder the test exercises.
+  Type *F32 = Type::getFloatTy(Ctx);
+  Type *F64 = Type::getDoubleTy(Ctx);
+  Type *I32 = Type::getInt32Ty(Ctx);
+  Type *I64 = Type::getInt64Ty(Ctx);
+
+  // FPToSI -> i64
+  Function *FfToI64 = BuildCast1<Instruction::FPToSI>(*M, "f_to_i64", F32, I64);
+  Function *FdToI64 = BuildCast1<Instruction::FPToSI>(*M, "d_to_i64", F64, I64);
+  // FPToUI
+  Function *FfToU32 = BuildCast1<Instruction::FPToUI>(*M, "f_to_u32", F32, I32);
+  Function *FfToU64 = BuildCast1<Instruction::FPToUI>(*M, "f_to_u64", F32, I64);
+  Function *FdToU32 = BuildCast1<Instruction::FPToUI>(*M, "d_to_u32", F64, I32);
+  Function *FdToU64 = BuildCast1<Instruction::FPToUI>(*M, "d_to_u64", F64, I64);
+  // SIToFP
+  Function *Fi32ToF = BuildCast1<Instruction::SIToFP>(*M, "i32_to_f", I32, F32);
+  Function *Fi32ToD = BuildCast1<Instruction::SIToFP>(*M, "i32_to_d", I32, F64);
+  Function *Fi64ToF = BuildCast1<Instruction::SIToFP>(*M, "i64_to_f", I64, F32);
+  Function *Fi64ToD = BuildCast1<Instruction::SIToFP>(*M, "i64_to_d", I64, F64);
+  // UIToFP
+  Function *Fu32ToF = BuildCast1<Instruction::UIToFP>(*M, "u32_to_f", I32, F32);
+  Function *Fu32ToD = BuildCast1<Instruction::UIToFP>(*M, "u32_to_d", I32, F64);
+  Function *Fu64ToF = BuildCast1<Instruction::UIToFP>(*M, "u64_to_f", I64, F32);
+  Function *Fu64ToD = BuildCast1<Instruction::UIToFP>(*M, "u64_to_d", I64, F64);
+  // FPExt / FPTrunc
+  Function *Fwiden  = BuildCast1<Instruction::FPExt  >(*M, "widen",  F32, F64);
+  Function *Fnarrow = BuildCast1<Instruction::FPTrunc>(*M, "narrow", F64, F32);
+  // BitCast
+  Function *Ffbits     = BuildCast1<Instruction::BitCast>(*M, "fbits",     F32, I32);
+  Function *FfromFbits = BuildCast1<Instruction::BitCast>(*M, "from_fbits", I32, F32);
+  Function *Fdbits     = BuildCast1<Instruction::BitCast>(*M, "dbits",     F64, I64);
+  Function *FfromDbits = BuildCast1<Instruction::BitCast>(*M, "from_dbits", I64, F64);
+
   EmitOut eCalc  = EmitFunction(*Fcalc);
   EmitOut eClamp = EmitFunction(*Fclamp);
   EmitOut eMaxf  = EmitFunction(*Fmaxf);
@@ -465,6 +545,28 @@ int main() {
   EmitOut eDmax   = EmitFunction(*Fdmax);
   EmitOut eDret15 = EmitFunction(*Fdret15);
   EmitOut eDtoi   = EmitFunction(*Fdtoi);
+
+  // Round-8i conversion emits.
+  EmitOut eFtoI64 = EmitFunction(*FfToI64);
+  EmitOut eDtoI64 = EmitFunction(*FdToI64);
+  EmitOut eFtoU32 = EmitFunction(*FfToU32);
+  EmitOut eFtoU64 = EmitFunction(*FfToU64);
+  EmitOut eDtoU32 = EmitFunction(*FdToU32);
+  EmitOut eDtoU64 = EmitFunction(*FdToU64);
+  EmitOut eI32ToF = EmitFunction(*Fi32ToF);
+  EmitOut eI32ToD = EmitFunction(*Fi32ToD);
+  EmitOut eI64ToF = EmitFunction(*Fi64ToF);
+  EmitOut eI64ToD = EmitFunction(*Fi64ToD);
+  EmitOut eU32ToF = EmitFunction(*Fu32ToF);
+  EmitOut eU32ToD = EmitFunction(*Fu32ToD);
+  EmitOut eU64ToF = EmitFunction(*Fu64ToF);
+  EmitOut eU64ToD = EmitFunction(*Fu64ToD);
+  EmitOut eWiden  = EmitFunction(*Fwiden);
+  EmitOut eNarrow = EmitFunction(*Fnarrow);
+  EmitOut eFbits     = EmitFunction(*Ffbits);
+  EmitOut eFromFbits = EmitFunction(*FfromFbits);
+  EmitOut eDbits     = EmitFunction(*Fdbits);
+  EmitOut eFromDbits = EmitFunction(*FfromDbits);
 
   int failures = 0;
   failures += CheckEmit("calc",         eCalc);
@@ -479,6 +581,26 @@ int main() {
   failures += CheckEmit("dmax",         eDmax);
   failures += CheckEmit("dret_15",      eDret15);
   failures += CheckEmit("dtoi",         eDtoi);
+  failures += CheckEmit("f_to_i64",     eFtoI64);
+  failures += CheckEmit("d_to_i64",     eDtoI64);
+  failures += CheckEmit("f_to_u32",     eFtoU32);
+  failures += CheckEmit("f_to_u64",     eFtoU64);
+  failures += CheckEmit("d_to_u32",     eDtoU32);
+  failures += CheckEmit("d_to_u64",     eDtoU64);
+  failures += CheckEmit("i32_to_f",     eI32ToF);
+  failures += CheckEmit("i32_to_d",     eI32ToD);
+  failures += CheckEmit("i64_to_f",     eI64ToF);
+  failures += CheckEmit("i64_to_d",     eI64ToD);
+  failures += CheckEmit("u32_to_f",     eU32ToF);
+  failures += CheckEmit("u32_to_d",     eU32ToD);
+  failures += CheckEmit("u64_to_f",     eU64ToF);
+  failures += CheckEmit("u64_to_d",     eU64ToD);
+  failures += CheckEmit("widen",        eWiden);
+  failures += CheckEmit("narrow",       eNarrow);
+  failures += CheckEmit("fbits",        eFbits);
+  failures += CheckEmit("from_fbits",   eFromFbits);
+  failures += CheckEmit("dbits",        eDbits);
+  failures += CheckEmit("from_dbits",   eFromDbits);
 
   // Opcode-mask coverage guards — these run on any host, so the
   // emitter byte stream is verified even without an AArch64 CPU.
@@ -509,6 +631,48 @@ int main() {
        StreamHasOpcode(eDret15.code, kMaskFMovDX, kFMovDX_val));
   must("FCVTZS W,D in dtoi",
        StreamHasOpcode(eDtoi.code, kMaskFcvtzs, kFcvtzsWD_val));
+
+  // Round-8i conversion opcode coverage.
+  must("FCVTZS X,S in f_to_i64",
+       StreamHasOpcode(eFtoI64.code, kMaskFcvtzs, kFcvtzsXS_val));
+  must("FCVTZS X,D in d_to_i64",
+       StreamHasOpcode(eDtoI64.code, kMaskFcvtzs, kFcvtzsXD_val));
+  must("FCVTZU W,S in f_to_u32",
+       StreamHasOpcode(eFtoU32.code, kMaskFcvtzs, kFcvtzuWS_val));
+  must("FCVTZU X,S in f_to_u64",
+       StreamHasOpcode(eFtoU64.code, kMaskFcvtzs, kFcvtzuXS_val));
+  must("FCVTZU W,D in d_to_u32",
+       StreamHasOpcode(eDtoU32.code, kMaskFcvtzs, kFcvtzuWD_val));
+  must("FCVTZU X,D in d_to_u64",
+       StreamHasOpcode(eDtoU64.code, kMaskFcvtzs, kFcvtzuXD_val));
+  must("SCVTF S,W in i32_to_f",
+       StreamHasOpcode(eI32ToF.code, kMaskFcvtzs, kScvtfSW_val));
+  must("SCVTF D,W in i32_to_d",
+       StreamHasOpcode(eI32ToD.code, kMaskFcvtzs, kScvtfDW_val));
+  must("SCVTF S,X in i64_to_f",
+       StreamHasOpcode(eI64ToF.code, kMaskFcvtzs, kScvtfSX_val));
+  must("SCVTF D,X in i64_to_d",
+       StreamHasOpcode(eI64ToD.code, kMaskFcvtzs, kScvtfDX_val));
+  must("UCVTF S,W in u32_to_f",
+       StreamHasOpcode(eU32ToF.code, kMaskFcvtzs, kUcvtfSW_val));
+  must("UCVTF D,W in u32_to_d",
+       StreamHasOpcode(eU32ToD.code, kMaskFcvtzs, kUcvtfDW_val));
+  must("UCVTF S,X in u64_to_f",
+       StreamHasOpcode(eU64ToF.code, kMaskFcvtzs, kUcvtfSX_val));
+  must("UCVTF D,X in u64_to_d",
+       StreamHasOpcode(eU64ToD.code, kMaskFcvtzs, kUcvtfDX_val));
+  must("FCVT D,S in widen",
+       StreamHasOpcode(eWiden.code, kMaskFcvtzs, kFcvtDS_val));
+  must("FCVT S,D in narrow",
+       StreamHasOpcode(eNarrow.code, kMaskFcvtzs, kFcvtSD_val));
+  must("FMOV W,S in fbits",
+       StreamHasOpcode(eFbits.code, kMaskFcvtzs, kFmovWFromS_val));
+  must("FMOV S,W in from_fbits",
+       StreamHasOpcode(eFromFbits.code, kMaskFcvtzs, kFmovSFromW_val));
+  must("FMOV X,D in dbits",
+       StreamHasOpcode(eDbits.code, kMaskFcvtzs, kFmovXFromD_val));
+  must("FMOV D,X in from_dbits",
+       StreamHasOpcode(eFromDbits.code, kMaskFMovDX, kFMovDX_val));
 
   if (failures) {
     std::printf("FAIL: emit / coverage stage (%d failures)\n", failures);
@@ -542,6 +706,57 @@ int main() {
   if (!calc || !clamp || !maxf || !stale || !rZero || !rTwo || !r15 ||
       !dcalc || !dclamp || !dmax || !dret15 || !dtoi) {
     std::printf("FAIL: mmap/exec setup\n");
+    return 1;
+  }
+
+  // Round-8i conversion executables.
+  using FnFtoI64 = long long          (*)(float);
+  using FnDtoI64 = long long          (*)(double);
+  using FnFtoU32 = unsigned int       (*)(float);
+  using FnFtoU64 = unsigned long long (*)(float);
+  using FnDtoU32 = unsigned int       (*)(double);
+  using FnDtoU64 = unsigned long long (*)(double);
+  using FnI32ToF = float              (*)(int);
+  using FnI32ToD = double             (*)(int);
+  using FnI64ToF = float              (*)(long long);
+  using FnI64ToD = double             (*)(long long);
+  using FnU32ToF = float              (*)(unsigned int);
+  using FnU32ToD = double             (*)(unsigned int);
+  using FnU64ToF = float              (*)(unsigned long long);
+  using FnU64ToD = double             (*)(unsigned long long);
+  using FnWiden  = double             (*)(float);
+  using FnNarrow = float              (*)(double);
+  using FnFbits     = uint32_t (*)(float);
+  using FnFromFbits = float    (*)(uint32_t);
+  using FnDbits     = uint64_t (*)(double);
+  using FnFromDbits = double   (*)(uint64_t);
+
+  auto fnFtoI64 = (FnFtoI64)MakeExecutable(eFtoI64.code);
+  auto fnDtoI64 = (FnDtoI64)MakeExecutable(eDtoI64.code);
+  auto fnFtoU32 = (FnFtoU32)MakeExecutable(eFtoU32.code);
+  auto fnFtoU64 = (FnFtoU64)MakeExecutable(eFtoU64.code);
+  auto fnDtoU32 = (FnDtoU32)MakeExecutable(eDtoU32.code);
+  auto fnDtoU64 = (FnDtoU64)MakeExecutable(eDtoU64.code);
+  auto fnI32ToF = (FnI32ToF)MakeExecutable(eI32ToF.code);
+  auto fnI32ToD = (FnI32ToD)MakeExecutable(eI32ToD.code);
+  auto fnI64ToF = (FnI64ToF)MakeExecutable(eI64ToF.code);
+  auto fnI64ToD = (FnI64ToD)MakeExecutable(eI64ToD.code);
+  auto fnU32ToF = (FnU32ToF)MakeExecutable(eU32ToF.code);
+  auto fnU32ToD = (FnU32ToD)MakeExecutable(eU32ToD.code);
+  auto fnU64ToF = (FnU64ToF)MakeExecutable(eU64ToF.code);
+  auto fnU64ToD = (FnU64ToD)MakeExecutable(eU64ToD.code);
+  auto fnWiden  = (FnWiden) MakeExecutable(eWiden.code);
+  auto fnNarrow = (FnNarrow)MakeExecutable(eNarrow.code);
+  auto fnFbits     = (FnFbits)    MakeExecutable(eFbits.code);
+  auto fnFromFbits = (FnFromFbits)MakeExecutable(eFromFbits.code);
+  auto fnDbits     = (FnDbits)    MakeExecutable(eDbits.code);
+  auto fnFromDbits = (FnFromDbits)MakeExecutable(eFromDbits.code);
+  if (!fnFtoI64 || !fnDtoI64 || !fnFtoU32 || !fnFtoU64 || !fnDtoU32 ||
+      !fnDtoU64 || !fnI32ToF || !fnI32ToD || !fnI64ToF || !fnI64ToD ||
+      !fnU32ToF || !fnU32ToD || !fnU64ToF || !fnU64ToD ||
+      !fnWiden || !fnNarrow || !fnFbits || !fnFromFbits ||
+      !fnDbits || !fnFromDbits) {
+    std::printf("FAIL: mmap/exec setup (conversions)\n");
     return 1;
   }
 
@@ -689,12 +904,208 @@ int main() {
     }
   }
 
+  // ============================ Round-8i conversions ====================
+
+  // FPToSI -> i64
+  {
+    struct C { float x; long long want; };
+    C in[] = {{0.0f, 0}, {1.0f, 1}, {-1.0f, -1}, {1.9f, 1}, {-1.9f, -1},
+              {12345.5f, 12345}, {-12345.5f, -12345}};
+    for (const auto &t : in) {
+      long long got = fnFtoI64(t.x);
+      bool ok = (got == t.want);
+      std::printf("  f_to_i64(%.4f) = %lld want %lld %s\n",
+                  t.x, got, t.want, ok ? "OK" : "FAIL");
+      if (!ok) ++failures;
+    }
+  }
+  {
+    struct C { double x; long long want; };
+    C in[] = {{0.0, 0}, {1.0, 1}, {-1.0, -1}, {1.9, 1}, {-1.9, -1},
+              {1234567890.5, 1234567890LL}, {-1234567890.5, -1234567890LL}};
+    for (const auto &t : in) {
+      long long got = fnDtoI64(t.x);
+      bool ok = (got == t.want);
+      std::printf("  d_to_i64(%.4f) = %lld want %lld %s\n",
+                  t.x, got, t.want, ok ? "OK" : "FAIL");
+      if (!ok) ++failures;
+    }
+  }
+
+  // FPToUI
+  {
+    float fin[] = {0.0f, 1.0f, 2.5f, 1234.75f, 0.99f};
+    for (float x : fin) {
+      unsigned int got = fnFtoU32(x);
+      unsigned int want = (unsigned int)x;
+      bool ok = (got == want);
+      std::printf("  f_to_u32(%.4f) = %u want %u %s\n",
+                  x, got, want, ok ? "OK" : "FAIL");
+      if (!ok) ++failures;
+      unsigned long long got64 = fnFtoU64(x);
+      unsigned long long want64 = (unsigned long long)x;
+      bool ok64 = (got64 == want64);
+      std::printf("  f_to_u64(%.4f) = %llu want %llu %s\n",
+                  x, got64, want64, ok64 ? "OK" : "FAIL");
+      if (!ok64) ++failures;
+    }
+    double din[] = {0.0, 1.0, 2.5, 1234567.89, 0.99};
+    for (double x : din) {
+      unsigned int got = fnDtoU32(x);
+      unsigned int want = (unsigned int)x;
+      bool ok = (got == want);
+      std::printf("  d_to_u32(%.4f) = %u want %u %s\n",
+                  x, got, want, ok ? "OK" : "FAIL");
+      if (!ok) ++failures;
+      unsigned long long got64 = fnDtoU64(x);
+      unsigned long long want64 = (unsigned long long)x;
+      bool ok64 = (got64 == want64);
+      std::printf("  d_to_u64(%.4f) = %llu want %llu %s\n",
+                  x, got64, want64, ok64 ? "OK" : "FAIL");
+      if (!ok64) ++failures;
+    }
+  }
+
+  // SIToFP
+  {
+    int iin[] = {0, 1, -1, 1234567, -1234567};
+    for (int x : iin) {
+      float gotf = fnI32ToF(x); float wantf = (float)x;
+      double gotd = fnI32ToD(x); double wantd = (double)x;
+      bool okf = feq(gotf, wantf), okd = deq(gotd, wantd);
+      std::printf("  i32_to_f(%d) = %.6f want %.6f %s\n",
+                  x, gotf, wantf, okf ? "OK" : "FAIL");
+      if (!okf) ++failures;
+      std::printf("  i32_to_d(%d) = %.12f want %.12f %s\n",
+                  x, gotd, wantd, okd ? "OK" : "FAIL");
+      if (!okd) ++failures;
+    }
+    long long lin[] = {0LL, 1LL, -1LL, 1234567890123LL, -1234567890123LL};
+    for (long long x : lin) {
+      float gotf = fnI64ToF(x); float wantf = (float)x;
+      double gotd = fnI64ToD(x); double wantd = (double)x;
+      bool okf = feq(gotf, wantf), okd = deq(gotd, wantd);
+      std::printf("  i64_to_f(%lld) = %.6f want %.6f %s\n",
+                  x, gotf, wantf, okf ? "OK" : "FAIL");
+      if (!okf) ++failures;
+      std::printf("  i64_to_d(%lld) = %.12f want %.12f %s\n",
+                  x, gotd, wantd, okd ? "OK" : "FAIL");
+      if (!okd) ++failures;
+    }
+  }
+
+  // UIToFP
+  {
+    unsigned int uin[] = {0u, 1u, 1234567u, 0xFFFFFFFFu};
+    for (unsigned int x : uin) {
+      float gotf = fnU32ToF(x); float wantf = (float)x;
+      double gotd = fnU32ToD(x); double wantd = (double)x;
+      bool okf = feq(gotf, wantf), okd = deq(gotd, wantd);
+      std::printf("  u32_to_f(%u) = %.6f want %.6f %s\n",
+                  x, gotf, wantf, okf ? "OK" : "FAIL");
+      if (!okf) ++failures;
+      std::printf("  u32_to_d(%u) = %.12f want %.12f %s\n",
+                  x, gotd, wantd, okd ? "OK" : "FAIL");
+      if (!okd) ++failures;
+    }
+    unsigned long long ulin[] = {0ULL, 1ULL, 1234567890123ULL,
+                                 0xFFFFFFFFFFFFFFFFULL};
+    for (unsigned long long x : ulin) {
+      float gotf = fnU64ToF(x); float wantf = (float)x;
+      double gotd = fnU64ToD(x); double wantd = (double)x;
+      bool okf = feq(gotf, wantf), okd = deq(gotd, wantd);
+      std::printf("  u64_to_f(%llu) = %.6f want %.6f %s\n",
+                  x, gotf, wantf, okf ? "OK" : "FAIL");
+      if (!okf) ++failures;
+      std::printf("  u64_to_d(%llu) = %.12f want %.12f %s\n",
+                  x, gotd, wantd, okd ? "OK" : "FAIL");
+      if (!okd) ++failures;
+    }
+  }
+
+  // FPExt / FPTrunc
+  {
+    float fin[] = {0.0f, 1.5f, -2.25f, 12345.0f};
+    for (float x : fin) {
+      double got = fnWiden(x); double want = (double)x;
+      bool ok = deq(got, want);
+      std::printf("  widen(%.4f) = %.12f want %.12f %s\n",
+                  x, got, want, ok ? "OK" : "FAIL");
+      if (!ok) ++failures;
+    }
+    double din[] = {0.0, 1.5, -2.25, 12345.0};
+    for (double x : din) {
+      float got = fnNarrow(x); float want = (float)x;
+      bool ok = feq(got, want);
+      std::printf("  narrow(%.6f) = %.6f want %.6f %s\n",
+                  x, got, want, ok ? "OK" : "FAIL");
+      if (!ok) ++failures;
+    }
+  }
+
+  // BitCast — exact bit-pattern checks. We must match the host's
+  // memcpy-based reinterpret exactly; no tolerance allowed.
+  {
+    auto refFbits = [](float f) {
+      uint32_t b; std::memcpy(&b, &f, sizeof(b)); return b;
+    };
+    auto refFromFbits = [](uint32_t b) {
+      float f; std::memcpy(&f, &b, sizeof(f)); return f;
+    };
+    auto refDbits = [](double d) {
+      uint64_t b; std::memcpy(&b, &d, sizeof(b)); return b;
+    };
+    auto refFromDbits = [](uint64_t b) {
+      double d; std::memcpy(&d, &b, sizeof(d)); return d;
+    };
+    float fin[] = {0.0f, 1.0f, -2.5f, 1.5f};
+    for (float x : fin) {
+      uint32_t got = fnFbits(x), want = refFbits(x);
+      bool ok = (got == want);
+      std::printf("  fbits(%.4f) = 0x%08x want 0x%08x %s\n",
+                  x, got, want, ok ? "OK" : "FAIL");
+      if (!ok) ++failures;
+    }
+    uint32_t fbin[] = {0u, 0x3F800000u, 0xC0200000u, 0x3FC00000u};
+    for (uint32_t b : fbin) {
+      float got = fnFromFbits(b), want = refFromFbits(b);
+      uint32_t gb, wb;
+      std::memcpy(&gb, &got, 4); std::memcpy(&wb, &want, 4);
+      bool ok = (gb == wb);
+      std::printf("  from_fbits(0x%08x) = 0x%08x want 0x%08x %s\n",
+                  b, gb, wb, ok ? "OK" : "FAIL");
+      if (!ok) ++failures;
+    }
+    double din[] = {0.0, 1.0, -2.5, 1.5};
+    for (double x : din) {
+      uint64_t got = fnDbits(x), want = refDbits(x);
+      bool ok = (got == want);
+      std::printf("  dbits(%.4f) = 0x%016llx want 0x%016llx %s\n",
+                  x, (unsigned long long)got,
+                  (unsigned long long)want, ok ? "OK" : "FAIL");
+      if (!ok) ++failures;
+    }
+    uint64_t dbin[] = {0ULL, 0x3FF0000000000000ULL, 0xC004000000000000ULL,
+                       0x3FF8000000000000ULL};
+    for (uint64_t b : dbin) {
+      double got = fnFromDbits(b), want = refFromDbits(b);
+      uint64_t gb, wb;
+      std::memcpy(&gb, &got, 8); std::memcpy(&wb, &want, 8);
+      bool ok = (gb == wb);
+      std::printf("  from_dbits(0x%016llx) = 0x%016llx want 0x%016llx %s\n",
+                  (unsigned long long)b, (unsigned long long)gb,
+                  (unsigned long long)wb, ok ? "OK" : "FAIL");
+      if (!ok) ++failures;
+    }
+  }
+
   if (failures) {
     std::printf("FAILED: %d case(s)\n", failures);
     return 1;
   }
   std::printf("PASS: light fp ops (calc + clamp + maxf + stale_repro "
-              "+ ret_const + dcalc + dclamp + dmax + dret_15 + dtoi)\n");
+              "+ ret_const + dcalc + dclamp + dmax + dret_15 + dtoi "
+              "+ scalar fp conversions)\n");
   return 0;
 #else
   std::printf("PASS (emit+coverage only): non-AArch64 host, execution "

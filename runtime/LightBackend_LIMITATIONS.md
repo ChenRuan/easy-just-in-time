@@ -1,21 +1,10 @@
 # EasyJIT Light Backend Limitations
 
 This file tracks the intentional limits of the AArch64 light backend used by
-`EASYJIT_LIGHT_BACKEND_ONLY=ON`.
+`EASYJIT_LIGHT_BACKEND_ONLY=ON`. It is also pulled in automatically by the
+top-level `check` target when the light backend is enabled.
 
-##It is also pulled in automatically by the top-level `check` target when
-the light backend is enabled. The test exercises LDR/LDRH/STR, the
-12-bit-immediate ADD fast path, a >16-bit positive constant ADD, **and**
-an `i32` negative constant ADD (`-12345`, bit pattern `0xFFFFCFC7`).
-The latter two both force the binop RHS through `materializeImmAny` →
-`emitMovImm`, producing a real `MOVZ Wd,#lo` + `MOVK Wd,#hi,lsl #16`
-halfword pair each. The test asserts ≥2 MOVZ + ≥2 MOVK opcode words
-in the LE stream and explicitly asserts that no MOVN appears (the
-round-8e design choice is bit-pattern materialization, not MOVN), so
-any future change that silently bypasses the wide- or negative-
-immediate path will be caught here. (MOVZ/MOVK halfwords are also
-exercised independently by the absolute-address path used for snapshot
-bases.)Behavior
+## Fallback Behavior
 
 Light-only builds do not contain ORC/LLVM CodeGen fallback. If the light backend
 rejects a function, the runtime can only fall back to the original function
@@ -167,6 +156,27 @@ final-mile claim is deferred to a target-machine validation pass.
 - `fptosi float -> i32` (FCVTZS Wd, Sn) and `fptosi double -> i32`
   (FCVTZS Wd, Dn, round 8h). Conversion uses the round-toward-zero
   saturating semantics required by the C standard.
+- Round 8i: full scalar FP↔int / FP↔FP conversion family. All
+  conversions use the canonical AArch64 conversion encoders that
+  share the same FP-int conversion bit slot, so the light backend
+  emits exactly one instruction per IR conversion node:
+  - `fptosi {float,double} -> {i32,i64}`: `FCVTZS Wd,Sn` /
+    `FCVTZS Wd,Dn` / `FCVTZS Xd,Sn` / `FCVTZS Xd,Dn`.
+  - `fptoui {float,double} -> {i32,i64}`: same shape with `FCVTZU`.
+  - `sitofp {i32,i64} -> {float,double}`: `SCVTF Sd,Wn` /
+    `SCVTF Sd,Xn` / `SCVTF Dd,Wn` / `SCVTF Dd,Xn`.
+  - `uitofp {i32,i64} -> {float,double}`: same shape with `UCVTF`.
+  - `fpext float -> double`: `FCVT Dd,Sn` (precision change,
+    type=00→01, opc=01).
+  - `fptrunc double -> float`: `FCVT Sd,Dn` (precision change,
+    type=01→00, opc=00).
+  - `bitcast` reinterpret: `float <-> i32` via `FMOV Wd,Sn` /
+    `FMOV Sd,Wn`; `double <-> i64` via `FMOV Xd,Dn` / `FMOV Dd,Xn`.
+    Same-width same-class integer bitcasts (rare, e.g. `i32 <-> i32`
+    in transformed IR) forward the source register without emitting
+    code. Pointer↔pointer bitcasts are still folded into the
+    `ptrLoc` pointer-tracking chain in pass 2 and never reach the
+    code-emission path.
 - `sext/zext/trunc` over integer widths used by current tests.
 
 ## Known Unsupported Areas
@@ -174,10 +184,10 @@ final-mile claim is deferred to a target-machine validation pass.
 - `double` / `f64` conversions other than `fptosi double -> i32`:
   `fpext float -> double`, `fptrunc double -> float`, `fptoui` of any
   width, `sitofp`/`uitofp` from any integer width, `bitcast double
-  <-> i64`, and ordered/unordered FP-class intrinsics are all out of
-  scope for round 8h. Scalar `double` arithmetic, load/store, fcmp,
-  select, ret, and `fptosi double -> i32` ARE supported — see
-  Currently Supported IR Shape.
+  <-> i64` are all supported as of round 8i — see Currently Supported
+  IR Shape. Out-of-scope items in this family are the FP-class
+  intrinsics (e.g. `llvm.is.fpclass`), saturating conversion
+  intrinsics, and the half/bfloat/long-double FP types.
 - Vector IR.
 - Unordered FP comparison predicates (`FCMP_UEQ`, `FCMP_UNE`,
   `FCMP_UGT`, `FCMP_UGE`, `FCMP_ULT`, `FCMP_ULE`, `FCMP_UNO`,
@@ -254,7 +264,15 @@ lifetime (a dedicated reproducer asserts the FCMP RHS does not get
 clobbered by an intervening FP-constant materialization). The test
 includes opcode-mask coverage guards (`FADD-S` / `FSUB-S` / `FMUL-S`
 / `FDIV-S` / `FCMP-S`) that run on any host, plus full
-`mmap`+execute correctness on AArch64 hosts.
+`mmap`+execute correctness on AArch64 hosts. Round 8h extends it to
+the full scalar `double` family (D-form binops, `FCMP-D`, `FMOV D,X`
+constant materialization, `FCVTZS W,D`); round 8i extends it again
+to cover every scalar FP↔int / FP↔FP conversion (`FCVTZS X,S`,
+`FCVTZS X,D`, `FCVTZU W,S` / `W,D` / `X,S` / `X,D`, `SCVTF S,W` /
+`S,X` / `D,W` / `D,X`, `UCVTF` in all four widths, `FCVT D,S`,
+`FCVT S,D`, `FMOV W,S`, `FMOV S,W`, `FMOV X,D`, `FMOV D,X`) with
+matching opcode-mask coverage guards and exact bit-pattern execution
+checks for all four bitcast directions.
 
 Run it directly:
 
