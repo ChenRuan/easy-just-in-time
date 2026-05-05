@@ -810,25 +810,45 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
 
   // For the retval-bearing ret, we need to know frameSize. Already have it.
 
-  // Helper: emit a MOVZ/MOVK chain that places a non-negative integer
-  // constant into Wrd (is64=false) or Xrd (is64=true). Halfword
-  // selection uses the positional `hw` field of MOVZ/MOVK (ARM ARM
-  // C6.2.193 / C6.2.194) — endian-neutral by construction. Negative
-  // values return false (no MOVN-style materialization yet); values
-  // that do not fit the requested width also return false.
+  // Helper: emit a MOVZ/MOVK chain that places an arbitrary integer
+  // constant (negative or non-negative) into Wrd (is64=false) or Xrd
+  // (is64=true). Halfword selection uses the positional `hw` field of
+  // MOVZ/MOVK (ARM ARM C6.2.193 / C6.2.194) — endian-neutral by
+  // construction.
+  //
+  // Negative-immediate strategy (round 8e):
+  //   We materialize the unsigned two's-complement bit pattern of the
+  //   constant at the operation width (32 or 64 bits) using MOVZ + up
+  //   to 3 MOVKs. This avoids needing a separate MOVN encoder while
+  //   still giving correct results for every representable value:
+  //     - i32  -12345  → 0xFFFFCFC7 → MOVZ W,#0xCFC7 + MOVK W,#0xFFFF,lsl#16
+  //     - i32  -1      → 0xFFFFFFFF → MOVZ W,#0xFFFF + MOVK W,#0xFFFF,lsl#16
+  //     - i64  -1      → all-ones   → MOVZ X,#0xFFFF + 3× MOVK ,#0xFFFF
+  //   Cost is at worst 2 instructions (i32) or 4 (i64) — same upper
+  //   bound as the previous non-negative path. We deliberately do
+  //   not emit MOVN: MOVN would shave one instruction off some
+  //   negative values, but the simpler bit-pattern path keeps the
+  //   helper symmetric for positive and negative constants and avoids
+  //   a second encoder.
+  //
+  // The input APInt is normalized to the operation width with
+  // `sextOrTrunc`, so a narrower IR type (e.g. an i8 constant used in
+  // an i32 binop) is sign-extended into the right 32-bit pattern.
+  // Narrow integer (i1/i8/i16) constants are still only intended to
+  // appear after the frontend has widened the surrounding operation —
+  // we do NOT promise correctness for an i8/i16 binop directly.
   //
   // Encoding choice:
-  //   - 32-bit form: at most one MOVZ W,#lo + optional MOVK W,#hi,lsl#16.
+  //   - 32-bit form: MOVZ W,#hw0 + optional MOVK W,#hw1,lsl#16
+  //     (the MOVZ is always emitted — for hw0==0 it produces the
+  //     necessary zeroing of the upper halfword in W).
   //   - 64-bit form: MOVZ X,#hw0 + up to three MOVK X,#hwN,lsl#(N*16);
-  //     the leading MOVZ is always emitted (even if hw0==0) so the upper
-  //     halfwords start from a known zero state. This is at most 4
-  //     instructions for any 64-bit constant — small enough that we do
-  //     not bother with MOVZ-at-first-nonzero-halfword optimisations.
-  auto emitMovImm = [&](unsigned rd, bool is64, const APInt &AP) -> bool {
-    if (AP.isNegative()) return false;
+  //     skip MOVK when the halfword is zero, since MOVZ already left
+  //     it zero.
+  auto emitMovImm = [&](unsigned rd, bool is64, const APInt &APIn) -> bool {
+    APInt AP = APIn.sextOrTrunc(is64 ? 64 : 32);
     uint64_t v = AP.getZExtValue();
     if (!is64) {
-      if (AP.getActiveBits() > 32) return false;
       uint16_t lo = (uint16_t)(v & 0xFFFFu);
       uint16_t hi = (uint16_t)((v >> 16) & 0xFFFFu);
       if (!W.emit(encMovz16(false, rd, lo))) return false;
@@ -855,9 +875,10 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
           if (!W.emit(encMovReg(is64, 0, itr->second))) return false;
         }
       } else if (auto *CI = dyn_cast<ConstantInt>(retVal)) {
-        // Materialize a non-negative integer return constant directly
-        // into x0/w0 via the shared MOVZ/MOVK helper above. Negative
-        // immediates still fail (no MOVN path yet).
+        // Materialize an integer return constant directly into x0/w0
+        // via the shared MOVZ/MOVK helper above. Both non-negative and
+        // negative values are supported (negatives use the unsigned
+        // two's-complement bit pattern at the operation width).
         bool is64 = CI->getType()->isIntegerTy(64);
         if (!emitMovImm(0, is64, CI->getValue())) return false;
       } else {
@@ -870,10 +891,11 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
     return W.emit(kRet);
   };
 
-  // Helper: materialize a non-negative integer immediate into x16/w16
-  // (the binop scratch slot). Width follows the binop request: i32 →
-  // up to 32-bit MOVZ+MOVK; i64 → up to 4-halfword MOVZ+MOVK chain.
-  // Negative values are still rejected (kept narrow; round-9 leftover).
+  // Helper: materialize an integer immediate into x16/w16 (the binop
+  // scratch slot). Width follows the binop request: i32 → 32-bit
+  // MOVZ + optional MOVK; i64 → up to 4-halfword MOVZ+MOVK chain.
+  // Negative values are supported via the two's-complement bit
+  // pattern (see `emitMovImm` above).
   auto materializeImmAny = [&](const ConstantInt *CI, bool is64,
                                unsigned &outReg) -> bool {
     outReg = 16;

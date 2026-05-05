@@ -23,15 +23,19 @@
 //
 // Scope note: the IR sample below exercises LDR/LDRH/STR and the
 // 12-bit-immediate ADD fast path, AND deliberately includes a wider
-// constant (0x12345 — does not fit imm12 = 0xFFF) so that the binop
-// RHS routes through `materializeImmAny` → `emitMovImm`, producing a
-// real MOVZ + MOVK,lsl#16 halfword chain in the emitted stream. This
-// is what makes the parity claim non-trivial: MOVZ/MOVK use the
-// positional `hw` field (ARM ARM C6.2.193 / C6.2.194), so any LE/BE
-// divergence would necessarily come from either the triple gate or
-// the host-endian-agnostic `Writer::emit`. The test asserts presence
-// of at least one MOVZ and one MOVK opcode word in the LE stream as
-// a guard against the materializer being silently bypassed.
+// positive constant (0x12345 — does not fit imm12 = 0xFFF) and an
+// i32 negative constant (-12345, two's-complement bit pattern
+// 0xFFFFCFC7) so that the binop RHS routes through
+// `materializeImmAny` → `emitMovImm`, producing real MOVZ + MOVK,lsl#16
+// halfword chains in the emitted stream — for both the positive and
+// the negative case. This is what makes the parity claim non-trivial:
+// MOVZ/MOVK use the positional `hw` field (ARM ARM C6.2.193 /
+// C6.2.194), so any LE/BE divergence would necessarily come from
+// either the triple gate or the host-endian-agnostic `Writer::emit`.
+// The test asserts presence of at least two MOVZ and two MOVK opcode
+// words in the LE stream (one pair per constant) and explicitly
+// rejects MOVN, documenting the round-8e design choice of
+// bit-pattern (rather than MOVN-based) negative materialization.
 //
 // What it does NOT prove:
 //   * That code emitted with the BE module actually runs correctly on a
@@ -67,6 +71,9 @@ namespace {
 //     MOVZ W16,#lo + MOVK W16,#hi,lsl#16 + ADD reg-reg. This is the
 //     halfword-positional encoding (ARM ARM C6.2.193 / C6.2.194) that
 //     the round-8 endian-parity claim hinges on.
+//   - i32 negative constant add (-12345 → 0xFFFFCFC7) — exercises the
+//     round-8e bit-pattern negative materialization: MOVZ + MOVK,lsl#16
+//     with the upper halfword = 0xFFFF, no MOVN involved.
 //   - i32 add reg-reg and ret
 static std::unique_ptr<llvm::Module>
 BuildSampleModule(llvm::LLVMContext &C, const char *Triple, const char *DL) {
@@ -101,8 +108,15 @@ BuildSampleModule(llvm::LLVMContext &C, const char *Triple, const char *DL) {
   // emitMovImm, producing MOVZ W16,#0x2345 + MOVK W16,#0x1,lsl#16 +
   // ADD reg-reg. This is the path round 8d wants endian-parity-tested.
   Value *k2  = B.CreateAdd(k, B.getInt32(0x12345), "k2");
-  B.CreateAlignedStore(k2, P, MaybeAlign(4));
-  B.CreateRet(k2);
+  // Negative-immediate add — i32 -12345 has bit pattern 0xFFFFCFC7,
+  // which forces emitMovImm down the bit-pattern path (round 8e):
+  // MOVZ W16,#0xCFC7 + MOVK W16,#0xFFFF,lsl#16 + ADD reg-reg. Both
+  // halfwords are nonzero, so this also guarantees a second MOVZ +
+  // MOVK pair appears in the stream regardless of how the positive
+  // 0x12345 case folds.
+  Value *k3  = B.CreateAdd(k2, B.getInt32(-12345), "k3");
+  B.CreateAlignedStore(k3, P, MaybeAlign(4));
+  B.CreateRet(k3);
   return M;
 }
 
@@ -212,27 +226,35 @@ int main() {
     }
   }
 
-  // Coverage guard: the sample module includes a >16-bit ADD constant
-  // (0x12345) that must route through `materializeImmAny` →
-  // `emitMovImm` and produce at least one MOVZ + at least one MOVK
-  // halfword instruction in the LE stream. If a future change silently
-  // sidesteps this path (e.g. by folding the constant or by widening
-  // the imm12 fast path beyond what AArch64 actually supports), this
-  // test should fail loudly so the >16-bit MOVZ/MOVK encoding remains
-  // covered. Opcode masks per ARM ARM C6.2.193 / C6.2.194:
+  // Coverage guard: the sample module includes both a >16-bit positive
+  // ADD constant (0x12345) and an i32 negative constant (-12345, bit
+  // pattern 0xFFFFCFC7). Both must route through `materializeImmAny`
+  // → `emitMovImm`. Round 8e materializes negatives using the
+  // unsigned two's-complement bit pattern (no MOVN), so each of the
+  // two constants produces a MOVZ + MOVK,lsl#16 pair. We therefore
+  // expect at least 2 MOVZ and at least 2 MOVK opcode words in the
+  // LE stream; if a future change silently sidesteps this path (e.g.
+  // by rejecting negatives again, by folding constants, or by widening
+  // the imm12 fast path beyond what AArch64 supports), this test
+  // should fail loudly. Opcode masks per ARM ARM C6.2.193 / C6.2.194:
   //   MOVZ (32/64-bit) : top 9 bits = 0b?10100101  → mask 0x7F800000,
   //                                                  value 0x52800000
   //   MOVK (32/64-bit) : top 9 bits = 0b?11100101  → mask 0x7F800000,
   //                                                  value 0x72800000
+  //   MOVN (32/64-bit) : top 9 bits = 0b?00100101  → mask 0x7F800000,
+  //                                                  value 0x12800000
   // We intentionally accept both 32-bit (sf=0) and 64-bit (sf=1)
-  // forms — only the opcode family matters here.
+  // forms — only the opcode family matters here. We also count MOVN
+  // and assert it is zero, to document the round-8e design choice
+  // ("bit-pattern, not MOVN") — if someone later switches to MOVN
+  // they should update this assertion deliberately.
   if (!codeLE.empty()) {
     if ((codeLE.size() % 4) != 0) {
       std::printf("FAIL: code size %zu is not a multiple of 4\n",
                   codeLE.size());
       ++failures;
     } else {
-      unsigned movzCount = 0, movkCount = 0;
+      unsigned movzCount = 0, movkCount = 0, movnCount = 0;
       for (size_t i = 0; i < codeLE.size(); i += 4) {
         uint32_t w = (uint32_t)codeLE[i]
                    | ((uint32_t)codeLE[i+1] << 8)
@@ -240,15 +262,24 @@ int main() {
                    | ((uint32_t)codeLE[i+3] << 24);
         if ((w & 0x7F800000u) == 0x52800000u) ++movzCount;
         if ((w & 0x7F800000u) == 0x72800000u) ++movkCount;
+        if ((w & 0x7F800000u) == 0x12800000u) ++movnCount;
       }
-      if (movzCount == 0 || movkCount == 0) {
-        std::printf("FAIL: expected MOVZ+MOVK in stream, got "
-                    "movz=%u movk=%u (the wide-immediate path was "
-                    "not exercised)\n", movzCount, movkCount);
+      if (movzCount < 2 || movkCount < 2) {
+        std::printf("FAIL: expected >=2 MOVZ + >=2 MOVK in stream "
+                    "(positive 0x12345 + negative -12345), got "
+                    "movz=%u movk=%u movn=%u\n",
+                    movzCount, movkCount, movnCount);
+        ++failures;
+      } else if (movnCount != 0) {
+        std::printf("FAIL: round 8e chose bit-pattern materialization, "
+                    "not MOVN, but stream contains movn=%u — update "
+                    "this assertion if the design changed\n",
+                    movnCount);
         ++failures;
       } else {
         std::printf("OK: stream contains MOVZ x%u + MOVK x%u "
-                    "(materializeImmAny exercised)\n",
+                    "(positive + negative materialization exercised, "
+                    "no MOVN as designed)\n",
                     movzCount, movkCount);
       }
     }

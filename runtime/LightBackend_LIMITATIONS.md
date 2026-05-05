@@ -3,7 +3,19 @@
 This file tracks the intentional limits of the AArch64 light backend used by
 `EASYJIT_LIGHT_BACKEND_ONLY=ON`.
 
-## Fallback Behavior
+##It is also pulled in automatically by the top-level `check` target when
+the light backend is enabled. The test exercises LDR/LDRH/STR, the
+12-bit-immediate ADD fast path, a >16-bit positive constant ADD, **and**
+an `i32` negative constant ADD (`-12345`, bit pattern `0xFFFFCFC7`).
+The latter two both force the binop RHS through `materializeImmAny` →
+`emitMovImm`, producing a real `MOVZ Wd,#lo` + `MOVK Wd,#hi,lsl #16`
+halfword pair each. The test asserts ≥2 MOVZ + ≥2 MOVK opcode words
+in the LE stream and explicitly asserts that no MOVN appears (the
+round-8e design choice is bit-pattern materialization, not MOVN), so
+any future change that silently bypasses the wide- or negative-
+immediate path will be caught here. (MOVZ/MOVK halfwords are also
+exercised independently by the absolute-address path used for snapshot
+bases.)Behavior
 
 Light-only builds do not contain ORC/LLVM CodeGen fallback. If the light backend
 rejects a function, the runtime can only fall back to the original function
@@ -77,13 +89,25 @@ final-mile claim is deferred to a target-machine validation pass.
 - `i8/i16/i32/i64` loads and stores.
 - `float` loads and stores.
 - Integer arithmetic: `add/sub/mul/and/or/xor/shl/lshr/ashr`.
-- Non-negative `i32` / `i64` integer constants used as binop RHS or as
-  the value of an integer `ret` are materialized through a generic
-  MOVZ + (optional) MOVK halfword chain (`emitMovImm` /
-  `materializeImmAny` in `light_codegen/light_aarch64.cpp`):
+- Arbitrary `i32` / `i64` integer constants — including negative
+  values — used as binop RHS or as the value of an integer `ret` are
+  materialized through a generic MOVZ + (optional) MOVK halfword
+  chain (`emitMovImm` / `materializeImmAny` in
+  `light_codegen/light_aarch64.cpp`):
   one MOVZ for `0..0xFFFF`; MOVZ + MOVK,lsl#16 for `0x10000..0xFFFFFFFF`;
-  up to four MOVZ/MOVK halfwords for full 64-bit constants. The 12-bit
-  immediate ADD/SUB fast path still wins when the constant fits.
+  up to four MOVZ/MOVK halfwords for full 64-bit constants. Negative
+  values are handled by materializing the unsigned two's-complement
+  bit pattern at the operation width (32 or 64 bits): for example
+  `-12345` (i32) becomes `MOVZ W,#0xCFC7 + MOVK W,#0xFFFF,lsl#16`,
+  and `-1` (i64) becomes `MOVZ X,#0xFFFF + 3× MOVK ,#0xFFFF`. We do
+  NOT emit `MOVN`; the bit-pattern path keeps the helper symmetric
+  for positive and negative values and avoids a second encoder. The
+  12-bit immediate ADD/SUB fast path still wins when the constant
+  fits and is non-negative. Note: this guarantee is for `i32` and
+  `i64` constants used by an integer binop or `ret` of matching
+  width; narrow-integer (`i1`/`i8`/`i16`) negative constants used
+  directly in a same-width binop are not promised — the frontend is
+  expected to widen the operation first.
 - Integer comparisons when fused into a following conditional branch.
 - Integer and float phi copies.
 - `llvm.memcpy` with constant size up to 32 bytes.
@@ -94,12 +118,6 @@ final-mile claim is deferred to a target-machine validation pass.
 ## Known Unsupported Areas
 
 - `double` / `f64` arithmetic and conversion.
-- Negative integer immediate materialization (no MOVN-style chain yet);
-  `emitMovImm` returns false for `APInt::isNegative()` constants and the
-  caller falls back to the generic backend. Sign-extending a small
-  positive constant into a 64-bit register followed by a binop also
-  isn't matched as a "small immediate" — it goes through the generic
-  path.
 - Vector IR.
 - Standalone floating-point `fadd`, `fsub`, `fmul`, `fdiv` when optimization
   does not lower the pattern to `llvm.fmuladd.f32`.
