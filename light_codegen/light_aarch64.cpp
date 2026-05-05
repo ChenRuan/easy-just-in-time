@@ -422,21 +422,29 @@ struct Writer {
 // access into a host buffer whose base is known, or into a forwarded pointer
 // argument).
 //
-// The scaled-index forms are the minimum increment that lets us serve
-// `getelementptr T, ptr <base>, i64 %idx` patterns. We deliberately keep this to ONE runtime
-// index per pointer and a power-of-two element scale so the emitter
-// can lower it with a single `ADD x17, x17, Wm/Xm, ext #shift`.
+// The scaled-index forms lower `getelementptr` patterns with up to two
+// runtime indices and power-of-two element scales. Round 8k extended
+// the original single-term design (`base + idx0*scale0`) to up to TWO
+// dynamic terms (`base + idx0*scale0 + idx1*scale1 + constOff`), which
+// covers nested 2D-array GEPs like `base[i][j]`. Each term lowers to a
+// single `ADD x17, x17, Wm/Xm, ext #shift` when log2(scale) <= 4, or
+// a 3-instruction extend+LSL+ADD sequence when 4 < log2(scale) <= 12,
+// using x16 as the per-term temp.
 struct PtrLoc {
   enum Kind { InReg, StackRel, Absolute, AbsoluteScaledIndex, InRegScaledIndex } kind = InReg;
   unsigned reg = 0;     // for InReg
   int32_t  spOff = 0;   // for StackRel
   uint64_t addr = 0;    // for Absolute* forms (addr+const_off)
 
-  // For *ScaledIndex only:
-  const llvm::Value *idxValue = nullptr;  // non-constant index Value (i32 or i64)
-  uint32_t  scaleLog2 = 0;                // 0..3 (scale=1,2,4,8); only PoT
-  bool      idxIs64 = false;              // true: idx is i64; false: i32
-  bool      idxSigned = true;             // SXT vs UXT when extending i32 to i64
+  // For *ScaledIndex only. Up to 2 terms (round 8k).
+  struct Term {
+    const llvm::Value *value = nullptr;
+    uint32_t scaleLog2 = 0;
+    bool is64 = false;
+    bool isSigned = true;
+  };
+  Term terms[2] = {};
+  unsigned numTerms = 0;
 };
 
 struct ICmpFusion {
@@ -637,28 +645,30 @@ static bool resolvePtrLocChain(const Value *P, const DataLayout &DL,
 
 // Inspect a GEP and decide whether it can be expressed as
 //
-//   base_addr + const_off + idx * scale
+//   base_addr + const_off + idx0 * scale0 [+ idx1 * scale1]
 //
-// where base_addr is some PtrLoc::Absolute (after going through
-// resolvePtrLocChain), at most ONE GEP index is non-constant, all other
-// indices are constant, the non-constant index is an i32/i64 integer
-// Value, and the scale at the dynamic index is a power of two ≤ 8.
+// where base_addr is some PtrLoc::Absolute or PtrLoc::InReg (after
+// going through resolvePtrLocChain), each non-constant GEP index is
+// an i32 or i64 integer Value (or a sext/zext from one), at most TWO
+// indices are non-constant, all other indices are constant, and each
+// dynamic scale is a power of two with log2 <= 12. Round 8k lifted
+// the original "one runtime index, scale <= 8" restriction.
 //
-// On success fills `out` with kind=AbsoluteScaledIndex and returns true.
-// On any miss returns false (caller falls back / emits Unsupported).
+// On success fills `out` with kind=AbsoluteScaledIndex/InRegScaledIndex
+// and numTerms in {1, 2}, and returns true. On any miss returns false
+// (caller falls back / emits Unsupported).
 //
-// We use gep_type_iterator from llvm/IR/GetElementPtrTypeIterator.h-style
-// walking via GEP->getSourceElementType() + getIndexedType(). To keep
-// dependencies minimal we walk indices ourselves: at each step the
-// "indexed type" tells us the stride (struct member offset for struct,
-// element size for array/vector/pointer-element).
+// To keep dependencies minimal we walk indices ourselves: at each step
+// the "indexed type" tells us the stride (struct member offset for
+// struct, element size for array/vector/pointer-element).
 static bool resolveDynScaledGep(const GEPOperator *GEP, const DataLayout &DL,
                                 const std::unordered_map<const Value *, PtrLoc> &known,
                                 const GlobalSymbol *globals, size_t nglobals,
                                 PtrLoc &out) {
   // Resolve the base. The base must NOT itself already be a scaled-index
-  // form (we only support one runtime index per pointer location). It
-  // must reduce to a flat Absolute address or a forwarded pointer in a GPR.
+  // form (we only support one chain of runtime indices per pointer
+  // location). It must reduce to a flat Absolute address or a forwarded
+  // pointer in a GPR.
   PtrLoc base;
   if (!resolvePtrLocChain(GEP->getPointerOperand(), DL, known,
                           globals, nglobals, base))
@@ -669,8 +679,22 @@ static bool resolveDynScaledGep(const GEPOperator *GEP, const DataLayout &DL,
   // First index applies to the source element type as if it were an
   // array. Subsequent indices walk into structs/arrays/vectors.
   int64_t constOff = 0;
-  const Value *dynIdx = nullptr;
-  uint64_t dynScale = 0;
+  // Up to two pending dynamic terms (idx Value + element size).
+  struct Pending { const Value *v; uint64_t scale; };
+  Pending pend[2] = {};
+  unsigned nPend = 0;
+
+  auto pushDyn = [&](const Value *v, uint64_t elemSize) -> bool {
+    if (elemSize == 0) return false;
+    if (elemSize & (elemSize - 1)) return false; // PoT only
+    if (nPend >= 2) return false;
+    // log2 <= 12 (scale <= 4096) keeps the materializer's LSL imm6 sane.
+    uint64_t s = elemSize; unsigned log2 = 0;
+    while (s > 1) { s >>= 1; ++log2; }
+    if (log2 > 12) return false;
+    pend[nPend++] = {v, elemSize};
+    return true;
+  };
 
   unsigned NumIdx = GEP->getNumIndices();
   if (NumIdx == 0) return false;
@@ -683,17 +707,8 @@ static bool resolveDynScaledGep(const GEPOperator *GEP, const DataLayout &DL,
       if (auto *CI = dyn_cast<ConstantInt>(Idx)) {
         constOff += (int64_t)CI->getSExtValue() * (int64_t)elemSize;
       } else {
-        if (dynIdx) return false; // already have one runtime index
-        // Only PoT scale, ≤ 8.
-        if (elemSize == 0) return false;
-        if (elemSize & (elemSize - 1)) return false;
-        if (elemSize > 8) return false;
-        dynIdx = Idx;
-        dynScale = elemSize;
+        if (!pushDyn(Idx, elemSize)) return false;
       }
-      // After indexing into the source-element type as an array, the
-      // current type stays the same (index into outer array → element).
-      // For multi-index GEPs the next index walks INTO Cur.
       continue;
     }
     // Subsequent indices walk into Cur.
@@ -712,12 +727,7 @@ static bool resolveDynScaledGep(const GEPOperator *GEP, const DataLayout &DL,
       if (auto *CI = dyn_cast<ConstantInt>(Idx)) {
         constOff += (int64_t)CI->getSExtValue() * (int64_t)elemSize;
       } else {
-        if (dynIdx) return false;
-        if (elemSize == 0) return false;
-        if (elemSize & (elemSize - 1)) return false;
-        if (elemSize > 8) return false;
-        dynIdx = Idx;
-        dynScale = elemSize;
+        if (!pushDyn(Idx, elemSize)) return false;
       }
       Cur = AT->getElementType();
       continue;
@@ -726,43 +736,9 @@ static bool resolveDynScaledGep(const GEPOperator *GEP, const DataLayout &DL,
     return false;
   }
 
-  if (!dynIdx) {
+  if (nPend == 0) {
     // No runtime index — caller should have used the const-offset path.
     return false;
-  }
-
-  // Inspect the dynamic index. We accept i32 or i64. If it's a sext/zext
-  // from i32, look through it: the underlying GPR holds the i32 value
-  // (the cast in this emitter is a no-op alias), so we should emit
-  // SXTW/UXTW with that GPR. If it's already i64, use UXTX/SXTX (no-op
-  // for 64-bit) — pick UXTX for simplicity since the upper bits are
-  // already valid in a true i64 register.
-  bool idxIs64 = false;
-  bool idxSigned = true; // default: signed
-  const Value *idxV = dynIdx;
-  if (auto *Sx = dyn_cast<SExtInst>(idxV)) {
-    Value *Src = Sx->getOperand(0);
-    if (Src->getType()->isIntegerTy(32)) {
-      idxV = Src; idxIs64 = false; idxSigned = true;
-    } else if (Src->getType()->isIntegerTy(64)) {
-      idxV = Src; idxIs64 = true; idxSigned = true;
-    } else {
-      return false;
-    }
-  } else if (auto *Zx = dyn_cast<ZExtInst>(idxV)) {
-    Value *Src = Zx->getOperand(0);
-    if (Src->getType()->isIntegerTy(32)) {
-      idxV = Src; idxIs64 = false; idxSigned = false;
-    } else if (Src->getType()->isIntegerTy(64)) {
-      idxV = Src; idxIs64 = true; idxSigned = false;
-    } else {
-      return false;
-    }
-  } else {
-    Type *T = idxV->getType();
-    if (T->isIntegerTy(32))      { idxIs64 = false; idxSigned = true; }
-    else if (T->isIntegerTy(64)) { idxIs64 = true;  idxSigned = false; }
-    else return false;
   }
 
   // Build the result.
@@ -773,13 +749,49 @@ static bool resolveDynScaledGep(const GEPOperator *GEP, const DataLayout &DL,
   out.reg        = base.reg;
   out.spOff      = base.spOff + (int32_t)constOff;
   out.addr       = base.addr + (uint64_t)constOff;
-  out.idxValue   = idxV;
-  uint64_t s = dynScale;
-  unsigned log2 = 0;
-  while (s > 1) { s >>= 1; ++log2; }
-  out.scaleLog2  = log2;
-  out.idxIs64    = idxIs64;
-  out.idxSigned  = idxSigned;
+  out.numTerms   = nPend;
+
+  for (unsigned t = 0; t < nPend; ++t) {
+    // Inspect the dynamic index. We accept i32 or i64. If it's a
+    // sext/zext from i32, look through it: the underlying GPR holds the
+    // i32 value (the cast in this emitter is a no-op alias), so we
+    // should emit SXTW/UXTW with that GPR. If it's already i64, use
+    // UXTX/SXTX (no-op for 64-bit) — pick UXTX for the unsigned case
+    // since the upper bits are already valid in a true i64 register.
+    bool idxIs64 = false;
+    bool idxSigned = true;
+    const Value *idxV = pend[t].v;
+    if (auto *Sx = dyn_cast<SExtInst>(idxV)) {
+      Value *Src = Sx->getOperand(0);
+      if (Src->getType()->isIntegerTy(32)) {
+        idxV = Src; idxIs64 = false; idxSigned = true;
+      } else if (Src->getType()->isIntegerTy(64)) {
+        idxV = Src; idxIs64 = true; idxSigned = true;
+      } else {
+        return false;
+      }
+    } else if (auto *Zx = dyn_cast<ZExtInst>(idxV)) {
+      Value *Src = Zx->getOperand(0);
+      if (Src->getType()->isIntegerTy(32)) {
+        idxV = Src; idxIs64 = false; idxSigned = false;
+      } else if (Src->getType()->isIntegerTy(64)) {
+        idxV = Src; idxIs64 = true; idxSigned = false;
+      } else {
+        return false;
+      }
+    } else {
+      Type *T = idxV->getType();
+      if (T->isIntegerTy(32))      { idxIs64 = false; idxSigned = true; }
+      else if (T->isIntegerTy(64)) { idxIs64 = true;  idxSigned = false; }
+      else return false;
+    }
+    uint64_t s = pend[t].scale; unsigned log2 = 0;
+    while (s > 1) { s >>= 1; ++log2; }
+    out.terms[t].value     = idxV;
+    out.terms[t].scaleLog2 = log2;
+    out.terms[t].is64      = idxIs64;
+    out.terms[t].isSigned  = idxSigned;
+  }
   return true;
 }
 
@@ -1333,20 +1345,23 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
     return true;
   };
 
-  // Helper: materialize the address of a PtrLoc::AbsoluteScaledIndex into
-  // x17 (final base register). Sequence:
-  //   MOVZ/MOVK x17, addr           (addr already includes any const_off)
-  //   ADD x17, x17, Wm/Xm, ext #log2(scale)
+  // Helper: materialize the address of a PtrLoc::*ScaledIndex into x17.
+  // Sequence:
+  //   MOVZ/MOVK x17, addr           (Absolute base, includes const_off)
+  //   or  MOV x17, base.reg ; ADD x17, x17, #spOff   (InReg base)
+  // then for each term (round 8k: up to 2):
+  //   shift <= 4: ADD x17, x17, Wm/Xm, ext #shift   (single instruction)
+  //   shift  > 4: extend idx into x16; LSL x16, x16, #shift;
+  //               ADD x17, x17, x16, UXTX #0        (3 instructions)
   //
-  // ext is one of {UXTW=2, SXTW=6, UXTX=3} depending on idxIs64/idxSigned.
-  // For idxIs64=true we use UXTX (option=3) so a 64-bit register is taken
-  // as-is; sign of the value is irrelevant for the mod-2^64 add. For
-  // idxIs64=false we use SXTW or UXTW based on idxSigned, mirroring the
-  // sext/zext semantics of the IR's index-typing cast.
+  // ext is one of {UXTW=2, SXTW=6, UXTX=3, SXTX=7} depending on
+  // idxIs64/idxSigned. For idxIs64=true we use UXTX (option=3); sign of
+  // the value is irrelevant for the mod-2^64 add. For idxIs64=false we
+  // use SXTW or UXTW based on idxSigned, mirroring the sext/zext
+  // semantics of the IR's index-typing cast.
   //
-  // Endian: addr → x17 path is MOVZ/MOVK halfwords (positional). The ADD
-  // operates on register values, not memory, so it is endian-neutral. The
-  // subsequent LDR/STR honours target data endian (handled by hardware).
+  // x16 is treated as scratch in the >4 path — safe here because no
+  // immediate-materialization runs between us and the final LDR/STR.
   auto materializeScaledAddrToX17 = [&](const PtrLoc &P) -> bool {
     if (P.kind == PtrLoc::AbsoluteScaledIndex) {
       if (!materializeAddrToX17(P.addr)) return false;
@@ -1359,13 +1374,31 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
     } else {
       return false;
     }
-    unsigned idxReg;
-    if (!valueInReg(P.idxValue, P.idxIs64, idxReg)) return false;
-    unsigned option;
-    if (P.idxIs64)         option = 3; // UXTX (64-bit no-op)
-    else if (P.idxSigned)  option = 6; // SXTW
-    else                   option = 2; // UXTW
-    return W.emit(encAddExtReg64(17, 17, idxReg, option, P.scaleLog2));
+    if (P.numTerms == 0 || P.numTerms > 2) return false;
+    for (unsigned t = 0; t < P.numTerms; ++t) {
+      const PtrLoc::Term &T = P.terms[t];
+      unsigned idxReg;
+      if (!valueInReg(T.value, T.is64, idxReg)) return false;
+      unsigned option;
+      if (T.is64)             option = 3; // UXTX (64-bit no-op)
+      else if (T.isSigned)    option = 6; // SXTW
+      else                    option = 2; // UXTW
+      if (T.scaleLog2 <= 4) {
+        if (!W.emit(encAddExtReg64(17, 17, idxReg, option, T.scaleLog2)))
+          return false;
+      } else {
+        // 3-instruction: extend idx -> x16, LSL x16, ADD x17,x17,x16,UXTX#0
+        if (T.is64) {
+          if (idxReg != 16 && !W.emit(encMovReg(true, 16, idxReg))) return false;
+        } else {
+          // SXTW or UXTW into x16. encExtendBits(sign, to64=true, rd=16, rn=idx, fromBits=32)
+          if (!W.emit(encExtendBits(T.isSigned, true, 16, idxReg, 32))) return false;
+        }
+        if (!W.emit(encLslImm(true, 16, 16, T.scaleLog2))) return false;
+        if (!W.emit(encAddExtReg64(17, 17, 16, /*UXTX*/3, 0))) return false;
+      }
+    }
+    return true;
   };
 
   auto accessSizeForBits = [](unsigned bits, unsigned &size) -> bool {

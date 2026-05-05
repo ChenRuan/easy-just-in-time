@@ -96,7 +96,29 @@ final-mile claim is deferred to a target-machine validation pass.
   the offset cannot be encoded in the LDR uimm12 the rejection is
   `"stack arg offset/encoding"`.
 - Fixed-size stack frame, constant-offset alloca GEP.
-- One dynamic scaled GEP index over an absolute pointer or forwarded pointer.
+- Dynamic scaled GEP with up to **two** dynamic terms (round 8k):
+
+      base + constOff + idx0 * pow2Scale0 [+ idx1 * pow2Scale1]
+
+  Each dynamic index is an `i32` or `i64` Value (sext/zext from
+  `i32` is looked through, recording the SXTW vs UXTW choice).
+  Each scale must be a power of two with `log2(scale)` in
+  `0..12`. The base may be a `PtrLoc::Absolute` (inttoptr / known
+  global) or a `PtrLoc::InReg` (function-arg pointer, including
+  one preloaded from a stack arg). The address is materialised in
+  `x17` as base, then per term:
+    * `log2(scale) <= 4`: single
+      `ADD x17, x17, Wm/Xm, {SXTW|UXTW|UXTX} #log2(scale)`.
+    * `log2(scale) in 5..12`: 3-instruction sequence —
+      `SXTW/UXTW/MOV x16, idx`, `LSL x16, x16, #log2(scale)`,
+      `ADD x17, x17, x16, UXTX #0`. `x16` is treated as
+      address-materialisation scratch and is safe because no
+      immediate-materialisation runs between us and the final
+      `LDR/STR`.
+  This covers the common `base[i][j]` pattern over nested
+  arrays (`int (*)[N]`, `double (*)[N]`) and multi-index struct
+  GEPs that have a constant struct-field prefix and two array
+  indices (`s->arr[i][j]`).
 - `i8/i16/i32/i64` loads and stores.
 - `float` loads and stores.
 - `double` loads and stores (round 8h) — `LDR Dt`/`STR Dt` with the
@@ -236,7 +258,14 @@ final-mile claim is deferred to a target-machine validation pass.
   offsets that don't fit in the scaled `LDR` uimm12 encoding
   (rejected with `"stack arg offset/encoding"`).
 - Register spilling under high pressure.
-- Multiple independent dynamic indexes in one GEP chain.
+- Dynamic GEP shapes beyond the round-8k two-term form: more than
+  two dynamic indices in the GEP chain, dynamic index scales that
+  are not powers of two, scales with `log2 > 12`, and arithmetic
+  expressions in the index slot that are not a sext/zext of a
+  scratch-resident i32/i64 (e.g. `add (mul i, C), j` is not
+  recognised — frontends should encode such patterns through nested
+  array types or struct GEPs so the resolver sees them as separate
+  dynamic indices).
 - Complex C++ frontend shapes such as exceptions, RTTI-heavy code, virtual
   dispatch that is not devirtualized, and non-trivial object lifetime code.
 - Serialization fallback: deserialized bitcode has no original function pointer
@@ -323,4 +352,26 @@ Run it directly:
 
 Like `check-light-endian`, it is pulled in automatically by the
 top-level `check` target when the light backend is enabled.
+
+A fourth standalone target `light_dynamic_gep_test` covers the
+round-8k two-term dynamic GEP support. It builds and emits six IR
+shapes: `int (*)[4]` 2-D load (both shifts ≤ 4 → two single
+ADD-extended-register instructions), `int (*)[8]` 2-D load (outer
+shift = 5 → 3-instruction extend+LSL+ADD path), `int (*)[4]` 2-D
+store + reload round trip, `double (*)[4]` 2-D load (outer shift = 5,
+inner shift = 3), a struct field + 2-D array combo
+(`struct S { int pad; int arr[4][4]; }; s->arr[i][j]`) that
+exercises the constant-offset-plus-two-dynamic-terms folding, and a
+9-arg form whose two dynamic indices arrive as round-8j stack-passed
+arguments. The test also includes a coverage guard asserting the
+small-stride 2-D shape emits ≥ 2 ADD-extended-register
+instructions, so a future refactor that silently drops the second
+term is caught here. On AArch64 hosts all six are executed for
+end-to-end correctness; on other hosts only the emit path is
+exercised. Run it directly:
+
+    cmake --build <build-dir> --target check-light-dynamic-gep
+
+It is also pulled in automatically by the top-level `check` target
+when the light backend is enabled.
 

@@ -186,4 +186,25 @@ if (EASYJIT_ENABLE_LIGHT_BACKEND)
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running light backend stack-arg test"
     VERBATIM)
+
+  # Round 8k: dynamic GEP with up to 2 dynamic terms (`base[i][j]`).
+  # Validates the extended PtrLoc::*ScaledIndex form, the per-term
+  # ADD-extended-register or extend+LSL+ADD address sequence, and
+  # multi-index struct GEP folding. End-to-end correctness on AArch64
+  # hosts; emit-only on others.
+  add_executable(light_dynamic_gep_test
+    ${CMAKE_SOURCE_DIR}/light_codegen/test_dynamic_gep.cpp
+    ${CMAKE_SOURCE_DIR}/light_codegen/light_aarch64.cpp)
+  target_include_directories(light_dynamic_gep_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/light_codegen)
+  llvm_config(light_dynamic_gep_test core support)
+  set_target_properties(light_dynamic_gep_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+  add_custom_target(check-light-dynamic-gep
+    COMMAND $<TARGET_FILE:light_dynamic_gep_test>
+    DEPENDS light_dynamic_gep_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Running light backend dynamic-GEP test"
+    VERBATIM)
 endif()
