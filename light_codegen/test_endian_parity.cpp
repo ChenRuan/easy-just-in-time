@@ -12,13 +12,23 @@
 //     is bit-identical when the IR is otherwise the same. This is the
 //     round-8 endian-parity claim:
 //       - the AArch64 instruction stream is unconditionally LE (ARM ARM
-//         B2.6.2), so neither MOVZ/MOVK halfwords nor LDR/STR opcodes
-//         depend on target data endian;
+//         B2.6.2), so LDR/STR/ADD-imm opcodes (and the MOVZ/MOVK halfword
+//         encodings used elsewhere by the emitter for absolute-address
+//         materialization) do not depend on target data endian;
 //       - Writer::emit writes explicit little-endian bytes for every
 //         32-bit instruction word, so emission is host-endian-agnostic;
 //       - the runtime always JIT-runs the code it emits, so target data
 //         endian == host endian → producer and consumer of any data
 //         buffer agree by construction.
+//
+// Scope note: the IR sample below specifically exercises LDR/LDRH/STR
+// and 12-bit-immediate ADD, which is what the binop fast path emits.
+// Wider integer constants would route through MOVZ+MOVK in
+// materializeImm16, but the binop RHS materializer currently caps at
+// 16 bits, so this test does not cover the >16-bit MOVZ/MOVK case
+// directly. The MOVZ/MOVK halfword encoding IS still exercised
+// indirectly elsewhere in the emitter (absolute-address resolution)
+// and remains positional/endian-neutral by ARM ARM C6.2.193.
 //
 // What it does NOT prove:
 //   * That code emitted with the BE module actually runs correctly on a
@@ -48,8 +58,16 @@ namespace {
 //   - i32 load from a pointer-arg register (LDR Wt, [Xn, #imm12])
 //   - i32 store back to that pointer (STR Wt, [Xn, #imm12])
 //   - i16 load + zext (LDRH + ZExt no-op)
-//   - i32 immediate materialization 0x12345 -> MOVZ + MOVK (positional)
-//   - i32 add and ret
+//   - 12-bit immediate add (encAddSubImm: imm12 positional field)
+//   - i32 add reg-reg and ret
+//
+// Note: the current light backend's integer-binop RHS materialization
+// caps at 16-bit MOVZ (see `materializeImm16` in light_aarch64.cpp), and
+// values that fit in imm12 take the encAddSubImm fast path before that
+// even applies. So this test deliberately sticks to imm12-sized
+// constants. Wider integer constants (32-bit MOVZ+MOVK in a binop RHS)
+// are not currently supported by the emitter and would need a small
+// extension to `materializeImm16` before they could be exercised here.
 static std::unique_ptr<llvm::Module>
 BuildSampleModule(llvm::LLVMContext &C, const char *Triple, const char *DL) {
   using namespace llvm;

@@ -130,4 +130,17 @@ if (EASYJIT_ENABLE_LIGHT_BACKEND)
   llvm_config(light_endian_parity_test core support)
   set_target_properties(light_endian_parity_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+  # Convenience runner. The lit-based `check` target only knows about
+  # tests under tests/, but this is a pure compile-time emitter test
+  # that does not need clang/EasyJitPass — keeping it as a small
+  # custom target avoids dragging Python/lit into the dependency chain
+  # and lets developers run it directly:
+  #     cmake --build <dir> --target check-light-endian
+  add_custom_target(check-light-endian
+    COMMAND $<TARGET_FILE:light_endian_parity_test>
+    DEPENDS light_endian_parity_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Running light backend endian/triple parity test"
+    VERBATIM)
 endif()

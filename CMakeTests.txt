@@ -6,5 +6,14 @@ add_custom_target(check
                   COMMAND ${PYTHON_EXEC} -m lit.main ${ALL_TESTS} -v --shuffle
                   DEPENDS EasyJitPass EasyJitRuntime)
 
+# When the light backend is on, the standalone parity test (defined in
+# runtime/CMakeLists.txt) is a tiny extra step that should run as part
+# of `check`. Adding it via add_dependencies keeps the lit invocation
+# above untouched and is a no-op when EASYJIT_ENABLE_LIGHT_BACKEND=OFF
+# (target does not exist).
+if (TARGET check-light-endian)
+  add_dependencies(check check-light-endian)
+endif()
+
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/tests/lit.cfg.in" "${CMAKE_CURRENT_BINARY_DIR}/tests/lit.cfg")
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/tests/doc/lit.cfg.in" "${CMAKE_CURRENT_BINARY_DIR}/tests/doc/lit.cfg")

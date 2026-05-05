@@ -125,3 +125,15 @@ In addition, `light_endian_parity_test` (built under
 `EASYJIT_ENABLE_LIGHT_BACKEND=ON`) covers the triple gate and the
 emit-time LE / BE / arm64 instruction-byte-stream parity claim.
 
+Run it directly:
+
+    cmake --build <build-dir> --target check-light-endian
+
+It is also pulled in automatically by the top-level `check` target when
+the light backend is enabled. The test exercises LDR/LDRH/STR and the
+12-bit-immediate ADD path; it does not currently cover the >16-bit
+MOVZ+MOVK integer-constant materialization (the binop RHS materializer
+caps at 16 bits today — see `materializeImm16` in `light_aarch64.cpp`),
+though MOVZ/MOVK halfwords are still exercised by the absolute-address
+path used for snapshot bases.
+
