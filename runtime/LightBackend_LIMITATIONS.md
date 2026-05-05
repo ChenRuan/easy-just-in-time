@@ -112,6 +112,25 @@ final-mile claim is deferred to a target-machine validation pass.
 - Integer and float phi copies.
 - `llvm.memcpy` with constant size up to 32 bytes.
 - `llvm.fmuladd.f32`.
+- Standalone scalar single-precision arithmetic: `fadd`, `fsub`, `fmul`,
+  `fdiv` on `float` (round 8f). `ConstantFP` operands are materialized
+  through `valueInFpReg` (FMOV-imm fast path for representable
+  immediates such as `0.0f` / `2.0f`; otherwise via integer MOVZ/MOVK
+  + `FMOV s,w` into the scratch register `s31`). Both operands of a
+  single FP binop being unmaterialized `ConstantFP` is rejected
+  ("fp binop both ops are scratch consts") because they would both
+  land in `s31`.
+- Scalar single-precision ordered comparisons (round 8f), fused into the
+  immediately-following conditional branch or `select`. Supported
+  predicates: `FCMP_OEQ` (EQ), `FCMP_OGT` (GT), `FCMP_OGE` (GE),
+  `FCMP_OLT` (MI — *not* AArch64 LT, which fires on NaN since V==1
+  inverts N), `FCMP_OLE` (LS). Unordered predicates and `FCMP_ONE`
+  are intentionally rejected — see Known Unsupported Areas.
+- `select` with float result type, driven by either an icmp or an
+  ordered fcmp (round 8f).
+- `ret float` of an SSA float value already materialized in an
+  FP register (round 8f). The result is moved to `s0` via
+  `FMOV s0, sN` if not already there.
 - `fptosi float -> i32`.
 - `sext/zext/trunc` over integer widths used by current tests.
 
@@ -119,9 +138,21 @@ final-mile claim is deferred to a target-machine validation pass.
 
 - `double` / `f64` arithmetic and conversion.
 - Vector IR.
-- Standalone floating-point `fadd`, `fsub`, `fmul`, `fdiv` when optimization
-  does not lower the pattern to `llvm.fmuladd.f32`.
-- Floating-point comparisons and selects.
+- Unordered FP comparison predicates (`FCMP_UEQ`, `FCMP_UNE`,
+  `FCMP_UGT`, `FCMP_UGE`, `FCMP_ULT`, `FCMP_ULE`, `FCMP_UNO`,
+  `FCMP_ORD`, `FCMP_TRUE`, `FCMP_FALSE`). AArch64 ordered conditions
+  treat `unordered` as a fall-through to the FALSE edge by design;
+  unordered semantics would require a second branch or `CCMP` and are
+  out of scope for the light backend.
+- `FCMP_ONE` ("ordered AND not equal"). AArch64 has no single-condition
+  encoding; emitting it correctly would require either two branches or
+  a `CCMP` chain. Frontends should canonicalize to `!FCMP_UEQ` ahead of
+  the light backend or accept rejection.
+- `ret` of a `ConstantFP` directly (no SSA producer). Frontends almost
+  always materialize the constant first; supporting this would require
+  reordering helpers in `light_aarch64.cpp` (lambda-ordering issue).
+- An FP binop or FCmp where *both* operands are unmaterialized
+  `ConstantFP` (`s31` scratch clobber).
 - Stack-passed arguments beyond the first eight integer/pointer or float
   argument registers.
 - Register spilling under high pressure.

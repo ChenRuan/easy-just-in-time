@@ -200,6 +200,31 @@ static uint32_t encFmovRegS(unsigned rd, unsigned rn) {
 static uint32_t encFmovSFromW(unsigned rd, unsigned rn) {
   return 0x1E270000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
 }
+// Single-precision scalar FP arithmetic (ARM ARM C6.2.79..C6.2.82).
+// Encoding family: 0001_1110_0010_mmmmm_<op>_nnnnn_ddddd, type=00 → single.
+//   FADD: opc=001010 → 0x1E20_2800 base
+//   FSUB: opc=001110 → 0x1E20_3800 base
+//   FMUL: opc=000010 → 0x1E20_0800 base
+//   FDIV: opc=000110 → 0x1E20_1800 base
+static uint32_t encFaddS(unsigned rd, unsigned rn, unsigned rm) {
+  return 0x1E202800u | ((rm & 0x1Fu) << 16) | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+static uint32_t encFsubS(unsigned rd, unsigned rn, unsigned rm) {
+  return 0x1E203800u | ((rm & 0x1Fu) << 16) | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+static uint32_t encFmulS(unsigned rd, unsigned rn, unsigned rm) {
+  return 0x1E200800u | ((rm & 0x1Fu) << 16) | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+static uint32_t encFdivS(unsigned rd, unsigned rn, unsigned rm) {
+  return 0x1E201800u | ((rm & 0x1Fu) << 16) | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+// FCMP Sn, Sm (scalar single, ARM ARM C6.2.84). Sets NZCV per IEEE-754:
+//   ordered <  → NZCV=1000   ordered ==  → 0110
+//   ordered >  → NZCV=0010   unordered   → 0011  (V=1 for NaN)
+// Encoding: 0001_1110_0010_mmmmm_001000_nnnnn_00000.
+static uint32_t encFcmpS(unsigned rn, unsigned rm) {
+  return 0x1E202000u | ((rm & 0x1Fu) << 16) | ((rn & 0x1Fu) << 5);
+}
 // SUBS (imm) — used for CMP imm. 32-bit form.
 static uint32_t encSubsImm32(unsigned rn, unsigned imm12) {
   return 0x71000000u | ((imm12 & 0xFFFu) << 10) | ((rn & 0x1Fu) << 5) | 31u;
@@ -302,6 +327,51 @@ static int asImm12(const Value *V) {
   const auto &AP = CI->getValue();
   if (AP.isNegative() || AP.getActiveBits() > 12) return -1;
   return (int)CI->getZExtValue();
+}
+
+// FCmp fusion record: like ICmpFusion but for scalar single-precision
+// FP compares. We support an ordered subset of LLVM FCmp predicates and
+// reject everything else with an "fcmp predicate" reason. Unordered /
+// NaN-sensitive predicates (UEQ, UNE, UGT, UGE, ULT, ULE, ORD, UNO,
+// AlwaysTrue/False, ONE) are intentionally not handled: AArch64 has no
+// single condition code that captures "ordered AND not equal" without
+// CCMP or two branches, and the unordered family would require the
+// caller to opt into NaN propagation semantics we have not validated.
+struct FCmpFusion {
+  const FCmpInst *I = nullptr;
+  CmpInst::Predicate pred = CmpInst::FCMP_OEQ;
+  unsigned lhsReg = 0;
+  unsigned rhsReg = 0;
+};
+
+// Translate an ordered LLVM FCmp predicate to an AArch64 condition code
+// for the TRUE edge. Returns 0xFF when the predicate is not in the
+// supported ordered subset; callers MUST check for that and fail.
+//
+// AArch64 FCMP NZCV table (ARM ARM C6.2.84):
+//   ordered <  : N=1 Z=0 C=0 V=0    ordered == : N=0 Z=1 C=1 V=0
+//   ordered >  : N=0 Z=0 C=1 V=0    unordered  : N=0 Z=0 C=1 V=1
+//
+// The mapping below is the ARM-recommended ordered-only set. In
+// particular OLT uses MI (N==1) — NOT LT (N!=V) — because LT also
+// fires when NaN sets V=1, which would silently match unordered.
+// Symmetrically, OLE uses LS (C==0 || Z==1), and OGT uses GT
+// (N==V && !Z), both of which exclude the unordered NZCV pattern.
+//
+// For each supported predicate, `cond ^ 1` (the negation we use to
+// branch over the TRUE arm) yields a condition that catches both
+// "ordered with the opposite relation" AND "unordered", which is the
+// correct behaviour: when the FCmp is false (including unordered),
+// take the FALSE edge.
+static unsigned fcmpToCond(CmpInst::Predicate p) {
+  switch (p) {
+  case CmpInst::FCMP_OEQ: return 0x0; // EQ
+  case CmpInst::FCMP_OGT: return 0xC; // GT
+  case CmpInst::FCMP_OGE: return 0xA; // GE
+  case CmpInst::FCMP_OLT: return 0x4; // MI (NOT LT — LT triggers on NaN)
+  case CmpInst::FCMP_OLE: return 0x9; // LS
+  default:                return 0xFFu;
+  }
 }
 
 // Compile-time GEP offset for a constant-index GEP on a sized aggregate.
@@ -868,6 +938,22 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
 
   auto epilogueRet = [&](const Value *retVal) -> bool {
     if (retVal) {
+      // Float return — place the value in S0 (FMOV S0, Sn) when it is
+      // already in an FP register from earlier lowering. ConstantFP
+      // returns are intentionally NOT handled here: they are rare in
+      // practice (the frontend typically materializes the constant
+      // first and then returns the SSA value), and supporting them
+      // would require reaching forward to the `valueInFpReg` lambda
+      // which is declared later in this scope. If we ever want it,
+      // the cleanest fix is to move the helpers above this lambda
+      // — same approach used for integer constants in round 8d.
+      if (retVal->getType()->isFloatTy()) {
+        auto itf = fpRegOf.find(retVal);
+        if (itf == fpRegOf.end()) return false;
+        if (itf->second != 0) {
+          if (!W.emit(encFmovRegS(0, itf->second))) return false;
+        }
+      } else {
       auto itr = regOf.find(retVal);
       if (itr != regOf.end()) {
         if (itr->second != 0) {
@@ -883,6 +969,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         if (!emitMovImm(0, is64, CI->getValue())) return false;
       } else {
         return false;
+      }
       }
     }
     if (frameSize > 0) {
@@ -1092,10 +1179,17 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
   // For icmp/br fusion: remember the last icmp if its only user is the
   // terminating br i1 of the same BB. Reset per BB.
   ICmpFusion pendingCmp;
+  // Same idea for fcmp: an fcmp result feeds either a conditional br or
+  // a select. Reset per BB. We defer the actual FCMP emit until the
+  // consumer because no other instruction we emit between the FCmp and
+  // its branch/select can clobber NZCV (FP arith / FMOV / MOV / MOVK
+  // all leave the flags alone) — same invariant as the integer path.
+  FCmpFusion pendingFCmp;
 
   for (const BasicBlock &BB : Fn) {
     bbStart[&BB] = W.pos;
     pendingCmp.I = nullptr;
+    pendingFCmp.I = nullptr;
 
     for (const Instruction &I : BB) {
       // Skip instructions whose effect was already modeled in passes 0/2.
@@ -1512,40 +1606,112 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         }
         continue;
       }
+
+      // fcmp — record, fuse with following br/select. Only scalar f32 is
+      // supported in this round; double / vector / NaN-sensitive
+      // unordered predicates and ONE are rejected with "fcmp predicate"
+      // / "fcmp shape". We defer the FCMP emit to the consumer (same
+      // pattern as integer pendingCmp) since none of the instructions
+      // we may emit between an FCmp and its branch/select clobber NZCV.
+      if (auto *FC = dyn_cast<FCmpInst>(&I)) {
+        if (!FC->getOperand(0)->getType()->isFloatTy() ||
+            !FC->getOperand(1)->getType()->isFloatTy()) {
+          r.status = Status::Unsupported; r.reason = "fcmp shape"; return r;
+        }
+        unsigned condCheck = fcmpToCond(FC->getPredicate());
+        if (condCheck == 0xFFu) {
+          r.status = Status::Unsupported; r.reason = "fcmp predicate"; return r;
+        }
+        unsigned rn, rm;
+        if (!valueInFpReg(FC->getOperand(0), rn)) {
+          r.status = Status::Unsupported; r.reason = "fcmp lhs"; return r;
+        }
+        if (!valueInFpReg(FC->getOperand(1), rm)) {
+          r.status = Status::Unsupported; r.reason = "fcmp rhs"; return r;
+        }
+        if (rn == 31 && rm == 31) {
+          // Both operands materialized through the S31 scratch, so the
+          // first is already clobbered. Constant-fold or restructure.
+          r.status = Status::Unsupported;
+          r.reason = "fcmp both ops are scratch consts";
+          return r;
+        }
+        pendingFCmp.I = FC;
+        pendingFCmp.pred = FC->getPredicate();
+        pendingFCmp.lhsReg = rn;
+        pendingFCmp.rhsReg = rm;
+        continue;
+      }
       
-      // select i1, x, y  — lower to small conditional sequence using the
-      // pendingCmp if available. We emit a B.cond stub, materialize the
-      // true-value, branch over the false-value, then materialize false.
+      // select i1, x, y  — lower to small conditional sequence using
+      // the pendingCmp (icmp) or pendingFCmp (fcmp) recorded above.
+      // We emit a CMP/FCMP, then a B.cond stub, materialize the
+      // true-value, branch over the false-value, then materialize the
+      // false-value, and patch up branches.
+      //
+      // Supported result types: i32 / i64 / float. Other types return
+      // an "unsupported" status with a clear reason.
       if (auto *SI = dyn_cast<SelectInst>(&I)) {
-        // Only support selects whose condition is an immediately preceding
-        // icmp that we recorded in pendingCmp.
-  const Value *Cond = SI->getCondition();
-        if (!pendingCmp.I || pendingCmp.I != Cond) {
-          r.status = Status::Unsupported; r.reason = "select without fused icmp"; return r;
+        const Value *Cond = SI->getCondition();
+        bool isIcmp = (pendingCmp.I  && pendingCmp.I  == Cond);
+        bool isFcmp = (pendingFCmp.I && pendingFCmp.I == Cond);
+        if (!isIcmp && !isFcmp) {
+          r.status = Status::Unsupported; r.reason = "select without fused icmp/fcmp"; return r;
         }
-        // allocate result reg
-        int rd = assignReg(SI);
-        if (rd < 0) { r.status = Status::Unsupported; r.reason = "scratch OOM (select)"; return r; }
+        bool isFloatRes = SI->getType()->isFloatTy();
+        if (!isFloatRes && !SI->getType()->isIntegerTy()) {
+          r.status = Status::Unsupported; r.reason = "select result type"; return r;
+        }
+        bool resIs64 = SI->getType()->isIntegerTy(64);
 
-        // emit CMP
-        if (pendingCmp.rhsImm >= 0) {
-          if (!W.emit(encSubsImm32(pendingCmp.lhsReg, (unsigned)pendingCmp.rhsImm))) { r.status=Status::TooLarge; return r; }
-          if (pendingCmp.is64) { r.status = Status::Unsupported; r.reason = "i64 cmp imm in select"; return r; }
+        // allocate result reg (FP or GPR depending on result type)
+        int rd;
+        if (isFloatRes) {
+          rd = assignFpReg(SI);
+          if (rd < 0) { r.status = Status::Unsupported; r.reason = "fp scratch OOM (select)"; return r; }
         } else {
-          if (pendingCmp.is64) { r.status = Status::Unsupported; r.reason = "i64 cmp reg in select"; return r; }
-          if (!W.emit(encSubsReg32(pendingCmp.lhsReg, pendingCmp.rhsReg))) { r.status=Status::TooLarge; return r; }
+          rd = assignReg(SI);
+          if (rd < 0) { r.status = Status::Unsupported; r.reason = "scratch OOM (select)"; return r; }
         }
 
-        unsigned cond = icmpToCond(pendingCmp.pred);
+        // emit CMP / FCMP based on which compare drives this select.
+        unsigned cond;
+        if (isFcmp) {
+          if (!W.emit(encFcmpS(pendingFCmp.lhsReg, pendingFCmp.rhsReg))) {
+            r.status = Status::TooLarge; return r;
+          }
+          cond = fcmpToCond(pendingFCmp.pred);
+        } else {
+          if (pendingCmp.rhsImm >= 0) {
+            if (!W.emit(encSubsImm32(pendingCmp.lhsReg, (unsigned)pendingCmp.rhsImm))) { r.status=Status::TooLarge; return r; }
+            if (pendingCmp.is64) { r.status = Status::Unsupported; r.reason = "i64 cmp imm in select"; return r; }
+          } else {
+            if (pendingCmp.is64) { r.status = Status::Unsupported; r.reason = "i64 cmp reg in select"; return r; }
+            if (!W.emit(encSubsReg32(pendingCmp.lhsReg, pendingCmp.rhsReg))) { r.status=Status::TooLarge; return r; }
+          }
+          cond = icmpToCond(pendingCmp.pred);
+        }
         unsigned invCond = cond ^ 1u;
         size_t bcondPos = W.pos;
         if (!W.emit(encBcondStub(invCond))) { r.status=Status::TooLarge; return r; }
 
         // TRUE case: materialize true value into rd
-        unsigned trueReg;
-        if (!valueInReg(SI->getTrueValue(), SI->getTrueValue()->getType()->isIntegerTy(64), trueReg)) { r.status=Status::Unsupported; r.reason = "select true val"; return r; }
-        if ((unsigned)rd != trueReg) {
-          if (!W.emit(encMovReg(SI->getType()->isIntegerTy(64), (unsigned)rd, trueReg))) { r.status=Status::TooLarge; return r; }
+        if (isFloatRes) {
+          unsigned trueReg;
+          if (!valueInFpReg(SI->getTrueValue(), trueReg)) {
+            r.status = Status::Unsupported; r.reason = "select true val (fp)"; return r;
+          }
+          if ((unsigned)rd != trueReg) {
+            if (!W.emit(encFmovRegS((unsigned)rd, trueReg))) { r.status=Status::TooLarge; return r; }
+          }
+        } else {
+          unsigned trueReg;
+          if (!valueInReg(SI->getTrueValue(), resIs64, trueReg)) {
+            r.status = Status::Unsupported; r.reason = "select true val"; return r;
+          }
+          if ((unsigned)rd != trueReg) {
+            if (!W.emit(encMovReg(resIs64, (unsigned)rd, trueReg))) { r.status=Status::TooLarge; return r; }
+          }
         }
 
         // jump over false-case
@@ -1562,10 +1728,22 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         }
 
         // FALSE case
-        unsigned falseReg;
-        if (!valueInReg(SI->getFalseValue(), SI->getFalseValue()->getType()->isIntegerTy(64), falseReg)) { r.status=Status::Unsupported; r.reason = "select false val"; return r; }
-        if ((unsigned)rd != falseReg) {
-          if (!W.emit(encMovReg(SI->getType()->isIntegerTy(64), (unsigned)rd, falseReg))) { r.status=Status::TooLarge; return r; }
+        if (isFloatRes) {
+          unsigned falseReg;
+          if (!valueInFpReg(SI->getFalseValue(), falseReg)) {
+            r.status = Status::Unsupported; r.reason = "select false val (fp)"; return r;
+          }
+          if ((unsigned)rd != falseReg) {
+            if (!W.emit(encFmovRegS((unsigned)rd, falseReg))) { r.status=Status::TooLarge; return r; }
+          }
+        } else {
+          unsigned falseReg;
+          if (!valueInReg(SI->getFalseValue(), resIs64, falseReg)) {
+            r.status = Status::Unsupported; r.reason = "select false val"; return r;
+          }
+          if ((unsigned)rd != falseReg) {
+            if (!W.emit(encMovReg(resIs64, (unsigned)rd, falseReg))) { r.status=Status::TooLarge; return r; }
+          }
         }
 
         // patch bTrue to jump to continuation (TRUE target)
@@ -1577,13 +1755,58 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
           W.patch32(bTruePos, w);
         }
 
-        // select lowered; clear pendingCmp
+        // select lowered; clear pendingCmp / pendingFCmp
         pendingCmp.I = nullptr;
+        pendingFCmp.I = nullptr;
         continue;
       }
 
       // Binary ops
       if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+        // FP binary ops (fadd/fsub/fmul/fdiv) — only scalar f32 is
+        // supported. Both operands are routed through valueInFpReg,
+        // which materializes ConstantFP values into S31 via x16+FMOV.
+        // Because the constant path always lands in S31, having two
+        // ConstantFP operands in the same binop would clobber the
+        // first; we explicitly reject that. In practice the frontend
+        // would have constant-folded such a binop already.
+        if (BO->getType()->isFloatTy()) {
+          auto opc = BO->getOpcode();
+          if (opc != Instruction::FAdd && opc != Instruction::FSub &&
+              opc != Instruction::FMul && opc != Instruction::FDiv) {
+            r.status = Status::Unsupported; r.reason = "fp binop kind"; return r;
+          }
+          const Value *L = BO->getOperand(0);
+          const Value *R = BO->getOperand(1);
+          bool lhsIsConst = isa<ConstantFP>(L) && !fpRegOf.count(L);
+          bool rhsIsConst = isa<ConstantFP>(R) && !fpRegOf.count(R);
+          if (lhsIsConst && rhsIsConst) {
+            r.status = Status::Unsupported;
+            r.reason = "fp binop both ops are scratch consts";
+            return r;
+          }
+          unsigned rn, rm;
+          if (!valueInFpReg(L, rn)) {
+            r.status = Status::Unsupported; r.reason = "fp binop lhs"; return r;
+          }
+          if (!valueInFpReg(R, rm)) {
+            r.status = Status::Unsupported; r.reason = "fp binop rhs"; return r;
+          }
+          int rd = assignFpReg(&I);
+          if (rd < 0) {
+            r.status = Status::Unsupported; r.reason = "fp scratch OOM (binop)"; return r;
+          }
+          bool ok = false;
+          switch (opc) {
+          case Instruction::FAdd: ok = W.emit(encFaddS((unsigned)rd, rn, rm)); break;
+          case Instruction::FSub: ok = W.emit(encFsubS((unsigned)rd, rn, rm)); break;
+          case Instruction::FMul: ok = W.emit(encFmulS((unsigned)rd, rn, rm)); break;
+          case Instruction::FDiv: ok = W.emit(encFdivS((unsigned)rd, rn, rm)); break;
+          default: break;
+          }
+          if (!ok) { r.status = Status::TooLarge; return r; }
+          continue;
+        }
         if (!BO->getType()->isIntegerTy()) { r.status=Status::Unsupported; r.reason="binop non-int"; return r; }
         unsigned bits = BO->getType()->getIntegerBitWidth();
         if (bits != 32 && bits != 64) { r.status=Status::Unsupported; r.reason="binop width"; return r; }
@@ -1752,14 +1975,20 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
           fixups.push_back({p, BR->getSuccessor(0), false, 0});
           continue;
         }
-        // Conditional: must be fused with the pending icmp.
-        if (!pendingCmp.I || BR->getCondition() != pendingCmp.I) {
+        // Conditional: must be fused with the pending icmp or fcmp.
+        bool brIsIcmp = (pendingCmp.I  && BR->getCondition() == pendingCmp.I);
+        bool brIsFcmp = (pendingFCmp.I && BR->getCondition() == pendingFCmp.I);
+        if (!brIsIcmp && !brIsFcmp) {
           r.status = Status::Unsupported;
-          r.reason = "cond br without fused icmp";
+          r.reason = "cond br without fused icmp/fcmp";
           return r;
         }
-        // emit CMP.
-        if (pendingCmp.rhsImm >= 0) {
+        // emit CMP / FCMP.
+        if (brIsFcmp) {
+          if (!W.emit(encFcmpS(pendingFCmp.lhsReg, pendingFCmp.rhsReg))) {
+            r.status=Status::TooLarge; return r;
+          }
+        } else if (pendingCmp.rhsImm >= 0) {
           if (!W.emit(encSubsImm32(pendingCmp.lhsReg, (unsigned)pendingCmp.rhsImm))) {
             r.status=Status::TooLarge; return r;
           }
@@ -1804,7 +2033,8 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         //
         // To implement this we emit a B.cond whose target is a synthetic
         // 'mid' point in THIS buffer, and backpatch when we know mid's pos.
-        unsigned cond = icmpToCond(pendingCmp.pred);
+        unsigned cond = brIsFcmp ? fcmpToCond(pendingFCmp.pred)
+                                 : icmpToCond(pendingCmp.pred);
         unsigned invCond = cond ^ 1u; // invert low bit flips EQ<->NE, etc.
         size_t bcondPos = W.pos;
         if (!W.emit(encBcondStub(invCond))) { r.status=Status::TooLarge; return r; }
