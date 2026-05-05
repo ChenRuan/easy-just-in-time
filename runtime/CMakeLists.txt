@@ -165,4 +165,25 @@ if (EASYJIT_ENABLE_LIGHT_BACKEND)
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running light backend f32 ops test"
     VERBATIM)
+
+  # Stack-argument test (round-8j) — covers AAPCS64 NSAA layout for
+  # the 9th and later scalar args (int/ptr/float/double). On AArch64
+  # hosts the C++ caller arranges the stack layout per AAPCS64; the
+  # emitted code reads from `[sp, frameSize+incomingOff]` after the
+  # entry prologue. On non-AArch64 hosts only the emit step is run.
+  add_executable(light_stack_args_test
+    ${CMAKE_SOURCE_DIR}/light_codegen/test_stack_args.cpp
+    ${CMAKE_SOURCE_DIR}/light_codegen/light_aarch64.cpp)
+  target_include_directories(light_stack_args_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/light_codegen)
+  llvm_config(light_stack_args_test core support)
+  set_target_properties(light_stack_args_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+  add_custom_target(check-light-stack-args
+    COMMAND $<TARGET_FILE:light_stack_args_test>
+    DEPENDS light_stack_args_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Running light backend stack-arg test"
+    VERBATIM)
 endif()

@@ -833,9 +833,10 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
   if (Fn.isDeclaration() || Fn.empty()) {
     r.status = Status::Unsupported; r.reason = "no body"; return r;
   }
-  if (Fn.arg_size() > 8) {
-    r.status = Status::Unsupported; r.reason = "> 8 args"; return r;
-  }
+  // Round-8j: stack-passed scalar args are now supported, so the
+  // pre-flight `arg_size() > 8` gate has been removed. Per-argument
+  // classification + overflow-area handling lives in pass 1 below.
+  // Vararg / aggregate-by-value are still rejected there.
 
   const DataLayout &DL = Fn.getParent()->getDataLayout();
 
@@ -884,33 +885,66 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
   std::unordered_map<const Value *, unsigned> regOf;
   std::unordered_map<const Value *, unsigned> fpRegOf;
 
-  // Params: integer/pointer arguments use x0..x7; float arguments use
-  // s0..s7. The register classes have independent AAPCS allocation.
+  // Params: integer/pointer arguments use x0..x7; float/double arguments
+  // use s0..s7 / d0..d7. The register classes have independent AAPCS64
+  // allocation. The 9th and later GPR-class / FP-class scalar arguments
+  // overflow onto the caller's stack frame in a single shared "incoming
+  // argument area" (AAPCS64 §6.4 NSAA), laid out in the original
+  // parameter order. We collect overflow args here and preload them
+  // into scratch registers below (after assignReg/assignFpReg are
+  // defined). For the supported scalar subset every overflow slot is
+  // 8-byte aligned and 8 bytes wide:
+  //   - i32  → 8-byte slot, low 4 bytes hold the value (LE host).
+  //   - i64/pointer → 8-byte slot.
+  //   - float  → 8-byte slot, low 4 bytes hold the value (LE host).
+  //   - double → 8-byte slot.
+  // i8/i16 stack args are intentionally rejected — frontends should
+  // widen narrow integers before the AAPCS boundary anyway.
+  struct StackArgEnt {
+    const Argument *arg;
+    int32_t  incomingOff; // bytes from entry SP (caller's NSAA base).
+    bool     isFp;
+    bool     is64;        // i64/ptr/double; false for i32/float.
+  };
+  std::vector<StackArgEnt> stackArgs;
   unsigned argCount = 0;
   unsigned fpArgCount = 0;
+  int32_t  incomingStackOff = 0;
   {
     for (const Argument &A : Fn.args()) {
       Type *T = A.getType();
       if (T->isIntegerTy() || T->isPointerTy()) {
-        regOf[&A] = argCount;
-        argCount++;
+        if (argCount < 8) {
+          regOf[&A] = argCount;
+          argCount++;
+          continue;
+        }
+        // Overflow GPR-class arg.
+        bool is64 = T->isPointerTy() || T->isIntegerTy(64);
+        if (!is64 && !T->isIntegerTy(32)) {
+          r.status = Status::Unsupported;
+          r.reason = "stack arg shape (i8/i16)";
+          return r;
+        }
+        incomingStackOff = (incomingStackOff + 7) & ~7;
+        stackArgs.push_back({&A, incomingStackOff, /*isFp=*/false, is64});
+        incomingStackOff += 8;
       } else if (T->isFloatTy() || T->isDoubleTy()) {
-        // float -> S{n}, double -> D{n}; the V register file is shared so
-        // we just track the register index and let emit-time logic pick
-        // the S- or D-view based on the SSA value's type.
-        fpRegOf[&A] = fpArgCount;
-        fpArgCount++;
+        if (fpArgCount < 8) {
+          // float -> S{n}, double -> D{n}; the V register file is shared so
+          // we just track the register index and let emit-time logic pick
+          // the S- or D-view based on the SSA value's type.
+          fpRegOf[&A] = fpArgCount;
+          fpArgCount++;
+          continue;
+        }
+        bool isDouble = T->isDoubleTy();
+        incomingStackOff = (incomingStackOff + 7) & ~7;
+        stackArgs.push_back({&A, incomingStackOff, /*isFp=*/true, isDouble});
+        incomingStackOff += 8;
       } else {
         r.status = Status::Unsupported; r.reason = "non-int/ptr/float arg"; return r;
       }
-    }
-    if (argCount > 8) {
-      // AArch64 AAPCS: x0..x7 are integer arg regs; beyond that args come
-      // in on the stack. Light emitter does not handle stack-passed args.
-      r.status = Status::Unsupported; r.reason = "too many args"; return r;
-    }
-    if (fpArgCount > 8) {
-      r.status = Status::Unsupported; r.reason = "too many fp args"; return r;
     }
   }
 
@@ -937,6 +971,62 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
     fpRegOf[V] = r;
     return (int)r;
   };
+
+  // ---------- Stack-arg preload (round 8j). ----------
+  // For each AAPCS64 stack-passed scalar argument, allocate a scratch
+  // register and emit one LDR from `[sp, frameSize + incomingOff]`. The
+  // result is that overflow args become indistinguishable from in-reg
+  // args for the rest of pass 1 / pass 2 / pass 3 — they live in
+  // regOf / fpRegOf with a normal scratch index. We do this AFTER the
+  // prologue (sp already adjusted by `frameSize`) and BEFORE phi
+  // pre-assign, so any subsequent scratch allocations follow these.
+  auto fitsScaledLocal = [](int32_t off, unsigned size) -> int {
+    unsigned scale = 1u << size;
+    if (off < 0) return -1;
+    if ((uint32_t)off & (scale - 1)) return -1;
+    uint32_t s = (uint32_t)off / scale;
+    if (s > 0xFFF) return -1;
+    return (int)s;
+  };
+  for (const StackArgEnt &SE : stackArgs) {
+    int32_t off = frameSize + SE.incomingOff;
+    if (SE.isFp) {
+      int rd = assignFpReg(SE.arg);
+      if (rd < 0) {
+        r.status = Status::Unsupported;
+        r.reason = "fp scratch OOM (stack arg)";
+        return r;
+      }
+      unsigned sz = SE.is64 ? 3u : 2u;
+      int s = fitsScaledLocal(off, sz);
+      if (s < 0) {
+        r.status = Status::Unsupported;
+        r.reason = "stack arg offset/encoding";
+        return r;
+      }
+      bool ok = SE.is64
+                  ? W.emit(encFpLdrStrUID(true, (unsigned)rd, 31, (unsigned)s))
+                  : W.emit(encFpLdrStrUIS(true, (unsigned)rd, 31, (unsigned)s));
+      if (!ok) { r.status = Status::TooLarge; return r; }
+    } else {
+      int rd = assignReg(SE.arg);
+      if (rd < 0) {
+        r.status = Status::Unsupported;
+        r.reason = "scratch OOM (stack arg)";
+        return r;
+      }
+      unsigned sz = SE.is64 ? 3u : 2u;
+      int s = fitsScaledLocal(off, sz);
+      if (s < 0) {
+        r.status = Status::Unsupported;
+        r.reason = "stack arg offset/encoding";
+        return r;
+      }
+      if (!W.emit(encLdrStrUI(true, sz, (unsigned)rd, 31, (unsigned)s))) {
+        r.status = Status::TooLarge; return r;
+      }
+    }
+  }
 
   // Pre-assign phi regs.
   for (const BasicBlock &BB : Fn) {

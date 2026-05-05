@@ -77,6 +77,24 @@ final-mile claim is deferred to a target-machine validation pass.
   register file backs both `s` and `d` views, so the AAPCS allocation
   pool and `fpRegOf` register numbering are shared between `float`
   and `double` arguments.
+- Stack-passed scalar arguments beyond the first eight GPR-class /
+  FP-class slots (round 8j). The supported subset is
+  `i32`, `i64`, pointer, `float`, `double`. Each overflow argument
+  occupies an 8-byte AAPCS64 NSAA slot regardless of natural width;
+  GPR-overflow and FP-overflow share a single overflow area in
+  original parameter order (per AAPCS64 §6.4 NSAA — they do **not**
+  start at independent zero offsets). Stack-arg lowering preloads
+  every overflow argument once, immediately after the entry prologue,
+  via a single `LDR W/X/S/D, [sp, #frameSize+incomingOff]`. The
+  preloaded value lives in a normal scratch register (x8..x15 minus
+  x16; d16..d30) for the rest of the function and feeds the existing
+  binop / load / store / GEP / fcmp / select / ret / cast paths just
+  like an in-register argument. Pointer stack args correctly drive
+  pointer-tracking (`ptrLoc[&A] = InReg{regOf[&A]}`). When too many
+  stack args exhaust the scratch pool the lowering rejects with
+  `"scratch OOM (stack arg)"` / `"fp scratch OOM (stack arg)"`; if
+  the offset cannot be encoded in the LDR uimm12 the rejection is
+  `"stack arg offset/encoding"`.
 - Fixed-size stack frame, constant-offset alloca GEP.
 - One dynamic scaled GEP index over an absolute pointer or forwarded pointer.
 - `i8/i16/i32/i64` loads and stores.
@@ -207,8 +225,16 @@ final-mile claim is deferred to a target-machine validation pass.
   catches this at the FCmp node (reason `"fcmp both ops are scratch
   consts"`); the binop check stays at the binop site (reason `"fp
   binop both ops are scratch consts"`).
-- Stack-passed arguments beyond the first eight integer/pointer or float
-  argument registers.
+- Stack-passed scalar arguments beyond the first eight GPR-class /
+  FP-class slots are now supported for `i32`/`i64`/pointer/`float`/
+  `double` (round 8j, see preamble). Still unsupported in the
+  stack-arg path: aggregate-by-value, homogeneous floating-point
+  aggregates (HFA), varargs, `i8`/`i16` overflow args (rejected with
+  reason `"stack arg shape (i8/i16)"`), scratch register exhaustion
+  in the preload phase (no spilling — rejected with
+  `"scratch OOM (stack arg)"` / `"fp scratch OOM (stack arg)"`), and
+  offsets that don't fit in the scaled `LDR` uimm12 encoding
+  (rejected with `"stack arg offset/encoding"`).
 - Register spilling under high pressure.
 - Multiple independent dynamic indexes in one GEP chain.
 - Complex C++ frontend shapes such as exceptions, RTTI-heavy code, virtual
@@ -273,6 +299,23 @@ to cover every scalar FP↔int / FP↔FP conversion (`FCVTZS X,S`,
 `FCVT S,D`, `FMOV W,S`, `FMOV S,W`, `FMOV X,D`, `FMOV D,X`) with
 matching opcode-mask coverage guards and exact bit-pattern execution
 checks for all four bitcast directions.
+
+A third standalone target `light_stack_args_test` covers the round-8j
+AAPCS64 stack-passed scalar argument support. It builds and emits
+seven IR shapes: 9× `i64`, 9× `i32`, eight `i32` plus a 9th `i32*`
+that is loaded from, 9× `float`, 9× `double`, a mixed-overflow shape
+with eight `i64` + eight `double` followed by alternating
+`i64`/`double` overflow (exercising the shared GPR/FP NSAA in
+original parameter order), and an `alloca` + 9th `i64` shape that
+exercises the interaction between `frameSize` and the
+`[sp, frameSize+incomingOff]` preload addressing. On AArch64 hosts
+all seven are executed for end-to-end correctness; on other hosts
+only the emit path is exercised. Run it directly:
+
+    cmake --build <build-dir> --target check-light-stack-args
+
+It is also pulled in automatically by the top-level `check` target
+when the light backend is enabled.
 
 Run it directly:
 
