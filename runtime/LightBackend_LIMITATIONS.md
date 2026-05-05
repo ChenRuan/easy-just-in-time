@@ -86,8 +86,9 @@ final-mile claim is deferred to a target-machine validation pass.
   start at independent zero offsets). Stack-arg lowering preloads
   every overflow argument once, immediately after the entry prologue,
   via a single `LDR W/X/S/D, [sp, #frameSize+incomingOff]`. The
-  preloaded value lives in a normal scratch register (x8..x15 minus
-  x16; d16..d30) for the rest of the function and feeds the existing
+  preloaded value lives in a normal scratch register (caller-saved
+  `x8..x15`, plus saved `x19..x28` for GPR-class values; `d16..d30`
+  for FP-class values) for the rest of the function and feeds the existing
   binop / load / store / GEP / fcmp / select / ret / cast paths just
   like an in-register argument. Pointer stack args correctly drive
   pointer-tracking (`ptrLoc[&A] = InReg{regOf[&A]}`). When too many
@@ -95,6 +96,13 @@ final-mile claim is deferred to a target-machine validation pass.
   `"scratch OOM (stack arg)"` / `"fp scratch OOM (stack arg)"`; if
   the offset cannot be encoded in the LDR uimm12 the rejection is
   `"stack arg offset/encoding"`.
+- Extended GPR scratch pool (round 8l): the emitter saves `x19..x28`
+  into the local frame in the prologue, makes those registers available
+  after the caller-saved `x8..x15` pool is exhausted, and restores them
+  before every return. This is a pressure-relief mechanism rather than a
+  full SSA spill/reload allocator: GPR-heavy scalar expressions that need
+  up to 18 scratch registers now compile, while shapes requiring more
+  simultaneously assigned GPR values still reject cleanly.
 - Fixed-size stack frame, constant-offset alloca GEP.
 - Dynamic scaled GEP with up to **two** dynamic terms (round 8k):
 
@@ -253,11 +261,16 @@ final-mile claim is deferred to a target-machine validation pass.
   stack-arg path: aggregate-by-value, homogeneous floating-point
   aggregates (HFA), varargs, `i8`/`i16` overflow args (rejected with
   reason `"stack arg shape (i8/i16)"`), scratch register exhaustion
-  in the preload phase (no spilling — rejected with
-  `"scratch OOM (stack arg)"` / `"fp scratch OOM (stack arg)"`), and
+  in the preload phase after the saved-`x19..x28` extension is also
+  exhausted (rejected with `"scratch OOM (stack arg)"` /
+  `"fp scratch OOM (stack arg)"`), and
   offsets that don't fit in the scaled `LDR` uimm12 encoding
   (rejected with `"stack arg offset/encoding"`).
-- Register spilling under high pressure.
+- Full SSA spilling/reloading under very high register pressure. Round
+  8l expands the GPR scratch pool by saving `x19..x28`, but it does not
+  yet spill arbitrary live SSA values to stack slots and reload them on
+  demand. FP scratch remains capped at `d16..d30` plus the reserved
+  constant scratch `d31`.
 - Dynamic GEP shapes beyond the round-8k two-term form: more than
   two dynamic indices in the GEP chain, dynamic index scales that
   are not powers of two, scales with `log2 > 12`, and arithmetic
@@ -375,7 +388,20 @@ exercised. Run it directly:
 It is also pulled in automatically by the top-level `check` target
 when the light backend is enabled.
 
-A fifth optional target `check-light-be-smoke` builds a freestanding
+A fifth standalone target `light_gpr_pressure_test` covers the
+round-8l saved-scratch extension. It emits a single-block i64 function
+with 17 GPR-producing SSA instructions, which exceeded the old
+caller-saved-only scratch pool but fits once saved `x19..x28` are
+available. On AArch64 hosts it mmap+executes the emitted code and
+therefore also validates the save/restore path for the callee-saved
+registers. Run it directly:
+
+    cmake --build <build-dir> --target check-light-gpr-pressure
+
+It is also pulled in automatically by the top-level `check` target
+when the light backend is enabled.
+
+A sixth optional target `check-light-be-smoke` builds a freestanding
 static `aarch64_be` ELF from `light_codegen/test_be_smoke.S` and runs
 it under `qemu-aarch64_be` or `qemu-aarch64_be-static` when one is
 available. This smoke test does not require an `aarch64_be` libc or

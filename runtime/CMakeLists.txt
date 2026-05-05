@@ -208,6 +208,26 @@ if (EASYJIT_ENABLE_LIGHT_BACKEND)
     COMMENT "Running light backend dynamic-GEP test"
     VERBATIM)
 
+  # Round 8l: GPR pressure test for the saved x19..x28 scratch extension.
+  # The test emits a wide scalar expression that used to exceed the
+  # caller-saved-only scratch pool. On AArch64 hosts it also mmap+executes
+  # the result and verifies the callee-saved save/restore path is sound.
+  add_executable(light_gpr_pressure_test
+    ${CMAKE_SOURCE_DIR}/light_codegen/test_gpr_pressure.cpp
+    ${CMAKE_SOURCE_DIR}/light_codegen/light_aarch64.cpp)
+  target_include_directories(light_gpr_pressure_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/light_codegen)
+  llvm_config(light_gpr_pressure_test core support)
+  set_target_properties(light_gpr_pressure_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+  add_custom_target(check-light-gpr-pressure
+    COMMAND $<TARGET_FILE:light_gpr_pressure_test>
+    DEPENDS light_gpr_pressure_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Running light backend GPR pressure test"
+    VERBATIM)
+
   # Optional aarch64_be user-mode smoke. This does not need a BE sysroot:
   # the test is a freestanding static BE ELF assembled from explicit
   # Writer::emit-style instruction bytes, then run under qemu-aarch64_be.

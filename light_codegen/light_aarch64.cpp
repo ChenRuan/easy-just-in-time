@@ -21,7 +21,9 @@
 //   - sext/zext/trunc between i1/i8/i16/i32/i64
 //   - ret (restores sp if a frame was allocated)
 //
-// Everything else -> Status::Unsupported. No register spilling (fail fast).
+// Everything else -> Status::Unsupported. The emitter does not have a
+// general SSA spill/reload allocator; it does, however, extend its GPR
+// scratch pool with saved callee-saved registers x19..x28.
 //
 // Endian model (round-8 extension — aarch64_be enablement):
 //   A. Instruction stream is always LE (ARM ARM B2.6.2). Writer::emit
@@ -852,7 +854,74 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
 
   const DataLayout &DL = Fn.getParent()->getDataLayout();
 
-  // ---------- Pass 0: frame layout (collect allocas). ----------
+  // Conservative pre-scan: only pay the x19..x28 save/restore cost when
+  // the function is likely to exceed the caller-saved GPR scratch pool.
+  // The real lowering still owns final validation; underestimates fail
+  // cleanly through assignReg, while overestimates only cost a slightly
+  // larger frame for that function.
+  unsigned gprArgCountForScratch = 0;
+  unsigned estimatedGprValues = 0;
+  for (const Argument &A : Fn.args()) {
+    Type *T = A.getType();
+    if (T->isIntegerTy() || T->isPointerTy()) {
+      if (gprArgCountForScratch < 8) {
+        ++gprArgCountForScratch;
+      } else if (T->isPointerTy() || T->isIntegerTy(32) ||
+                 T->isIntegerTy(64)) {
+        ++estimatedGprValues; // stack-arg preload
+      }
+    }
+  }
+  for (const BasicBlock &BB : Fn) {
+    for (const Instruction &I : BB) {
+      if (auto *PN = dyn_cast<PHINode>(&I)) {
+        if (PN->getType()->isIntegerTy()) ++estimatedGprValues;
+        continue;
+      }
+      if (auto *LI = dyn_cast<LoadInst>(&I)) {
+        if (LI->getType()->isIntegerTy() || LI->getType()->isPointerTy())
+          ++estimatedGprValues;
+        continue;
+      }
+      if (auto *SI = dyn_cast<SelectInst>(&I)) {
+        if (SI->getType()->isIntegerTy()) ++estimatedGprValues;
+        continue;
+      }
+      if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+        if (BO->getType()->isIntegerTy()) ++estimatedGprValues;
+        continue;
+      }
+      if (auto *CI = dyn_cast<CastInst>(&I)) {
+        Type *SrcTy = CI->getOperand(0)->getType();
+        Type *DstTy = CI->getType();
+        if (CI->getOpcode() == Instruction::FPToSI ||
+            CI->getOpcode() == Instruction::FPToUI) {
+          ++estimatedGprValues;
+          continue;
+        }
+        if (CI->getOpcode() == Instruction::BitCast &&
+            ((SrcTy->isFloatTy() && DstTy->isIntegerTy(32)) ||
+             (SrcTy->isDoubleTy() && DstTy->isIntegerTy(64)))) {
+          ++estimatedGprValues;
+          continue;
+        }
+        if ((CI->getOpcode() == Instruction::SExt ||
+             CI->getOpcode() == Instruction::ZExt) &&
+            SrcTy->isIntegerTy() && DstTy->isIntegerTy()) {
+          unsigned srcBits = SrcTy->getIntegerBitWidth();
+          unsigned dstBits = DstTy->getIntegerBitWidth();
+          if ((srcBits == 8 || srcBits == 16) &&
+              (dstBits == 32 || dstBits == 64))
+            ++estimatedGprValues;
+        }
+      }
+    }
+  }
+  unsigned callerSavedScratch =
+      (gprArgCountForScratch < 16) ? (16 - gprArgCountForScratch) : 0;
+  const bool useSavedGprScratch = estimatedGprValues > callerSavedScratch;
+
+  // ---------- Pass 0: frame layout (collect allocas + saved scratch regs). ----------
   std::unordered_map<const AllocaInst *, int32_t> allocaOff;
   int32_t frameSize = 0;
   for (const BasicBlock &BB : Fn) {
@@ -872,7 +941,20 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
       }
     }
   }
-  // 16-byte align the frame.
+  // Round 8l: make x19..x28 available as extra GPR scratch registers.
+  // They are callee-saved under AAPCS64, so reserve 10 x 8-byte slots
+  // and save/restore them in the prologue/epilogue. This is deliberately
+  // simpler than a full SSA spill allocator, but removes the common
+  // "scratch OOM" cliff for wide scalar expressions while preserving the
+  // caller's ABI-visible state.
+  if (frameSize) frameSize = (frameSize + 15) & ~15;
+  const int32_t calleeSaveBase = frameSize;
+  const unsigned firstSavedScratch = 19;
+  const unsigned lastSavedScratch = 28;
+  const unsigned numSavedScratch = lastSavedScratch - firstSavedScratch + 1;
+  if (useSavedGprScratch)
+    frameSize += (int32_t)numSavedScratch * 8;
+  // 16-byte align the final frame.
   if (frameSize) frameSize = (frameSize + 15) & ~15;
   if (frameSize > 0xFFF) {
     r.status = Status::Unsupported; r.reason = "frame > 4095B"; return r;
@@ -882,6 +964,14 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
   if (frameSize > 0) {
     if (!W.emit(encAddSubImm(true, true, 31, 31, (unsigned)frameSize))) {
       r.status = Status::TooLarge; return r;
+    }
+  }
+  if (useSavedGprScratch) {
+    for (unsigned sr = firstSavedScratch; sr <= lastSavedScratch; ++sr) {
+      unsigned off = (unsigned)calleeSaveBase + (sr - firstSavedScratch) * 8u;
+      if (!W.emit(encLdrStrUI(false, 3, sr, 31, off / 8u))) {
+        r.status = Status::TooLarge; return r;
+      }
     }
   }
 
@@ -960,18 +1050,20 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
     }
   }
 
-  // Scratch pool is x{argCount}..x15, skipping x16 (imm materialization
-  // temp, reserved by emitImmToX16 + binop reg-reg fallback). Lower bound
-  // is at least 9 for forward compat with tests that assumed that floor,
-  // but we lower it to argCount when that buys us more scratch — this is
-  // what lets e.g. partial_struct_binding (which produces 8 live values
-  // due to an uncsed struct-field load) fit in the pool.
+  // Scratch pool is x{argCount}..x15 plus saved x19..x28. Skip x16/x17
+  // because they are transient materialization/address temps and skip
+  // x18 because AAPCS64 reserves it as the platform register on some
+  // systems. x19..x28 are safe because the prologue saves them above and
+  // every return restores them before handing control back to the caller.
   unsigned nextReg = argCount;
   unsigned nextFpReg = 16;
   auto assignReg = [&](const Value *V) -> int {
-    // Skip x16; it is our imm materialization scratch.
-    if (nextReg == 16) ++nextReg;
-    if (nextReg > 15) return -1;
+    // Skip x16/x17 temps and x18 platform register.
+    if (nextReg == 16)
+      nextReg = useSavedGprScratch ? 19 : 29;
+    if (nextReg == 17 || nextReg == 18) nextReg = 19;
+    unsigned lastScratch = useSavedGprScratch ? lastSavedScratch : 15;
+    if (nextReg > lastScratch) return -1;
     unsigned r = nextReg++;
     regOf[V] = r;
     return (int)r;
@@ -1276,6 +1368,12 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
       } else {
         return false;
       }
+      }
+    }
+    if (useSavedGprScratch) {
+      for (unsigned sr = firstSavedScratch; sr <= lastSavedScratch; ++sr) {
+        unsigned off = (unsigned)calleeSaveBase + (sr - firstSavedScratch) * 8u;
+        if (!W.emit(encLdrStrUI(true, 3, sr, 31, off / 8u))) return false;
       }
     }
     if (frameSize > 0) {
