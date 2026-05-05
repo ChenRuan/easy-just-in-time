@@ -84,10 +84,18 @@ final-mile claim is deferred to a target-machine validation pass.
 - AArch64/aarch64_be target only.
 - Integer and pointer arguments in `x0..x7`.
 - Float arguments in `s0..s7`.
+- Double-precision arguments in `d0..d7` (round 8h). The same V
+  register file backs both `s` and `d` views, so the AAPCS allocation
+  pool and `fpRegOf` register numbering are shared between `float`
+  and `double` arguments.
 - Fixed-size stack frame, constant-offset alloca GEP.
 - One dynamic scaled GEP index over an absolute pointer or forwarded pointer.
 - `i8/i16/i32/i64` loads and stores.
 - `float` loads and stores.
+- `double` loads and stores (round 8h) — `LDR Dt`/`STR Dt` with the
+  size=11, scale=8 unsigned-immediate-offset encoding (`fitsScaled`
+  shift = 3, so byte offset must be 8-byte aligned and within
+  `0..32760`).
 - Integer arithmetic: `add/sub/mul/and/or/xor/shl/lshr/ashr`.
 - Arbitrary `i32` / `i64` integer constants — including negative
   values — used as binop RHS or as the value of an integer `ret` are
@@ -120,6 +128,14 @@ final-mile claim is deferred to a target-machine validation pass.
   single FP binop being unmaterialized `ConstantFP` is rejected
   ("fp binop both ops are scratch consts") because they would both
   land in `s31`.
+- Standalone scalar double-precision arithmetic: `fadd`, `fsub`,
+  `fmul`, `fdiv` on `double` (round 8h). The encodings reuse the
+  single-precision op slots with bit 22 (the `type` field) toggled to
+  `01`. `ConstantFP` doubles are materialized via a 64-bit MOVZ +
+  optional MOVK halfword chain on `x16` followed by `FMOV Dn, X16`;
+  the zero fast path uses `FMOV Dn, XZR`. The scratch slot is `d31`,
+  which is the same V register as `s31`; the existing "both ops are
+  scratch consts" pre-flight check applies unchanged.
 - Scalar single-precision ordered comparisons (round 8f, hardened in
   round 8g), fused into the immediately-following conditional branch
   or `select`. Supported predicates: `FCMP_OEQ` (EQ), `FCMP_OGT` (GT),
@@ -132,19 +148,36 @@ final-mile claim is deferred to a target-machine validation pass.
   the `s31` scratch is fresh, even if any FP-constant materialization
   occurs between the FCmp and its consumer (e.g. an intervening
   `%t = fadd float %x, 2.0` no longer corrupts the FCMP RHS).
-- `select` with float result type, driven by either an icmp or an
-  ordered fcmp (round 8f).
-- `ret float` of either an SSA float value already in an FP register
-  (FMOV S0, Sn) **or** a `ConstantFP` directly (round 8g). Constants
-  are materialized straight into `s0` via the shared
-  `materializeFpConstToReg` helper: FMOV-imm fast path for `0.0f` and
-  `2.0f`, otherwise MOVZ/MOVK on `w16` + `FMOV s0, w16`.
-- `fptosi float -> i32`.
+- Scalar double-precision ordered comparisons (round 8h): same
+  predicate set as `float`, fused into a following branch or
+  `select`. Both operands must share the same FP type — mixed
+  `float`/`double` operands in one `fcmp` are rejected with
+  `"fcmp shape"`. The S vs D form of `FCMP` is selected at the
+  consumer based on the recorded operand type. The same round-8g
+  deferred-operand discipline applies; the `d31` view of the shared
+  scratch is refreshed immediately before `FCMP`.
+- `select` with float OR double result type (round 8h), driven by
+  either an icmp or an ordered fcmp. The TRUE/FALSE FMOV between
+  V-registers picks the S- or D-view based on the select result type.
+- `ret float` / `ret double` of either an SSA FP value already in an
+  FP register (FMOV S0, Sn / FMOV D0, Dn) **or** a `ConstantFP`
+  directly (round 8g for float, round 8h for double). Constants are
+  materialized straight into `s0` / `d0` via the shared
+  `materializeFpConstToReg` helper.
+- `fptosi float -> i32` (FCVTZS Wd, Sn) and `fptosi double -> i32`
+  (FCVTZS Wd, Dn, round 8h). Conversion uses the round-toward-zero
+  saturating semantics required by the C standard.
 - `sext/zext/trunc` over integer widths used by current tests.
 
 ## Known Unsupported Areas
 
-- `double` / `f64` arithmetic and conversion.
+- `double` / `f64` conversions other than `fptosi double -> i32`:
+  `fpext float -> double`, `fptrunc double -> float`, `fptoui` of any
+  width, `sitofp`/`uitofp` from any integer width, `bitcast double
+  <-> i64`, and ordered/unordered FP-class intrinsics are all out of
+  scope for round 8h. Scalar `double` arithmetic, load/store, fcmp,
+  select, ret, and `fptosi double -> i32` ARE supported — see
+  Currently Supported IR Shape.
 - Vector IR.
 - Unordered FP comparison predicates (`FCMP_UEQ`, `FCMP_UNE`,
   `FCMP_UGT`, `FCMP_UGE`, `FCMP_ULT`, `FCMP_ULE`, `FCMP_UNO`,
@@ -156,9 +189,9 @@ final-mile claim is deferred to a target-machine validation pass.
   encoding; emitting it correctly would require either two branches or
   a `CCMP` chain. Frontends should canonicalize to `!FCMP_UEQ` ahead of
   the light backend or accept rejection.
-- `ret` of a `ConstantFP` directly is now supported (round 8g) for
-  `float`. `double` / `f64` constant returns remain unsupported with
-  the rest of the f64 family.
+- `ret` of a `ConstantFP` directly is supported for both `float`
+  (round 8g) and `double` (round 8h). Other FP semantics
+  (long-double, `bfloat`, `half`) remain out of scope.
 - An FP binop or FCmp where *both* operands are unmaterialized
   `ConstantFP` (`s31` scratch clobber). The FCmp pre-flight check
   catches this at the FCmp node (reason `"fcmp both ops are scratch

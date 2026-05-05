@@ -103,6 +103,30 @@ static constexpr uint32_t kFDivS_val = 0x1E201800u;
 static constexpr uint32_t kMaskFCMP   = 0xFFE0FC1Fu;
 static constexpr uint32_t kFCmpS_val  = 0x1E202000u;
 
+// AArch64 scalar f64 opcode masks. The double variants flip bit 22
+// (type=01 vs single's type=00); same op-slot encoding otherwise.
+//   FADD D : 0001_1110_0110_mmmmm_001010_nnnnn_ddddd  -> 0x1E602800
+//   FSUB D : 0001_1110_0110_mmmmm_001110_nnnnn_ddddd  -> 0x1E603800
+//   FMUL D : 0001_1110_0110_mmmmm_000010_nnnnn_ddddd  -> 0x1E600800
+//   FDIV D : 0001_1110_0110_mmmmm_000110_nnnnn_ddddd  -> 0x1E601800
+//   FCMP D : 0001_1110_0110_mmmmm_001000_nnnnn_00000  -> 0x1E602000
+static constexpr uint32_t kFAddD_val = 0x1E602800u;
+static constexpr uint32_t kFSubD_val = 0x1E603800u;
+static constexpr uint32_t kFMulD_val = 0x1E600800u;
+static constexpr uint32_t kFDivD_val = 0x1E601800u;
+static constexpr uint32_t kFCmpD_val = 0x1E602000u;
+
+// FMOV Dd, Xn (used to materialize ConstantFP doubles via x16 bit-
+// pattern):  1001_1110_0110_0111_000000_nnnnn_ddddd -> 0x9E670000
+// Mask: drop Rn/Rd only.
+static constexpr uint32_t kMaskFMovDX  = 0xFFFFFC00u;
+static constexpr uint32_t kFMovDX_val  = 0x9E670000u;
+
+// FCVTZS Wd, Dn (fptosi double -> i32):
+// 0001_1110_0111_1000_000000_nnnnn_ddddd -> 0x1E780000
+static constexpr uint32_t kMaskFcvtzs   = 0xFFFFFC00u;
+static constexpr uint32_t kFcvtzsWD_val = 0x1E780000u;
+
 bool StreamHasOpcode(const std::vector<uint8_t> &code, uint32_t mask,
                      uint32_t value) {
   if ((code.size() % 4) != 0) return false;
@@ -250,6 +274,103 @@ Function *BuildRetConst(Module &M, const char *name, double v) {
   return F;
 }
 
+// =========================== Double IR builders ============================
+// Round-8h: parallel double-precision coverage. Same shapes as the
+// float tests but with f64 operand/result types so that emit picks the
+// D-form encoders (bit 22 set) and 8-byte LDR/STR D scaling.
+
+// double dcalc(double a, double b) { return (a + b) * 2.0 - a / b; }
+Function *BuildDcalc(Module &M) {
+  LLVMContext &C = M.getContext();
+  Type *F64 = Type::getDoubleTy(C);
+  FunctionType *FT = FunctionType::get(F64, {F64, F64}, false);
+  Function *F = Function::Create(FT, GlobalValue::ExternalLinkage, "dcalc", &M);
+  BasicBlock *BB = BasicBlock::Create(C, "entry", F);
+  IRBuilder<> B(BB);
+  Value *a = F->getArg(0);
+  Value *b = F->getArg(1);
+  Value *s = B.CreateFAdd(a, b, "s");
+  Value *d = B.CreateFMul(s, ConstantFP::get(F64, 2.0), "d");
+  Value *q = B.CreateFDiv(a, b, "q");
+  Value *r = B.CreateFSub(d, q, "r");
+  B.CreateRet(r);
+  return F;
+}
+
+// double dclamp(double x, double lo, double hi) — early-return shape,
+// exercises FCMP-D fused into a conditional branch (twice) and ret of
+// SSA double from three blocks.
+Function *BuildDclamp(Module &M) {
+  LLVMContext &C = M.getContext();
+  Type *F64 = Type::getDoubleTy(C);
+  FunctionType *FT = FunctionType::get(F64, {F64, F64, F64}, false);
+  Function *F = Function::Create(FT, GlobalValue::ExternalLinkage, "dclamp", &M);
+  BasicBlock *Entry = BasicBlock::Create(C, "entry", F);
+  BasicBlock *RetLo = BasicBlock::Create(C, "ret_lo", F);
+  BasicBlock *Chk2  = BasicBlock::Create(C, "chk2",   F);
+  BasicBlock *RetHi = BasicBlock::Create(C, "ret_hi", F);
+  BasicBlock *RetX  = BasicBlock::Create(C, "ret_x",  F);
+  Value *x  = F->getArg(0);
+  Value *lo = F->getArg(1);
+  Value *hi = F->getArg(2);
+  IRBuilder<> B(Entry);
+  Value *xLtLo = B.CreateFCmpOLT(x, lo, "x_lt_lo");
+  B.CreateCondBr(xLtLo, RetLo, Chk2);
+  IRBuilder<>(RetLo).CreateRet(lo);
+  IRBuilder<> B2(Chk2);
+  Value *xGtHi = B2.CreateFCmpOGT(x, hi, "x_gt_hi");
+  B2.CreateCondBr(xGtHi, RetHi, RetX);
+  IRBuilder<>(RetHi).CreateRet(hi);
+  IRBuilder<>(RetX).CreateRet(x);
+  return F;
+}
+
+// double dmax(double a, double b) { return a > b ? a : b; }
+// Exercises FCMP-D-driven select on double result (FMOV D copy path).
+Function *BuildDmax(Module &M) {
+  LLVMContext &C = M.getContext();
+  Type *F64 = Type::getDoubleTy(C);
+  FunctionType *FT = FunctionType::get(F64, {F64, F64}, false);
+  Function *F = Function::Create(FT, GlobalValue::ExternalLinkage, "dmax", &M);
+  BasicBlock *BB = BasicBlock::Create(C, "entry", F);
+  IRBuilder<> B(BB);
+  Value *a = F->getArg(0);
+  Value *b = F->getArg(1);
+  Value *cmp = B.CreateFCmpOGT(a, b, "cmp");
+  Value *sel = B.CreateSelect(cmp, a, b, "sel");
+  B.CreateRet(sel);
+  return F;
+}
+
+// double dret_15(void) { return 1.5; } — bit-pattern materialization
+// via 64-bit MOVZ/MOVK chain on x16 followed by FMOV D0, X16.
+Function *BuildDretConst(Module &M, const char *name, double v) {
+  LLVMContext &C = M.getContext();
+  Type *F64 = Type::getDoubleTy(C);
+  FunctionType *FT = FunctionType::get(F64, {}, false);
+  Function *F = Function::Create(FT, GlobalValue::ExternalLinkage, name, &M);
+  BasicBlock *BB = BasicBlock::Create(C, "entry", F);
+  IRBuilder<> B(BB);
+  B.CreateRet(ConstantFP::get(F64, v));
+  return F;
+}
+
+// int dtoi(double x) { return (int)x; } — fptosi double -> i32
+// (FCVTZS Wd, Dn).
+Function *BuildDtoi(Module &M) {
+  LLVMContext &C = M.getContext();
+  Type *F64 = Type::getDoubleTy(C);
+  Type *I32 = Type::getInt32Ty(C);
+  FunctionType *FT = FunctionType::get(I32, {F64}, false);
+  Function *F = Function::Create(FT, GlobalValue::ExternalLinkage, "dtoi", &M);
+  BasicBlock *BB = BasicBlock::Create(C, "entry", F);
+  IRBuilder<> B(BB);
+  Value *x = F->getArg(0);
+  Value *r = B.CreateFPToSI(x, I32, "r");
+  B.CreateRet(r);
+  return F;
+}
+
 // =============================== Reference =================================
 
 float refCalc(float a, float b)  { return (a + b) * 2.0f - a / b; }
@@ -270,6 +391,21 @@ bool feq(float x, float y) {
   float diff = std::fabs(x - y);
   float scale = std::fmax(1.0f, std::fmax(std::fabs(x), std::fabs(y)));
   return diff <= 1e-6f * scale;
+}
+
+// Double-precision references and tolerance check.
+double refDcalc(double a, double b) { return (a + b) * 2.0 - a / b; }
+double refDclamp(double x, double lo, double hi) {
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
+double refDmax(double a, double b) { return a > b ? a : b; }
+
+bool deq(double x, double y) {
+  double diff = std::fabs(x - y);
+  double scale = std::fmax(1.0, std::fmax(std::fabs(x), std::fabs(y)));
+  return diff <= 1e-12 * scale;
 }
 
 // =============================== Run loop =================================
@@ -310,6 +446,13 @@ int main() {
   Function *FrTwo   = BuildRetConst(*M, "ret_two",  2.0);
   Function *FrFifteen = BuildRetConst(*M, "ret_15", 1.5);
 
+  // Round-8h: double-precision counterparts.
+  Function *Fdcalc   = BuildDcalc(*M);
+  Function *Fdclamp  = BuildDclamp(*M);
+  Function *Fdmax    = BuildDmax(*M);
+  Function *Fdret15  = BuildDretConst(*M, "dret_15", 1.5);
+  Function *Fdtoi    = BuildDtoi(*M);
+
   EmitOut eCalc  = EmitFunction(*Fcalc);
   EmitOut eClamp = EmitFunction(*Fclamp);
   EmitOut eMaxf  = EmitFunction(*Fmaxf);
@@ -317,6 +460,11 @@ int main() {
   EmitOut eZero  = EmitFunction(*FrZero);
   EmitOut eTwo   = EmitFunction(*FrTwo);
   EmitOut e15    = EmitFunction(*FrFifteen);
+  EmitOut eDcalc  = EmitFunction(*Fdcalc);
+  EmitOut eDclamp = EmitFunction(*Fdclamp);
+  EmitOut eDmax   = EmitFunction(*Fdmax);
+  EmitOut eDret15 = EmitFunction(*Fdret15);
+  EmitOut eDtoi   = EmitFunction(*Fdtoi);
 
   int failures = 0;
   failures += CheckEmit("calc",         eCalc);
@@ -326,6 +474,11 @@ int main() {
   failures += CheckEmit("ret_zero",     eZero);
   failures += CheckEmit("ret_two",      eTwo);
   failures += CheckEmit("ret_15",       e15);
+  failures += CheckEmit("dcalc",        eDcalc);
+  failures += CheckEmit("dclamp",       eDclamp);
+  failures += CheckEmit("dmax",         eDmax);
+  failures += CheckEmit("dret_15",      eDret15);
+  failures += CheckEmit("dtoi",         eDtoi);
 
   // Opcode-mask coverage guards — these run on any host, so the
   // emitter byte stream is verified even without an AArch64 CPU.
@@ -342,6 +495,20 @@ int main() {
   must("FCMP-S in clamp", StreamHasOpcode(eClamp.code, kMaskFCMP, kFCmpS_val));
   must("FCMP-S in maxf",  StreamHasOpcode(eMaxf.code,  kMaskFCMP, kFCmpS_val));
   must("FCMP-S in stale", StreamHasOpcode(eStale.code, kMaskFCMP, kFCmpS_val));
+
+  // Round-8h double-precision opcode coverage. Each builder targets a
+  // specific D-form encoding so a missing match means the lowering
+  // never went through the new path.
+  must("FADD-D in dcalc",  StreamHasOpcode(eDcalc.code,  kMaskFP3, kFAddD_val));
+  must("FSUB-D in dcalc",  StreamHasOpcode(eDcalc.code,  kMaskFP3, kFSubD_val));
+  must("FMUL-D in dcalc",  StreamHasOpcode(eDcalc.code,  kMaskFP3, kFMulD_val));
+  must("FDIV-D in dcalc",  StreamHasOpcode(eDcalc.code,  kMaskFP3, kFDivD_val));
+  must("FCMP-D in dclamp", StreamHasOpcode(eDclamp.code, kMaskFCMP, kFCmpD_val));
+  must("FCMP-D in dmax",   StreamHasOpcode(eDmax.code,   kMaskFCMP, kFCmpD_val));
+  must("FMOV D,X in dret_15",
+       StreamHasOpcode(eDret15.code, kMaskFMovDX, kFMovDX_val));
+  must("FCVTZS W,D in dtoi",
+       StreamHasOpcode(eDtoi.code, kMaskFcvtzs, kFcvtzsWD_val));
 
   if (failures) {
     std::printf("FAIL: emit / coverage stage (%d failures)\n", failures);
@@ -362,7 +529,18 @@ int main() {
   F0 rZero = (F0)MakeExecutable(eZero.code);
   F0 rTwo  = (F0)MakeExecutable(eTwo.code);
   F0 r15   = (F0)MakeExecutable(e15.code);
-  if (!calc || !clamp || !maxf || !stale || !rZero || !rTwo || !r15) {
+  // Double-precision execution wrappers.
+  using D2  = double(*)(double, double);
+  using D3  = double(*)(double, double, double);
+  using D0  = double(*)();
+  using DI1 = int   (*)(double);
+  D2  dcalc  = (D2 )MakeExecutable(eDcalc.code);
+  D3  dclamp = (D3 )MakeExecutable(eDclamp.code);
+  D2  dmax   = (D2 )MakeExecutable(eDmax.code);
+  D0  dret15 = (D0 )MakeExecutable(eDret15.code);
+  DI1 dtoi   = (DI1)MakeExecutable(eDtoi.code);
+  if (!calc || !clamp || !maxf || !stale || !rZero || !rTwo || !r15 ||
+      !dcalc || !dclamp || !dmax || !dret15 || !dtoi) {
     std::printf("FAIL: mmap/exec setup\n");
     return 1;
   }
@@ -440,12 +618,83 @@ int main() {
     }
   }
 
+  // ============================ double tests ============================
+
+  // dcalc
+  {
+    std::pair<double, double> in[] = {
+      {1.0, 2.0}, {3.0, 4.0}, {-1.5, 2.5},
+      {10.0, -2.0}, {0.5, 0.25}, {-7.0, -3.0}};
+    for (auto [a, b] : in) {
+      double got = dcalc(a, b), want = refDcalc(a, b);
+      bool ok = deq(got, want);
+      std::printf("  dcalc(%.4f,%.4f) = %.12f want %.12f %s\n",
+                  a, b, got, want, ok ? "OK" : "FAIL");
+      if (!ok) ++failures;
+    }
+  }
+
+  // dclamp
+  {
+    struct DC { double x, lo, hi; };
+    DC in[] = {{0.5, 0.0, 1.0}, {-1.0, 0.0, 1.0}, {2.0, 0.0, 1.0},
+               {0.0, 0.0, 1.0}, {1.0, 0.0, 1.0}, {-7.5, -10.0, -5.0}};
+    for (const auto &c : in) {
+      double got  = dclamp(c.x, c.lo, c.hi);
+      double want = refDclamp(c.x, c.lo, c.hi);
+      bool ok = deq(got, want);
+      std::printf("  dclamp(%.4f,%.4f,%.4f) = %.12f want %.12f %s\n",
+                  c.x, c.lo, c.hi, got, want, ok ? "OK" : "FAIL");
+      if (!ok) ++failures;
+    }
+  }
+
+  // dmax
+  {
+    std::pair<double, double> in[] = {
+      {1.0, 2.0}, {3.0, -4.0}, {-1.5, 2.5},
+      {0.0, 0.0}, {7.0, 7.0}, {-1.0, -2.0}};
+    for (auto [a, b] : in) {
+      double got = dmax(a, b), want = refDmax(a, b);
+      bool ok = deq(got, want);
+      std::printf("  dmax(%.4f,%.4f) = %.12f want %.12f %s\n",
+                  a, b, got, want, ok ? "OK" : "FAIL");
+      if (!ok) ++failures;
+    }
+  }
+
+  // dret_15 — bit-pattern materialization for 1.5 via 64-bit MOVZ/MOVK
+  // chain on x16 followed by FMOV D0, X16. 1.5 = 0x3FF8000000000000;
+  // only one non-zero halfword (hw3 = 0x3FF8) so the chain is 1 MOVZ
+  // + 1 MOVK + 1 FMOV.
+  {
+    double got = dret15();
+    bool ok = deq(got, 1.5);
+    std::printf("  dret_15() = %.12f want 1.500000000000 %s\n",
+                got, ok ? "OK" : "FAIL");
+    if (!ok) ++failures;
+  }
+
+  // dtoi — fptosi double -> i32 with truncation toward zero.
+  {
+    struct DT { double x; int want; };
+    DT in[] = {{0.0, 0}, {1.0, 1}, {1.9, 1}, {-1.9, -1},
+               {2.5, 2}, {-2.5, -2}, {1234567.89, 1234567}};
+    for (const auto &t : in) {
+      int got = dtoi(t.x);
+      bool ok = (got == t.want);
+      std::printf("  dtoi(%.4f) = %d want %d %s\n",
+                  t.x, got, t.want, ok ? "OK" : "FAIL");
+      if (!ok) ++failures;
+    }
+  }
+
   if (failures) {
     std::printf("FAILED: %d case(s)\n", failures);
     return 1;
   }
   std::printf("PASS: light fp ops (calc + clamp + maxf + stale_repro "
-              "+ ret_const)\n");
+              "+ ret_const + dcalc + dclamp + dmax + dret_15 + dtoi)\n");
   return 0;
 #else
   std::printf("PASS (emit+coverage only): non-AArch64 host, execution "

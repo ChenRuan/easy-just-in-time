@@ -181,12 +181,28 @@ static uint32_t encFpLdrStrUIS(bool load, unsigned rt, unsigned rn,
   uint32_t op = load ? 0xBD400000u : 0xBD000000u;
   return op | ((imm12 & 0xFFFu) << 10) | ((rn & 0x1Fu) << 5) | (rt & 0x1Fu);
 }
+// Double-precision (Dt) variant: same encoding family but size=11 (bits
+// 30-31). LDR Dt: 0xFD40_0000 base, STR Dt: 0xFD00_0000 base. The
+// imm12 field is scaled by 8 (for D) instead of 4 (for S); callers
+// pass the already-scaled (i.e. divided) immediate.
+static uint32_t encFpLdrStrUID(bool load, unsigned rt, unsigned rn,
+                               unsigned imm12) {
+  uint32_t op = load ? 0xFD400000u : 0xFD000000u;
+  return op | ((imm12 & 0xFFFu) << 10) | ((rn & 0x1Fu) << 5) | (rt & 0x1Fu);
+}
 static uint32_t encFmaddS(unsigned rd, unsigned rn, unsigned rm, unsigned ra) {
   return 0x1F000000u | ((rm & 0x1Fu) << 16) | ((ra & 0x1Fu) << 10)
                     | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
 }
 static uint32_t encFcvtzsWS(unsigned rd, unsigned rn) {
   return 0x1E380000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+// FCVTZS Wd, Dn — round toward zero, double-precision source, 32-bit
+// signed integer destination. Encoding: sf=0 type=01 rmode=11 opc=000
+// → 0x1E78_0000 base. Out-of-range / NaN inputs saturate per ARM
+// (INT_MIN / INT_MAX / 0). ARM ARM C6.2.61.
+static uint32_t encFcvtzsWD(unsigned rd, unsigned rn) {
+  return 0x1E780000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
 }
 static uint32_t encFmovImm2S(unsigned rd) {
   return 0x1E201000u | (rd & 0x1Fu);
@@ -200,6 +216,20 @@ static uint32_t encFmovRegS(unsigned rd, unsigned rn) {
 static uint32_t encFmovSFromW(unsigned rd, unsigned rn) {
   return 0x1E270000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
 }
+// Double-precision FMOV variants (ARM ARM C6.2.103/104).
+//   FMOV Dd, Dn   : type=01 opc=00 → 0x1E60_4000
+//   FMOV Dd, Xn   : sf=1 type=01 rmode=00 opc=111 → 0x9E67_0000
+//   FMOV Xd, Dn   : sf=1 type=01 rmode=00 opc=110 → 0x9E66_0000
+//   FMOV Dd, XZR  : same as FMOV Dd, Xn with Xn=31 → +0.0  (no separate
+//                   FMOV-imm zero needed, ditto for the S form).
+static uint32_t encFmovRegD(unsigned rd, unsigned rn) {
+  return 0x1E604000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+static uint32_t encFmovDFromX(unsigned rd, unsigned rn) {
+  return 0x9E670000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+// (FMOV Xd from Dn is not currently needed by any IR shape we lower,
+// so we don't define it. Add when fptoui/bitcast double->i64 lands.)
 // Single-precision scalar FP arithmetic (ARM ARM C6.2.79..C6.2.82).
 // Encoding family: 0001_1110_0010_mmmmm_<op>_nnnnn_ddddd, type=00 → single.
 //   FADD: opc=001010 → 0x1E20_2800 base
@@ -218,12 +248,33 @@ static uint32_t encFmulS(unsigned rd, unsigned rn, unsigned rm) {
 static uint32_t encFdivS(unsigned rd, unsigned rn, unsigned rm) {
   return 0x1E201800u | ((rm & 0x1Fu) << 16) | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
 }
+// Double-precision counterparts (type=01 → bit 22 set, vs single's
+// type=00). Encoding: 0001_1110_0110_mmmmm_<op>_nnnnn_ddddd.
+//   FADD D: 0x1E60_2800   FSUB D: 0x1E60_3800
+//   FMUL D: 0x1E60_0800   FDIV D: 0x1E60_1800
+static uint32_t encFaddD(unsigned rd, unsigned rn, unsigned rm) {
+  return 0x1E602800u | ((rm & 0x1Fu) << 16) | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+static uint32_t encFsubD(unsigned rd, unsigned rn, unsigned rm) {
+  return 0x1E603800u | ((rm & 0x1Fu) << 16) | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+static uint32_t encFmulD(unsigned rd, unsigned rn, unsigned rm) {
+  return 0x1E600800u | ((rm & 0x1Fu) << 16) | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+static uint32_t encFdivD(unsigned rd, unsigned rn, unsigned rm) {
+  return 0x1E601800u | ((rm & 0x1Fu) << 16) | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
 // FCMP Sn, Sm (scalar single, ARM ARM C6.2.84). Sets NZCV per IEEE-754:
 //   ordered <  → NZCV=1000   ordered ==  → 0110
 //   ordered >  → NZCV=0010   unordered   → 0011  (V=1 for NaN)
 // Encoding: 0001_1110_0010_mmmmm_001000_nnnnn_00000.
 static uint32_t encFcmpS(unsigned rn, unsigned rm) {
   return 0x1E202000u | ((rm & 0x1Fu) << 16) | ((rn & 0x1Fu) << 5);
+}
+// FCMP Dn, Dm — same NZCV semantics as FCMP S, type=01.
+// Encoding: 0001_1110_0110_mmmmm_001000_nnnnn_00000 → 0x1E60_2000.
+static uint32_t encFcmpD(unsigned rn, unsigned rm) {
+  return 0x1E602000u | ((rm & 0x1Fu) << 16) | ((rn & 0x1Fu) << 5);
 }
 // SUBS (imm) — used for CMP imm. 32-bit form.
 static uint32_t encSubsImm32(unsigned rn, unsigned imm12) {
@@ -749,7 +800,10 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
       if (T->isIntegerTy() || T->isPointerTy()) {
         regOf[&A] = argCount;
         argCount++;
-      } else if (T->isFloatTy()) {
+      } else if (T->isFloatTy() || T->isDoubleTy()) {
+        // float -> S{n}, double -> D{n}; the V register file is shared so
+        // we just track the register index and let emit-time logic pick
+        // the S- or D-view based on the SSA value's type.
         fpRegOf[&A] = fpArgCount;
         fpArgCount++;
       } else {
@@ -794,7 +848,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
   for (const BasicBlock &BB : Fn) {
     for (const Instruction &I : BB) {
       if (auto *PN = dyn_cast<PHINode>(&I)) {
-        if (PN->getType()->isFloatTy()) {
+        if (PN->getType()->isFloatTy() || PN->getType()->isDoubleTy()) {
           if (assignFpReg(PN) < 0) {
             r.status = Status::Unsupported; r.reason = "out of fp scratch (phi)"; return r;
           }
@@ -942,29 +996,43 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
     return true;
   };
 
-  // Materialize an `f32` ConstantFP into the destination FP register
-  // `rd`. Fast paths for 0.0f and 2.0f use FMOV-imm; everything else
-  // goes through `MOVZ Wx16,#lo (+ MOVK Wx16,#hi,lsl#16)` followed by
-  // `FMOV Sd, W16`. Defined here (above `epilogueRet`) so both
-  // `epilogueRet` (for `ret <ConstantFP>`) and `valueInFpReg` can
-  // share it. Returns false on encode/buffer failure or non-IEEEsingle
-  // semantics.
+  // Materialize an `f32`/`f64` ConstantFP into the destination FP
+  // register `rd`. For float, fast paths for 0.0f and 2.0f use
+  // FMOV-imm; everything else goes through `MOVZ Wx16,#lo (+ MOVK
+  // Wx16,#hi,lsl#16)` followed by `FMOV Sd, W16`. For double, 0.0
+  // uses `FMOV Dd, XZR` (1 insn); other values are materialized via
+  // a 64-bit MOVZ/MOVK chain on x16 followed by `FMOV Dd, X16`.
+  // Defined here (above `epilogueRet`) so both `epilogueRet` (for
+  // `ret <ConstantFP>`) and `valueInFpReg` can share it. Returns
+  // false on encode/buffer failure or unsupported FP semantics.
   auto materializeFpConstToReg = [&](const ConstantFP *CFP,
                                      unsigned rd) -> bool {
     const APFloat &APF = CFP->getValueAPF();
-    if (&APF.getSemantics() != &APFloat::IEEEsingle()) return false;
-    if (APF.isZero()) return W.emit(encFmovZeroS(rd));
-    bool losesInfo = false;
-    APFloat V2(APF);
-    V2.convert(APFloat::IEEEsingle(), APFloat::rmNearestTiesToEven,
-               &losesInfo);
-    if (!losesInfo && V2.convertToFloat() == 2.0f)
-      return W.emit(encFmovImm2S(rd));
-    uint32_t raw = (uint32_t)APF.bitcastToAPInt().getZExtValue();
-    if (!W.emit(encMovz16(false, 16, (uint16_t)(raw & 0xFFFFu)))) return false;
-    uint16_t hi = (uint16_t)(raw >> 16);
-    if (hi && !W.emit(encMovkHw32(16, hi, 1))) return false;
-    return W.emit(encFmovSFromW(rd, 16));
+    if (&APF.getSemantics() == &APFloat::IEEEsingle()) {
+      if (APF.isZero()) return W.emit(encFmovZeroS(rd));
+      bool losesInfo = false;
+      APFloat V2(APF);
+      V2.convert(APFloat::IEEEsingle(), APFloat::rmNearestTiesToEven,
+                 &losesInfo);
+      if (!losesInfo && V2.convertToFloat() == 2.0f)
+        return W.emit(encFmovImm2S(rd));
+      uint32_t raw = (uint32_t)APF.bitcastToAPInt().getZExtValue();
+      if (!W.emit(encMovz16(false, 16, (uint16_t)(raw & 0xFFFFu)))) return false;
+      uint16_t hi = (uint16_t)(raw >> 16);
+      if (hi && !W.emit(encMovkHw32(16, hi, 1))) return false;
+      return W.emit(encFmovSFromW(rd, 16));
+    }
+    if (&APF.getSemantics() == &APFloat::IEEEdouble()) {
+      // 0.0 fast path: FMOV Dd, XZR (xzr is encoded as Xn=31).
+      if (APF.isZero()) return W.emit(encFmovDFromX(rd, 31));
+      uint64_t raw = APF.bitcastToAPInt().getZExtValue();
+      // Reuse the 64-bit MOVZ+MOVK chain on x16, then FMOV Dd, X16.
+      // emitMovImm takes an APInt so we hand it the raw bit pattern
+      // as an unsigned 64-bit integer.
+      if (!emitMovImm(16, /*is64=*/true, APInt(64, raw))) return false;
+      return W.emit(encFmovDFromX(rd, 16));
+    }
+    return false;
   };
 
   auto epilogueRet = [&](const Value *retVal) -> bool {
@@ -974,11 +1042,21 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
       // returns are handled directly here (round 8g): we materialize
       // the constant straight into S0 so callers like `ret float 1.5`
       // work without going through an intermediate SSA producer.
-      if (retVal->getType()->isFloatTy()) {
+      // Float/double return — place the value in S0/D0. SSA values
+      // that already live in `fpRegOf` are moved with FMOV Sn/Dn ->
+      // S0/D0. ConstantFP returns are handled directly here (round
+      // 8g): we materialize the constant straight into S0/D0 so
+      // callers like `ret float 1.5` / `ret double 1.5` work without
+      // going through an intermediate SSA producer.
+      if (retVal->getType()->isFloatTy() ||
+          retVal->getType()->isDoubleTy()) {
+        bool isDouble = retVal->getType()->isDoubleTy();
         auto itf = fpRegOf.find(retVal);
         if (itf != fpRegOf.end()) {
           if (itf->second != 0) {
-            if (!W.emit(encFmovRegS(0, itf->second))) return false;
+            if (!W.emit(isDouble ? encFmovRegD(0, itf->second)
+                                 : encFmovRegS(0, itf->second)))
+              return false;
           }
         } else if (auto *CFP = dyn_cast<ConstantFP>(retVal)) {
           if (!materializeFpConstToReg(CFP, 0)) return false;
@@ -1276,7 +1354,11 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
 
       // Load
       if (auto *LI = dyn_cast<LoadInst>(&I)) {
-        if (LI->getType()->isFloatTy()) {
+        if (LI->getType()->isFloatTy() || LI->getType()->isDoubleTy()) {
+          bool isDouble = LI->getType()->isDoubleTy();
+          // Scale shift for the unsigned-immediate-offset LDR encoding:
+          // single = 4 bytes -> shift 2; double = 8 bytes -> shift 3.
+          int scaleShift = isDouble ? 3 : 2;
           auto it = ptrLoc.find(LI->getPointerOperand());
           if (it == ptrLoc.end()) {
             PtrLoc loc;
@@ -1298,7 +1380,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
           unsigned baseReg = 0;
           unsigned imm = 0;
           if (base.kind == PtrLoc::StackRel) {
-            int s = fitsScaled(base.spOff, 2);
+            int s = fitsScaled(base.spOff, scaleShift);
             if (s < 0) { r.status = Status::Unsupported; r.reason = "float load offset"; return r; }
             baseReg = 31; imm = (unsigned)s;
           } else if (base.kind == PtrLoc::Absolute) {
@@ -1309,12 +1391,14 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
             if (!materializeScaledAddrToX17(base)) { r.status = Status::Unsupported; r.reason = "float dyn addr"; return r; }
             baseReg = 17; imm = 0;
           } else {
-            int s = fitsScaled(base.spOff, 2);
+            int s = fitsScaled(base.spOff, scaleShift);
             if (s < 0) { r.status = Status::Unsupported; r.reason = "float load reg+off"; return r; }
             baseReg = base.reg; imm = 0;
             imm = (unsigned)s;
           }
-          if (!W.emit(encFpLdrStrUIS(true, (unsigned)rd, baseReg, imm))) {
+          if (!W.emit(isDouble
+                        ? encFpLdrStrUID(true, (unsigned)rd, baseReg, imm)
+                        : encFpLdrStrUIS(true, (unsigned)rd, baseReg, imm))) {
             r.status = Status::TooLarge; return r;
           }
           continue;
@@ -1472,7 +1556,9 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
       // Store
       if (auto *SI = dyn_cast<StoreInst>(&I)) {
         const Value *V = SI->getValueOperand();
-        if (V->getType()->isFloatTy()) {
+        if (V->getType()->isFloatTy() || V->getType()->isDoubleTy()) {
+          bool isDouble = V->getType()->isDoubleTy();
+          int scaleShift = isDouble ? 3 : 2;
           auto it = ptrLoc.find(SI->getPointerOperand());
           if (it == ptrLoc.end()) {
             PtrLoc loc;
@@ -1494,7 +1580,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
           unsigned baseReg = 0;
           unsigned imm = 0;
           if (base.kind == PtrLoc::StackRel) {
-            int s = fitsScaled(base.spOff, 2);
+            int s = fitsScaled(base.spOff, scaleShift);
             if (s < 0) { r.status = Status::Unsupported; r.reason = "float store offset"; return r; }
             baseReg = 31; imm = (unsigned)s;
           } else if (base.kind == PtrLoc::Absolute) {
@@ -1505,12 +1591,13 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
             if (!materializeScaledAddrToX17(base)) { r.status = Status::Unsupported; r.reason = "float dyn addr"; return r; }
             baseReg = 17; imm = 0;
           } else {
-            int s = fitsScaled(base.spOff, 2);
+            int s = fitsScaled(base.spOff, scaleShift);
             if (s < 0) { r.status = Status::Unsupported; r.reason = "float store reg+off"; return r; }
             baseReg = base.reg; imm = 0;
             imm = (unsigned)s;
           }
-          if (!W.emit(encFpLdrStrUIS(false, rs, baseReg, imm))) {
+          if (!W.emit(isDouble ? encFpLdrStrUID(false, rs, baseReg, imm)
+                               : encFpLdrStrUIS(false, rs, baseReg, imm))) {
             r.status = Status::TooLarge; return r;
           }
           continue;
@@ -1623,21 +1710,26 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         continue;
       }
 
-      // fcmp — record, fuse with following br/select. Only scalar f32
-      // is supported in this round; double / vector / NaN-sensitive
-      // unordered predicates and ONE are rejected with "fcmp predicate"
-      // / "fcmp shape".
+      // fcmp — record, fuse with following br/select. Scalar f32 and
+      // f64 are supported; both operands must share the same FP type
+      // (no mixed single/double). NaN-sensitive unordered predicates
+      // and ONE are rejected with "fcmp predicate" / "fcmp shape".
       //
       // IMPORTANT (round 8g): we do NOT materialize the operands here.
       // If we did, an intervening instruction that materializes another
       // ConstantFP (e.g. `%t = fadd float %x, 2.0` between this fcmp
-      // and its consumer) would clobber the S31 scratch slot, and the
-      // deferred FCMP would compare against a stale value. Instead we
-      // record the IR Values and let the consumer call `valueInFpReg`
-      // immediately before emitting FCMP, when the scratch is fresh.
+      // and its consumer) would clobber the S31/D31 scratch slot, and
+      // the deferred FCMP would compare against a stale value. Instead
+      // we record the IR Values and let the consumer call
+      // `valueInFpReg` immediately before emitting FCMP, when the
+      // scratch is fresh. The S vs D form of FCMP is selected at the
+      // consumer based on `pendingFCmp.lhs->getType()`.
       if (auto *FC = dyn_cast<FCmpInst>(&I)) {
-        if (!FC->getOperand(0)->getType()->isFloatTy() ||
-            !FC->getOperand(1)->getType()->isFloatTy()) {
+        Type *LT = FC->getOperand(0)->getType();
+        Type *RT = FC->getOperand(1)->getType();
+        bool bothFloat  = LT->isFloatTy()  && RT->isFloatTy();
+        bool bothDouble = LT->isDoubleTy() && RT->isDoubleTy();
+        if (!bothFloat && !bothDouble) {
           r.status = Status::Unsupported; r.reason = "fcmp shape"; return r;
         }
         unsigned condCheck = fcmpToCond(FC->getPredicate());
@@ -1679,15 +1771,17 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         if (!isIcmp && !isFcmp) {
           r.status = Status::Unsupported; r.reason = "select without fused icmp/fcmp"; return r;
         }
-        bool isFloatRes = SI->getType()->isFloatTy();
-        if (!isFloatRes && !SI->getType()->isIntegerTy()) {
+        bool isFloatRes  = SI->getType()->isFloatTy();
+        bool isDoubleRes = SI->getType()->isDoubleTy();
+        bool isFpRes     = isFloatRes || isDoubleRes;
+        if (!isFpRes && !SI->getType()->isIntegerTy()) {
           r.status = Status::Unsupported; r.reason = "select result type"; return r;
         }
         bool resIs64 = SI->getType()->isIntegerTy(64);
 
         // allocate result reg (FP or GPR depending on result type)
         int rd;
-        if (isFloatRes) {
+        if (isFpRes) {
           rd = assignFpReg(SI);
           if (rd < 0) { r.status = Status::Unsupported; r.reason = "fp scratch OOM (select)"; return r; }
         } else {
@@ -1700,8 +1794,9 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         if (isFcmp) {
           // Round 8g: materialize fcmp operands HERE, not at the FCmp
           // node. Any intervening FP-constant materialization may have
-          // clobbered S31 since the FCmp; redoing the materialization
-          // immediately before FCMP guarantees a fresh scratch.
+          // clobbered S31/D31 since the FCmp; redoing the
+          // materialization immediately before FCMP guarantees a fresh
+          // scratch.
           unsigned rn, rm;
           if (!valueInFpReg(pendingFCmp.lhs, rn)) {
             r.status = Status::Unsupported; r.reason = "fcmp lhs"; return r;
@@ -1714,7 +1809,11 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
             r.reason = "fcmp both ops are scratch consts";
             return r;
           }
-          if (!W.emit(encFcmpS(rn, rm))) {
+          // Pick the S- or D-view of FCMP based on the operand type.
+          // S/D share the V register file so the register numbers are
+          // the same — only the encoding differs.
+          bool fcmpIsDouble = pendingFCmp.lhs->getType()->isDoubleTy();
+          if (!W.emit(fcmpIsDouble ? encFcmpD(rn, rm) : encFcmpS(rn, rm))) {
             r.status = Status::TooLarge; return r;
           }
           cond = fcmpToCond(pendingFCmp.pred);
@@ -1733,13 +1832,16 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         if (!W.emit(encBcondStub(invCond))) { r.status=Status::TooLarge; return r; }
 
         // TRUE case: materialize true value into rd
-        if (isFloatRes) {
+        if (isFpRes) {
           unsigned trueReg;
           if (!valueInFpReg(SI->getTrueValue(), trueReg)) {
             r.status = Status::Unsupported; r.reason = "select true val (fp)"; return r;
           }
           if ((unsigned)rd != trueReg) {
-            if (!W.emit(encFmovRegS((unsigned)rd, trueReg))) { r.status=Status::TooLarge; return r; }
+            if (!W.emit(isDoubleRes ? encFmovRegD((unsigned)rd, trueReg)
+                                    : encFmovRegS((unsigned)rd, trueReg))) {
+              r.status=Status::TooLarge; return r;
+            }
           }
         } else {
           unsigned trueReg;
@@ -1765,13 +1867,16 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         }
 
         // FALSE case
-        if (isFloatRes) {
+        if (isFpRes) {
           unsigned falseReg;
           if (!valueInFpReg(SI->getFalseValue(), falseReg)) {
             r.status = Status::Unsupported; r.reason = "select false val (fp)"; return r;
           }
           if ((unsigned)rd != falseReg) {
-            if (!W.emit(encFmovRegS((unsigned)rd, falseReg))) { r.status=Status::TooLarge; return r; }
+            if (!W.emit(isDoubleRes ? encFmovRegD((unsigned)rd, falseReg)
+                                    : encFmovRegS((unsigned)rd, falseReg))) {
+              r.status=Status::TooLarge; return r;
+            }
           }
         } else {
           unsigned falseReg;
@@ -1800,14 +1905,16 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
 
       // Binary ops
       if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
-        // FP binary ops (fadd/fsub/fmul/fdiv) — only scalar f32 is
+        // FP binary ops (fadd/fsub/fmul/fdiv) — scalar f32 and f64 are
         // supported. Both operands are routed through valueInFpReg,
-        // which materializes ConstantFP values into S31 via x16+FMOV.
-        // Because the constant path always lands in S31, having two
-        // ConstantFP operands in the same binop would clobber the
-        // first; we explicitly reject that. In practice the frontend
-        // would have constant-folded such a binop already.
-        if (BO->getType()->isFloatTy()) {
+        // which materializes ConstantFP values into S31/D31 via
+        // x16+FMOV. Because the constant path always lands in the
+        // shared scratch slot, having two ConstantFP operands in the
+        // same binop would clobber the first; we explicitly reject
+        // that. In practice the frontend would have constant-folded
+        // such a binop already.
+        if (BO->getType()->isFloatTy() || BO->getType()->isDoubleTy()) {
+          bool isDouble = BO->getType()->isDoubleTy();
           auto opc = BO->getOpcode();
           if (opc != Instruction::FAdd && opc != Instruction::FSub &&
               opc != Instruction::FMul && opc != Instruction::FDiv) {
@@ -1835,10 +1942,10 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
           }
           bool ok = false;
           switch (opc) {
-          case Instruction::FAdd: ok = W.emit(encFaddS((unsigned)rd, rn, rm)); break;
-          case Instruction::FSub: ok = W.emit(encFsubS((unsigned)rd, rn, rm)); break;
-          case Instruction::FMul: ok = W.emit(encFmulS((unsigned)rd, rn, rm)); break;
-          case Instruction::FDiv: ok = W.emit(encFdivS((unsigned)rd, rn, rm)); break;
+          case Instruction::FAdd: ok = W.emit(isDouble ? encFaddD((unsigned)rd, rn, rm) : encFaddS((unsigned)rd, rn, rm)); break;
+          case Instruction::FSub: ok = W.emit(isDouble ? encFsubD((unsigned)rd, rn, rm) : encFsubS((unsigned)rd, rn, rm)); break;
+          case Instruction::FMul: ok = W.emit(isDouble ? encFmulD((unsigned)rd, rn, rm) : encFmulS((unsigned)rd, rn, rm)); break;
+          case Instruction::FDiv: ok = W.emit(isDouble ? encFdivD((unsigned)rd, rn, rm) : encFdivS((unsigned)rd, rn, rm)); break;
           default: break;
           }
           if (!ok) { r.status = Status::TooLarge; return r; }
@@ -1899,7 +2006,13 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
       // clearing high bits; sext from i8/i16 needs an explicit SBFM.
       if (auto *CI = dyn_cast<CastInst>(&I)) {
         if (CI->getOpcode() == Instruction::FPToSI) {
-          if (!CI->getOperand(0)->getType()->isFloatTy() ||
+          // Supported shapes: float -> i32 (FCVTZS Wd, Sn) and
+          // double -> i32 (FCVTZS Wd, Dn). Other widths/types are
+          // rejected with "fptosi shape".
+          Type *srcTy = CI->getOperand(0)->getType();
+          bool srcIsFloat  = srcTy->isFloatTy();
+          bool srcIsDouble = srcTy->isDoubleTy();
+          if ((!srcIsFloat && !srcIsDouble) ||
               !CI->getType()->isIntegerTy(32)) {
             r.status = Status::Unsupported; r.reason = "fptosi shape"; return r;
           }
@@ -1911,7 +2024,8 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
           if (rd < 0) {
             r.status = Status::Unsupported; r.reason = "scratch OOM (fptosi)"; return r;
           }
-          if (!W.emit(encFcvtzsWS((unsigned)rd, it->second))) {
+          if (!W.emit(srcIsDouble ? encFcvtzsWD((unsigned)rd, it->second)
+                                  : encFcvtzsWS((unsigned)rd, it->second))) {
             r.status = Status::TooLarge; return r;
           }
           continue;
@@ -1978,14 +2092,17 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
             auto *PN = dyn_cast<PHINode>(&J);
             if (!PN) break;
             Value *inc = PN->getIncomingValueForBlock(&BB);
-            if (PN->getType()->isFloatTy()) {
+            if (PN->getType()->isFloatTy() || PN->getType()->isDoubleTy()) {
+              bool isDouble = PN->getType()->isDoubleTy();
               auto itR = fpRegOf.find(PN);
               if (itR == fpRegOf.end()) return false;
               unsigned phiReg = itR->second;
               unsigned srcReg;
               if (!valueInFpReg(inc, srcReg)) return false;
               if (srcReg != phiReg) {
-                if (!W.emit(encFmovRegS(phiReg, srcReg))) return false;
+                if (!W.emit(isDouble ? encFmovRegD(phiReg, srcReg)
+                                     : encFmovRegS(phiReg, srcReg)))
+                  return false;
               }
               continue;
             }
@@ -2037,7 +2154,11 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
             r.reason = "fcmp both ops are scratch consts";
             return r;
           }
-          if (!W.emit(encFcmpS(rn, rm))) {
+          // S vs D dispatch based on the operand type recorded at the
+          // FCmp site. Both operands have already been validated to
+          // share the same FP type at FCmp lowering time.
+          bool fcmpIsDouble = pendingFCmp.lhs->getType()->isDoubleTy();
+          if (!W.emit(fcmpIsDouble ? encFcmpD(rn, rm) : encFcmpS(rn, rm))) {
             r.status=Status::TooLarge; return r;
           }
         } else if (pendingCmp.rhsImm >= 0) {
