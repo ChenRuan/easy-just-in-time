@@ -11,6 +11,8 @@ HOST_EASYJIT_BUILD=""
 SOURCE_FILE=""
 OUTPUT_FILE=""
 RUNTIME_SO=""
+RUNTIME_STATIC=""
+STATIC_BINARY=0
 RUNTIME_BUILD_DIR=""
 LLVM_DIR=""
 TARGET_CPU=""
@@ -37,7 +39,7 @@ Usage:
     --sysroot <path> \
     --host-llvm-build <path> \
     (--host-easyjit-build <path> | --host-easyjit-dir <path>) \
-    [--runtime-so <path> | --llvm-dir <path>] \
+    [--runtime-so <path> | --runtime-static <path> | --llvm-dir <path>] \
     --source <file.c> \
     --output <binary>
 
@@ -55,6 +57,12 @@ Optional:
                              Host EasyJIT build dir containing bin/EasyJitPass.so
   --host-easyjit-dir <path>  Dir containing host EasyJitPass.so
   --runtime-so <path>        Prebuilt target libEasyJitRuntime.so path
+  --runtime-static <path>    Prebuilt target static EasyJIT runtime archive,
+                             usually libEasyJitRuntimeWithNeededLLVM.a from
+                             build_cross_runtime.sh --runtime-type static
+                             --bundle-llvm-needed-static
+  --static-binary            Link the final target binary with -static.
+                             Requires --runtime-static.
   --llvm-dir <path>          Target LLVM CMake package dir; required when --runtime-so is omitted
   --runtime-build-dir <path> Output dir when building target runtime in-script
   --target-cpu <cpu>         Optional -mcpu
@@ -111,6 +119,39 @@ Pure clang + libc++ example:
     --libcxx-lib-dir /opt/sdk/lib64 \
     --source ./tests/c_api/add_int.c \
     --output ./tests/c_api/output/add_int.aarch64be
+
+Static board-probe example:
+  # First build a light-only bundled static runtime archive:
+  ./build_cross_runtime.sh \
+    --target aarch64_be-linux-gnu \
+    --sysroot /opt/sdk/sysroot \
+    --target-llvm-dir /opt/llvm15-aarch64be \
+    --host-llvm-build /opt/llvm15-host/build-host \
+    --runtime-type static \
+    --light-backend-only \
+    --bundle-llvm-needed-static \
+    --strip-debug \
+    --use-lld \
+    --stdlib libstdc++ \
+    --gcc-toolchain /opt/gcc-aarch64be \
+    --extra-cflags "-mno-outline-atomics" \
+    --extra-cxxflags "-mno-outline-atomics" \
+    --build-dir /tmp/easyjit-be-light-static
+
+  # Then build one self-contained target executable:
+  ./build_cross_c_example.sh \
+    --target aarch64_be-linux-gnu \
+    --sysroot /opt/sdk/sysroot \
+    --host-llvm-build /opt/llvm15-host/build-host \
+    --host-easyjit-build /path/to/easy-jit/build-llvm15 \
+    --runtime-static /tmp/easyjit-be-light-static/bin/libEasyJitRuntimeWithNeededLLVM.a \
+    --static-binary \
+    --use-lld \
+    --stdlib libstdc++ \
+    --gcc-toolchain /opt/gcc-aarch64be \
+    --extra-cflags "-mno-outline-atomics -fno-vectorize -fno-slp-vectorize" \
+    --source ./tests/c_api/be_backend_probe.c \
+    --output ./tests/c_api/output/be_backend_probe.aarch64be.static
 EOF
 }
 
@@ -206,6 +247,8 @@ while [[ $# -gt 0 ]]; do
     --host-easyjit-build) HOST_EASYJIT_BUILD="$2"; shift 2 ;;
     --host-easyjit-dir) HOST_EASYJIT_DIR="$2"; shift 2 ;;
     --runtime-so) RUNTIME_SO="$2"; shift 2 ;;
+    --runtime-static) RUNTIME_STATIC="$2"; shift 2 ;;
+    --static-binary) STATIC_BINARY=1; shift ;;
     --runtime-build-dir) RUNTIME_BUILD_DIR="$2"; shift 2 ;;
     --llvm-dir|--target-llvm-dir) LLVM_DIR="$2"; shift 2 ;;
     --source) SOURCE_FILE="$2"; shift 2 ;;
@@ -253,7 +296,16 @@ case "$CXX_STDLIB" in
   *) die "--stdlib must be one of: libstdc++, libc++, none" ;;
 esac
 
-if [[ -z "$RUNTIME_SO" ]]; then
+if [[ "$STATIC_BINARY" -eq 1 && -z "$RUNTIME_STATIC" ]]; then
+  die "--static-binary requires --runtime-static <archive>"
+fi
+if [[ -n "$RUNTIME_STATIC" && "$STATIC_BINARY" -ne 1 ]]; then
+  die "--runtime-static requires --static-binary"
+fi
+if [[ -n "$RUNTIME_SO" && -n "$RUNTIME_STATIC" ]]; then
+  die "pass only one of --runtime-so or --runtime-static"
+fi
+if [[ -z "$RUNTIME_SO" && -z "$RUNTIME_STATIC" ]]; then
   [[ -n "$LLVM_DIR" ]] || die "--llvm-dir is required when --runtime-so is omitted"
   LLVM_DIR="$(resolve_llvm_dir "$LLVM_DIR" || true)"
   [[ -n "$LLVM_DIR" ]] || die "could not resolve LLVM dir; pass a directory containing LLVMConfig.cmake, or an LLVM root with lib/cmake/llvm or lib64/cmake/llvm"
@@ -369,6 +421,9 @@ if [[ -n "$RUNTIME_BUILD_DIR" ]]; then
 fi
 if [[ -n "$RUNTIME_SO" ]]; then
   echo "  runtime_so      = $RUNTIME_SO"
+elif [[ -n "$RUNTIME_STATIC" ]]; then
+  echo "  runtime_static  = $RUNTIME_STATIC"
+  echo "  static_binary   = ON"
 else
   echo "  runtime_so      = <build in-script>"
 fi
@@ -376,7 +431,7 @@ echo "  source          = $SOURCE_FILE"
 echo "  output          = $OUTPUT_FILE"
 echo
 
-if [[ -z "$RUNTIME_SO" ]]; then
+if [[ -z "$RUNTIME_SO" && -z "$RUNTIME_STATIC" ]]; then
   echo "==> Configuring target runtime build"
   cmake -S "$SCRIPT_DIR" \
     -B "$RUNTIME_BUILD_DIR" \
@@ -406,8 +461,13 @@ if [[ -z "$RUNTIME_SO" ]]; then
   assert_runtime_is_not_linked_against_llvm_shared "$RUNTIME_SO"
 fi
 
-[[ -f "$RUNTIME_SO" ]] || die "target runtime not found: $RUNTIME_SO"
-RUNTIME_DIR=$(cd -- "$(dirname -- "$RUNTIME_SO")" && pwd)
+if [[ -n "$RUNTIME_STATIC" ]]; then
+  [[ -f "$RUNTIME_STATIC" ]] || die "target static runtime archive not found: $RUNTIME_STATIC"
+  RUNTIME_DIR=$(cd -- "$(dirname -- "$RUNTIME_STATIC")" && pwd)
+else
+  [[ -f "$RUNTIME_SO" ]] || die "target runtime not found: $RUNTIME_SO"
+  RUNTIME_DIR=$(cd -- "$(dirname -- "$RUNTIME_SO")" && pwd)
+fi
 
 COMMON_FLAGS=(
   "--target=$TARGET_TRIPLE"
@@ -417,30 +477,28 @@ COMMON_FLAGS=(
   "-g"
   "-Wall"
   "-I$SCRIPT_DIR/include"
-  "-L$RUNTIME_DIR"
-  "-Wl,-rpath,\$ORIGIN"
-  "-lEasyJitRuntime"
-  "-lpthread"
   "-Xclang" "-fpass-plugin=$PASS_SO"
 )
 
+LINK_FLAGS=()
+if [[ "$STATIC_BINARY" -eq 1 ]]; then
+  LINK_FLAGS+=("-static")
+else
+  LINK_FLAGS+=("-L$RUNTIME_DIR" "-Wl,-rpath,\$ORIGIN" "-lEasyJitRuntime")
+fi
+
 if [[ "$USE_LLD" -eq 1 ]]; then
-  COMMON_FLAGS+=("-fuse-ld=lld")
+  LINK_FLAGS+=("-fuse-ld=lld")
 fi
 if [[ -n "$LIBCXX_LIB_DIR" ]]; then
-  COMMON_FLAGS+=("-L$LIBCXX_LIB_DIR")
+  LINK_FLAGS+=("-L$LIBCXX_LIB_DIR")
 fi
 if [[ -n "$LIBCXXABI_LIB_DIR" ]]; then
-  COMMON_FLAGS+=("-L$LIBCXXABI_LIB_DIR")
+  LINK_FLAGS+=("-L$LIBCXXABI_LIB_DIR")
 fi
 if [[ -n "$LIBUNWIND_LIB_DIR" ]]; then
-  COMMON_FLAGS+=("-L$LIBUNWIND_LIB_DIR")
+  LINK_FLAGS+=("-L$LIBUNWIND_LIB_DIR")
 fi
-case "${CXX_STDLIB:-libstdc++}" in
-  libstdc++) COMMON_FLAGS+=("-lstdc++") ;;
-  libc++) COMMON_FLAGS+=("-lc++") ;;
-  none) ;;
-esac
 
 if [[ -n "$TARGET_CPU" ]]; then
   COMMON_FLAGS+=("-mcpu=$TARGET_CPU")
@@ -449,7 +507,8 @@ if [[ -n "$GCC_BIN_DIR" ]]; then
   COMMON_FLAGS+=("-B$GCC_BIN_DIR")
 fi
 if [[ -n "$GCC_LIB_DIR" ]]; then
-  COMMON_FLAGS+=("-B$GCC_LIB_DIR" "-L$GCC_LIB_DIR")
+  COMMON_FLAGS+=("-B$GCC_LIB_DIR")
+  LINK_FLAGS+=("-L$GCC_LIB_DIR" "-B$GCC_LIB_DIR")
 fi
 if [[ -n "$EXTRA_CFLAGS" ]]; then
   # shellcheck disable=SC2206
@@ -459,14 +518,36 @@ fi
 if [[ -n "$EXTRA_LDFLAGS" ]]; then
   # shellcheck disable=SC2206
   EXTRA_LDFLAG_ARR=($EXTRA_LDFLAGS)
-  COMMON_FLAGS+=("${EXTRA_LDFLAG_ARR[@]}")
+  LINK_FLAGS+=("${EXTRA_LDFLAG_ARR[@]}")
+fi
+
+if [[ "$STATIC_BINARY" -eq 1 ]]; then
+  LINK_FLAGS+=("-Wl,--start-group" "$RUNTIME_STATIC")
+  case "${CXX_STDLIB:-libstdc++}" in
+    libstdc++) LINK_FLAGS+=("-lstdc++") ;;
+    libc++) LINK_FLAGS+=("-lc++" "-lc++abi" "-lunwind") ;;
+    none) ;;
+  esac
+  LINK_FLAGS+=("-lm" "-lpthread" "-Wl,--end-group")
+else
+  case "${CXX_STDLIB:-libstdc++}" in
+    libstdc++) LINK_FLAGS+=("-lstdc++") ;;
+    libc++) LINK_FLAGS+=("-lc++") ;;
+    none) ;;
+  esac
+  LINK_FLAGS+=("-lm" "-lpthread")
 fi
 
 "$HOST_CLANG" \
   "${COMMON_FLAGS[@]}" \
   "$SOURCE_FILE" \
+  "${LINK_FLAGS[@]}" \
   -o "$OUTPUT_FILE"
 
 echo "==> Done"
 echo "  binary  : $OUTPUT_FILE"
-echo "  runtime : $RUNTIME_SO"
+if [[ -n "$RUNTIME_STATIC" ]]; then
+  echo "  runtime : $RUNTIME_STATIC"
+else
+  echo "  runtime : $RUNTIME_SO"
+fi
