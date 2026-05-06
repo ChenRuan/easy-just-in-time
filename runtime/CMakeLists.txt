@@ -243,8 +243,14 @@ if (EASYJIT_ENABLE_LIGHT_BACKEND)
     HINTS ${LLVM_TOOLS_BINARY_DIR})
   find_program(EASYJIT_LIGHT_BE_LLD
     NAMES ld.lld)
-  if (EASYJIT_QEMU_AARCH64_BE AND EXISTS ${EASYJIT_QEMU_AARCH64_BE}
-      AND EASYJIT_LIGHT_BE_CLANG AND EASYJIT_LIGHT_BE_LLD)
+  set(_easyjit_have_be_smoke_tools OFF)
+  if (EASYJIT_QEMU_AARCH64_BE
+      AND EXISTS "${EASYJIT_QEMU_AARCH64_BE}"
+      AND EASYJIT_LIGHT_BE_CLANG
+      AND EASYJIT_LIGHT_BE_LLD)
+    set(_easyjit_have_be_smoke_tools ON)
+  endif()
+  if (_easyjit_have_be_smoke_tools)
     set(_easyjit_be_smoke ${CMAKE_BINARY_DIR}/bin/light_be_smoke)
     add_custom_command(
       OUTPUT ${_easyjit_be_smoke}
