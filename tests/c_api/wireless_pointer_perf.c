@@ -93,9 +93,7 @@ static McmCellConfig g_mcm[CELL_MAX];
 static KeyInfo g_keys[TRP_MAX];
 
 static double now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+    return (double)clock() * 1000.0 / (double)CLOCKS_PER_SEC;
 }
 
 static void init_pdc_config(void) {
