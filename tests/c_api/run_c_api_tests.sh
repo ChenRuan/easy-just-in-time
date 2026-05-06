@@ -49,7 +49,7 @@ should_skip() {
     local base
     base="$(basename "$src")"
     case "$base" in
-        config_process_base.c|config_process_easyjit.c|wireless_business_perf.c)
+        config_process_base.c|config_process_easyjit.c|wireless_pointer_perf.c)
             [ "$INCLUDE_BENCHMARKS" = "1" ] && return 1 || return 0
             ;;
         *)

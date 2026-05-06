@@ -1,13 +1,13 @@
 /*
- * wireless_business_perf.c
+ * wireless_pointer_perf.c
  *
  * Board-friendly EasyJIT C API benchmark adapted from wireless-test/example1.
- * It measures whether runtime savings from specializing pointer-heavy business
- * code can pay back the JIT compile cost.
+ * It measures whether runtime savings from specializing pointer-heavy wireless
+ * config code can pay back the JIT compile cost.
  *
  * Compare backends by running the same binary with:
- *   EASYJIT_LIGHT=off   ./wireless_business_perf --run-iters 1000000
- *   EASYJIT_LIGHT=force ./wireless_business_perf --run-iters 1000000
+ *   EASYJIT_LIGHT=off   ./wireless_pointer_perf --run-iters 1000000
+ *   EASYJIT_LIGHT=force ./wireless_pointer_perf --run-iters 1000000
  *
  * Output is plain text only, so it is usable on serial consoles.
  */
@@ -320,7 +320,7 @@ static long long run_jit_full(const Options *opt, const JitSet *set) {
     return sum;
 }
 
-static void reset_business_state(void) {
+static void reset_wireless_state(void) {
     free(g_pdc);
     g_pdc = NULL;
     init_pdc_config();
@@ -350,13 +350,13 @@ static void print_break_even(const char *label, double compile_ms,
 static int measure_baseline(const Options *opt, double *process_ms,
                             double *full_ms, long long *process_sum,
                             long long *full_sum) {
-    reset_business_state();
+    reset_wireless_state();
     run_baseline_process_only(opt);
     double t0 = now_ms();
     *process_sum = run_baseline_process_only(opt);
     *process_ms = now_ms() - t0;
 
-    reset_business_state();
+    reset_wireless_state();
     run_baseline_full(opt);
     t0 = now_ms();
     *full_sum = run_baseline_full(opt);
@@ -365,13 +365,13 @@ static int measure_baseline(const Options *opt, double *process_ms,
 }
 
 static int measure_jit(const Options *opt, JitSet *set) {
-    reset_business_state();
+    reset_wireless_state();
     run_jit_process_only(opt, set);
     double t0 = now_ms();
     set->process_sum = run_jit_process_only(opt, set);
     set->process_ms = now_ms() - t0;
 
-    reset_business_state();
+    reset_wireless_state();
     run_jit_full(opt, set);
     t0 = now_ms();
     set->full_sum = run_jit_full(opt, set);
@@ -497,8 +497,8 @@ int main(int argc, char **argv) {
 
     if (parse_args(argc, argv, &opt)) return 2;
 
-    reset_business_state();
-    printf("=== EasyJIT wireless business perf ===\n");
+    reset_wireless_state();
+    printf("=== EasyJIT wireless pointer perf ===\n");
     printf("keys=%d/%d run_iters=%d compile_rounds=%d opt=O%d\n",
            opt.keys, TRP_MAX, opt.run_iters, opt.compile_rounds, opt.opt_level);
     printf("sizeof(PdcchTrpConfig)=%zu bytes, policy via EASYJIT_LIGHT=off|try|force\n",
@@ -529,9 +529,9 @@ int main(int argc, char **argv) {
     g_pdc = NULL;
 
     if (failures) {
-        printf("\nWIRELESS_BUSINESS_PERF FAIL failures=%d\n", failures);
+        printf("\nWIRELESS_POINTER_PERF FAIL failures=%d\n", failures);
         return 1;
     }
-    printf("\nWIRELESS_BUSINESS_PERF PASS\n");
+    printf("\nWIRELESS_POINTER_PERF PASS\n");
     return 0;
 }
