@@ -28,6 +28,7 @@ LIBCXX_INCLUDE_DIR=""
 LIBCXX_LIB_DIR=""
 LIBCXXABI_LIB_DIR=""
 LIBUNWIND_LIB_DIR=""
+LIBCXX_MERGED_ABI=0
 CMAKE_BUILD_TYPE="Release"
 JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)}"
 
@@ -75,6 +76,8 @@ Optional:
   --libcxx-include-dir <dir> Extra libc++ header dir for runtime build
   --libcxx-lib-dir <dir>     Extra dir containing libc++.a/.so
   --libcxxabi-lib-dir <dir>  Extra dir containing libc++abi.a/.so
+  --libcxx-merged-abi        libc++.a already contains libc++abi objects;
+                             do not add -lc++abi when linking a static binary
   --libunwind-lib-dir <dir>  Extra dir containing libunwind.a/.so
   --extra-cflags <flags>     Extra target C compiler flags
   --extra-cxxflags <flags>   Extra target C++ compiler flags for runtime build
@@ -149,6 +152,23 @@ Static board-probe example:
     --use-lld \
     --stdlib libstdc++ \
     --gcc-toolchain /opt/gcc-aarch64be \
+    --extra-cflags "-mno-outline-atomics -fno-vectorize -fno-slp-vectorize" \
+    --source ./tests/c_api/be_backend_probe.c \
+    --output ./tests/c_api/output/be_backend_probe.aarch64be.static
+
+Static libc++ example when libc++abi is merged into libc++.a:
+  ./build_cross_c_example.sh \
+    --target aarch64_be-linux-gnu \
+    --sysroot /opt/sdk/sysroot \
+    --host-llvm-build /opt/llvm15-host/build-host \
+    --host-easyjit-build /path/to/easy-jit/build-llvm15 \
+    --runtime-static /tmp/easyjit-be-light-static/bin/libEasyJitRuntimeWithNeededLLVM.a \
+    --static-binary \
+    --use-lld \
+    --stdlib libc++ \
+    --libcxx-lib-dir /opt/sdk/lib64 \
+    --libunwind-lib-dir /opt/sdk/lib64 \
+    --libcxx-merged-abi \
     --extra-cflags "-mno-outline-atomics -fno-vectorize -fno-slp-vectorize" \
     --source ./tests/c_api/be_backend_probe.c \
     --output ./tests/c_api/output/be_backend_probe.aarch64be.static
@@ -262,6 +282,7 @@ while [[ $# -gt 0 ]]; do
     --libcxx-include-dir) LIBCXX_INCLUDE_DIR="$2"; shift 2 ;;
     --libcxx-lib-dir) LIBCXX_LIB_DIR="$2"; shift 2 ;;
     --libcxxabi-lib-dir) LIBCXXABI_LIB_DIR="$2"; shift 2 ;;
+    --libcxx-merged-abi) LIBCXX_MERGED_ABI=1; shift ;;
     --libunwind-lib-dir) LIBUNWIND_LIB_DIR="$2"; shift 2 ;;
     --extra-cflags) EXTRA_CFLAGS="$2"; shift 2 ;;
     --extra-cxxflags) EXTRA_CXXFLAGS="$2"; shift 2 ;;
@@ -410,6 +431,9 @@ fi
 if [[ -n "$LIBCXXABI_LIB_DIR" ]]; then
   echo "  libcxxabi_lib_dir = $LIBCXXABI_LIB_DIR"
 fi
+if [[ "$LIBCXX_MERGED_ABI" -eq 1 ]]; then
+  echo "  libcxx_merged_abi = ON"
+fi
 if [[ -n "$LIBUNWIND_LIB_DIR" ]]; then
   echo "  libunwind_lib_dir = $LIBUNWIND_LIB_DIR"
 fi
@@ -525,7 +549,13 @@ if [[ "$STATIC_BINARY" -eq 1 ]]; then
   LINK_FLAGS+=("-Wl,--start-group" "$RUNTIME_STATIC")
   case "${CXX_STDLIB:-libstdc++}" in
     libstdc++) LINK_FLAGS+=("-lstdc++") ;;
-    libc++) LINK_FLAGS+=("-lc++" "-lc++abi" "-lunwind") ;;
+    libc++)
+      LINK_FLAGS+=("-lc++")
+      if [[ "$LIBCXX_MERGED_ABI" -ne 1 ]]; then
+        LINK_FLAGS+=("-lc++abi")
+      fi
+      LINK_FLAGS+=("-lunwind")
+      ;;
     none) ;;
   esac
   LINK_FLAGS+=("-lm" "-lpthread" "-Wl,--end-group")
