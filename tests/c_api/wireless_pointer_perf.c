@@ -30,6 +30,7 @@
 
 #define TRP_MAX 12
 #define CELL_MAX 4
+#define BLOCK_MAX 256
 #define KEY_STRIDE 13
 #define MAKE_KEY(trp, cell) ((trp) * KEY_STRIDE + (cell))
 
@@ -66,12 +67,16 @@ typedef struct {
 } KeyInfo;
 
 typedef int (*jit_fn_t)(void);
+typedef int (*block_jit_fn_t)(const int *, int *);
 
 typedef struct {
     int run_iters;
     int compile_rounds;
     int keys;
+    int block_items;
     int opt_level;
+    int scenario_pointer;
+    int scenario_block;
     int mode_snapshot;
     int mode_pointer;
     int verbose;
@@ -88,9 +93,20 @@ typedef struct {
     jit_fn_t fns[TRP_MAX];
 } JitSet;
 
+typedef struct {
+    const char *name;
+    double compile_ms;
+    double run_ms;
+    long long checksum;
+    easyjit_function_t handles[TRP_MAX];
+    block_jit_fn_t fns[TRP_MAX];
+} BlockJitSet;
+
 static PdcchTrpConfig *g_pdc = NULL;
 static McmCellConfig g_mcm[CELL_MAX];
 static KeyInfo g_keys[TRP_MAX];
+static int g_samples[TRP_MAX][BLOCK_MAX];
+static int g_out[TRP_MAX][BLOCK_MAX];
 
 static double now_ms(void) {
     return (double)clock() * 1000.0 / (double)CLOCKS_PER_SEC;
@@ -112,6 +128,10 @@ static void init_pdc_config(void) {
         g_pdc[i].flagB = (i % 7) == 0;
         g_pdc[i].counters[0] = 17 + i;
         g_pdc[i].reserved[0] = 23 + i;
+        g_pdc[i].reserved[1] = 31 + i * 2;
+        for (int j = 0; j < 8; j++) {
+            g_pdc[i].sub.subArray[j] = 3 + i + j;
+        }
     }
 }
 
@@ -181,6 +201,41 @@ int EASY_JIT_EXPOSE PERF_NOINLINE processTrp_jit(PdcchTrpConfig *cfg) {
     return result;
 }
 
+int EASY_JIT_EXPOSE PERF_NOINLINE processBlock_jit(PdcchTrpConfig *cfg,
+                                                   const int *samples,
+                                                   int *out,
+                                                   int n) {
+    int gain = cfg->priority + cfg->data[0] + 1;
+    int bias = cfg->weight + cfg->sub.subId + cfg->reserved[0];
+    int state = cfg->trpId + cfg->counters[0] + (int)cfg->enable;
+    for (int i = 0; i < n; i++) {
+        int x = samples[i];
+        state = state + x * gain + bias;
+        out[i] = state - cfg->data[1] + cfg->sub.subArray[0];
+    }
+    return state;
+}
+
+static PERF_NOINLINE int processBlock_ref(PdcchTrpConfig *cfg,
+                                          const int *samples,
+                                          int *out,
+                                          int n) {
+    /*
+     * The baseline models live config memory: field loads cannot be treated as
+     * compile-time constants. The JIT path snapshots the same config once.
+     */
+    volatile PdcchTrpConfig *live = (volatile PdcchTrpConfig *)cfg;
+    int state = live->trpId + live->counters[0] + (int)live->enable;
+    for (int i = 0; i < n; i++) {
+        int x = samples[i];
+        int gain = live->priority + live->data[0] + 1;
+        int bias = live->weight + live->sub.subId + live->reserved[0];
+        state = state + x * gain + bias;
+        out[i] = state - live->data[1] + live->sub.subArray[0];
+    }
+    return state;
+}
+
 static int set_opt(easyjit_context_t ctx, const Options *opt) {
     if (easyjit_context_set_opt_level(ctx, (unsigned)opt->opt_level, 0) != EASYJIT_OK) {
         fprintf(stderr, "set_opt_level failed: %s\n", easyjit_get_last_error());
@@ -190,6 +245,16 @@ static int set_opt(easyjit_context_t ctx, const Options *opt) {
 }
 
 static void destroy_jit_set(JitSet *set, int keys) {
+    for (int i = 0; i < keys; i++) {
+        if (set->handles[i]) {
+            easyjit_function_destroy(set->handles[i]);
+            set->handles[i] = NULL;
+            set->fns[i] = NULL;
+        }
+    }
+}
+
+static void destroy_block_jit_set(BlockJitSet *set, int keys) {
     for (int i = 0; i < keys; i++) {
         if (set->handles[i]) {
             easyjit_function_destroy(set->handles[i]);
@@ -256,6 +321,60 @@ static int compile_one(const Options *opt, int key_index, int snapshot,
     return 0;
 }
 
+static int compile_block_one(const Options *opt, int key_index,
+                             easyjit_function_t *out_handle,
+                             block_jit_fn_t *out_fn) {
+    int trp = g_keys[key_index].trpIndex;
+    int cell = g_keys[key_index].cellIndex;
+    PdcchTrpConfig *cfg;
+    easyjit_context_t ctx = NULL;
+    easyjit_function_t fn = NULL;
+    void *raw = NULL;
+
+    schConfig(trp, cell);
+    cfg = get_trp_config(trp);
+
+    if (easyjit_context_create(&ctx) != EASYJIT_OK) {
+        fprintf(stderr, "context_create failed: %s\n", easyjit_get_last_error());
+        return 1;
+    }
+    if (easyjit_context_set_snapshot(ctx, cfg, sizeof(PdcchTrpConfig)) != EASYJIT_OK) {
+        fprintf(stderr, "set_snapshot failed: %s\n", easyjit_get_last_error());
+        easyjit_context_destroy(ctx);
+        return 1;
+    }
+    if (easyjit_context_set_forward(ctx, 0) != EASYJIT_OK ||
+        easyjit_context_set_forward(ctx, 1) != EASYJIT_OK ||
+        easyjit_context_set_int(ctx, opt->block_items) != EASYJIT_OK) {
+        fprintf(stderr, "block context binding failed: %s\n",
+                easyjit_get_last_error());
+        easyjit_context_destroy(ctx);
+        return 1;
+    }
+    if (set_opt(ctx, opt)) {
+        easyjit_context_destroy(ctx);
+        return 1;
+    }
+
+    if (easyjit_compile((void *)processBlock_jit, ctx, &fn) != EASYJIT_OK) {
+        fprintf(stderr, "compile block failed key=%d trp=%d cell=%d: %s\n",
+                g_keys[key_index].key, trp, cell, easyjit_get_last_error());
+        easyjit_context_destroy(ctx);
+        return 1;
+    }
+    easyjit_context_destroy(ctx);
+
+    if (easyjit_get_function_pointer(fn, &raw) != EASYJIT_OK) {
+        fprintf(stderr, "get_function_pointer failed: %s\n", easyjit_get_last_error());
+        easyjit_function_destroy(fn);
+        return 1;
+    }
+
+    *out_handle = fn;
+    *out_fn = (block_jit_fn_t)raw;
+    return 0;
+}
+
 static int compile_jit_set(const Options *opt, const char *name, int snapshot,
                            JitSet *out) {
     memset(out, 0, sizeof(*out));
@@ -267,6 +386,24 @@ static int compile_jit_set(const Options *opt, const char *name, int snapshot,
         for (int i = 0; i < opt->keys; i++) {
             if (compile_one(opt, i, snapshot, &out->handles[i], &out->fns[i])) {
                 destroy_jit_set(out, opt->keys);
+                return 1;
+            }
+        }
+    }
+    out->compile_ms = (now_ms() - t0) / (double)opt->compile_rounds;
+    return 0;
+}
+
+static int compile_block_jit_set(const Options *opt, BlockJitSet *out) {
+    memset(out, 0, sizeof(*out));
+    out->name = "block snapshot raw-ptr";
+
+    double t0 = now_ms();
+    for (int round = 0; round < opt->compile_rounds; round++) {
+        destroy_block_jit_set(out, opt->keys);
+        for (int i = 0; i < opt->keys; i++) {
+            if (compile_block_one(opt, i, &out->handles[i], &out->fns[i])) {
+                destroy_block_jit_set(out, opt->keys);
                 return 1;
             }
         }
@@ -318,12 +455,44 @@ static long long run_jit_full(const Options *opt, const JitSet *set) {
     return sum;
 }
 
+static long long run_block_baseline(const Options *opt) {
+    long long sum = 0;
+    for (int it = 0; it < opt->run_iters; it++) {
+        int k = it % opt->keys;
+        int trp = g_keys[k].trpIndex;
+        sum += processBlock_ref(get_trp_config(trp), g_samples[k], g_out[k],
+                                opt->block_items);
+        sum += g_out[k][(it + k) & (opt->block_items - 1)];
+    }
+    return sum;
+}
+
+static long long run_block_jit(const Options *opt, const BlockJitSet *set) {
+    long long sum = 0;
+    for (int it = 0; it < opt->run_iters; it++) {
+        int k = it % opt->keys;
+        sum += set->fns[k](g_samples[k], g_out[k]);
+        sum += g_out[k][(it + k) & (opt->block_items - 1)];
+    }
+    return sum;
+}
+
+static void init_block_data(void) {
+    for (int k = 0; k < TRP_MAX; k++) {
+        for (int i = 0; i < BLOCK_MAX; i++) {
+            g_samples[k][i] = (k + 3) * 17 + (i * 5) - ((i & 7) * 11);
+            g_out[k][i] = 0;
+        }
+    }
+}
+
 static void reset_wireless_state(void) {
     free(g_pdc);
     g_pdc = NULL;
     init_pdc_config();
     init_mcm();
     prepare_keys();
+    init_block_data();
     for (int i = 0; i < TRP_MAX; i++) {
         schConfig(g_keys[i].trpIndex, g_keys[i].cellIndex);
     }
@@ -335,6 +504,8 @@ static void print_break_even(const char *label, double compile_ms,
     double saved_ns = saved_ms * 1000000.0 / (double)run_iters;
     printf("  %s baseline %.3f ms, jit %.3f ms, saved %.3f ms, %.3f ns/call\n",
            label, baseline_ms, jit_ms, saved_ms, saved_ns);
+    printf("  %s net after compile %.3f ms for this run\n",
+           label, saved_ms - compile_ms);
     if (saved_ns > 0.0) {
         double calls = compile_ms * 1000000.0 / saved_ns;
         double keyset_rounds = calls / (double)run_iters;
@@ -429,9 +600,63 @@ static int run_mode(const Options *opt, const char *name, int snapshot,
     return 0;
 }
 
+static int run_block_scenario(const Options *opt) {
+    BlockJitSet set;
+    long long base_sum;
+    double base_ms;
+    double t0;
+
+    reset_wireless_state();
+    run_block_baseline(opt);
+    t0 = now_ms();
+    base_sum = run_block_baseline(opt);
+    base_ms = now_ms() - t0;
+
+    if (compile_block_jit_set(opt, &set)) return 1;
+
+    reset_wireless_state();
+    run_block_jit(opt, &set);
+    t0 = now_ms();
+    set.checksum = run_block_jit(opt, &set);
+    set.run_ms = now_ms() - t0;
+
+    if (set.checksum != base_sum) {
+        fprintf(stderr, "block verification failed: base=%lld jit=%lld\n",
+                base_sum, set.checksum);
+        destroy_block_jit_set(&set, opt->keys);
+        return 1;
+    }
+
+    printf("\n[block snapshot raw-ptr]\n");
+    printf("  block_items=%d calls=%d total_items=%lld checksum=%lld\n",
+           opt->block_items, opt->run_iters,
+           (long long)opt->block_items * (long long)opt->run_iters,
+           set.checksum);
+    printf("  compile %.3f ms/keyset avg over %d round(s), %.3f ms/key\n",
+           set.compile_ms, opt->compile_rounds,
+           set.compile_ms / (double)opt->keys);
+    printf("  baseline %.3f ms, %.3f ns/block, %.3f ns/item\n",
+           base_ms,
+           base_ms * 1000000.0 / (double)opt->run_iters,
+           base_ms * 1000000.0 /
+               ((double)opt->run_iters * (double)opt->block_items));
+    printf("  jit      %.3f ms, %.3f ns/block, %.3f ns/item\n",
+           set.run_ms,
+           set.run_ms * 1000000.0 / (double)opt->run_iters,
+           set.run_ms * 1000000.0 /
+               ((double)opt->run_iters * (double)opt->block_items));
+    print_break_even("block-run", set.compile_ms, base_ms, set.run_ms,
+                     opt->run_iters);
+
+    destroy_block_jit_set(&set, opt->keys);
+    return 0;
+}
+
 static void usage(const char *argv0) {
-    printf("Usage: %s [--mode both|snapshot|pointer] [--run-iters N]\n", argv0);
-    printf("          [--compile-rounds N] [--keys 1..12] [--opt 0..3] [--verbose]\n");
+    printf("Usage: %s [--scenario block|pointer|both] [--mode both|snapshot|pointer]\n",
+           argv0);
+    printf("          [--run-iters N] [--compile-rounds N] [--keys 1..12]\n");
+    printf("          [--block-items 16|32|64|128|256] [--opt 0..3] [--verbose]\n");
     printf("\n");
     printf("Run the same binary twice to compare backend policies:\n");
     printf("  EASYJIT_LIGHT=off   %s --run-iters 1000000\n", argv0);
@@ -442,13 +667,25 @@ static int parse_args(int argc, char **argv, Options *opt) {
     opt->run_iters = 1000000;
     opt->compile_rounds = 1;
     opt->keys = TRP_MAX;
+    opt->block_items = 128;
     opt->opt_level = 3;
+    opt->scenario_pointer = 0;
+    opt->scenario_block = 1;
     opt->mode_snapshot = 1;
     opt->mode_pointer = 1;
     opt->verbose = 0;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
+        if (strcmp(argv[i], "--scenario") == 0 && i + 1 < argc) {
+            const char *s = argv[++i];
+            opt->scenario_block = strcmp(s, "pointer") != 0;
+            opt->scenario_pointer = strcmp(s, "block") != 0;
+            if (strcmp(s, "both") != 0 && strcmp(s, "block") != 0 &&
+                strcmp(s, "pointer") != 0) {
+                fprintf(stderr, "bad --scenario: %s\n", s);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
             const char *m = argv[++i];
             opt->mode_snapshot = strcmp(m, "pointer") != 0;
             opt->mode_pointer = strcmp(m, "snapshot") != 0;
@@ -467,6 +704,14 @@ static int parse_args(int argc, char **argv, Options *opt) {
             opt->keys = atoi(argv[++i]);
             if (opt->keys < 1) opt->keys = 1;
             if (opt->keys > TRP_MAX) opt->keys = TRP_MAX;
+        } else if (strcmp(argv[i], "--block-items") == 0 && i + 1 < argc) {
+            opt->block_items = atoi(argv[++i]);
+            if (opt->block_items < 16) opt->block_items = 16;
+            if (opt->block_items > BLOCK_MAX) opt->block_items = BLOCK_MAX;
+            if ((opt->block_items & (opt->block_items - 1)) != 0) {
+                fprintf(stderr, "--block-items must be a power of two\n");
+                return 1;
+            }
         } else if (strcmp(argv[i], "--opt") == 0 && i + 1 < argc) {
             opt->opt_level = atoi(argv[++i]);
             if (opt->opt_level < 0) opt->opt_level = 0;
@@ -497,30 +742,39 @@ int main(int argc, char **argv) {
 
     reset_wireless_state();
     printf("=== EasyJIT wireless pointer perf ===\n");
-    printf("keys=%d/%d run_iters=%d compile_rounds=%d opt=O%d\n",
+    printf("scenario=%s%s%s keys=%d/%d run_iters=%d compile_rounds=%d opt=O%d\n",
+           opt.scenario_block ? "block" : "",
+           (opt.scenario_block && opt.scenario_pointer) ? "+" : "",
+           opt.scenario_pointer ? "pointer" : "",
            opt.keys, TRP_MAX, opt.run_iters, opt.compile_rounds, opt.opt_level);
     printf("sizeof(PdcchTrpConfig)=%zu bytes, policy via EASYJIT_LIGHT=off|try|force\n",
            sizeof(PdcchTrpConfig));
 
-    measure_baseline(&opt, &base_process_ms, &base_full_ms,
-                     &base_process_sum, &base_full_sum);
-    printf("\n[baseline direct C]\n");
-    printf("  process-only %.3f ms, %.3f ns/call, checksum=%lld\n",
-           base_process_ms,
-           base_process_ms * 1000000.0 / (double)opt.run_iters,
-           base_process_sum);
-    printf("  full-flow    %.3f ms, %.3f ns/call, checksum=%lld\n",
-           base_full_ms,
-           base_full_ms * 1000000.0 / (double)opt.run_iters,
-           base_full_sum);
-
-    if (opt.mode_snapshot) {
-        failures += run_mode(&opt, "snapshot raw-ptr", 1, base_process_ms,
-                             base_full_ms, base_process_sum, base_full_sum);
+    if (opt.scenario_block) {
+        failures += run_block_scenario(&opt);
     }
-    if (opt.mode_pointer) {
-        failures += run_mode(&opt, "set_pointer raw-ptr", 0, base_process_ms,
-                             base_full_ms, base_process_sum, base_full_sum);
+
+    if (opt.scenario_pointer) {
+        measure_baseline(&opt, &base_process_ms, &base_full_ms,
+                         &base_process_sum, &base_full_sum);
+        printf("\n[baseline direct C]\n");
+        printf("  process-only %.3f ms, %.3f ns/call, checksum=%lld\n",
+               base_process_ms,
+               base_process_ms * 1000000.0 / (double)opt.run_iters,
+               base_process_sum);
+        printf("  full-flow    %.3f ms, %.3f ns/call, checksum=%lld\n",
+               base_full_ms,
+               base_full_ms * 1000000.0 / (double)opt.run_iters,
+               base_full_sum);
+
+        if (opt.mode_snapshot) {
+            failures += run_mode(&opt, "snapshot raw-ptr", 1, base_process_ms,
+                                 base_full_ms, base_process_sum, base_full_sum);
+        }
+        if (opt.mode_pointer) {
+            failures += run_mode(&opt, "set_pointer raw-ptr", 0, base_process_ms,
+                                 base_full_ms, base_process_sum, base_full_sum);
+        }
     }
 
     free(g_pdc);
