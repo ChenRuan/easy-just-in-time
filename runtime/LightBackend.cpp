@@ -243,11 +243,18 @@ static size_t MaterializePrivateGlobals(llvm::Module &M,
 // check just prevents us from wasting time on obviously-wrong hosts
 // (e.g. running x86_64 runtime with an aarch64 module) and from
 // producing AArch64 code on a host that can't execute it.
+//
+// Do not use llvm::sys::getProcessTriple() here. In cross-built static
+// bundles it can reflect the LLVM build/configuration triple rather than
+// the target architecture of this runtime binary. The compiler target
+// macros are the authoritative signal for whether this object file was
+// built as executable AArch64 code (LE or BE).
 static bool HostIsAArch64() {
-  std::string HostTriple = llvm::sys::getProcessTriple();
-  llvm::Triple T(HostTriple);
-  return T.getArch() == llvm::Triple::aarch64 ||
-         T.getArch() == llvm::Triple::aarch64_be;
+#if defined(__aarch64__) || defined(__arm64__)
+  return true;
+#else
+  return false;
+#endif
 }
 
 // Convert easy::GlobalMapping (Name, Address) <-> light::GlobalSymbol
