@@ -15,7 +15,8 @@
  * focused on scalar paths that are endian-sensitive or have grown recently:
  * sub-word loads, stores, stack-passed args, f32/f64
  * arithmetic/conversions, snapshot/private-global materialization, and high
- * GPR pressure.
+ * GPR pressure. The combo case intentionally mixes several supported shapes
+ * in one function so regressions at feature boundaries are easier to catch.
  */
 
 #include <easy/attributes.h>
@@ -35,6 +36,12 @@ typedef struct {
     double scale;
     const int32_t* table;
 } BEProbeConfig;
+
+typedef struct {
+    int32_t bias;
+    int32_t table[4];
+    double dscale;
+} BEComboConfig;
 
 typedef struct {
     int iters;
@@ -94,6 +101,25 @@ long long EASY_JIT_EXPOSE be_gpr_pressure_kernel(long long a0, long long a1,
     long long t7 = a7 + 108;
     long long t8 = a0 + 109;
     return ((((((((t0 + t1) + t2) + t3) + t4) + t5) + t6) + t7) + t8);
+}
+
+/* Mixed-shape probe: snapshot + 2D GEP + stack args + FP conversion + store. */
+long long EASY_JIT_EXPOSE be_combo_kernel(const BEComboConfig* cfg,
+                                          const int32_t grid[8][8],
+                                          int i, int j,
+                                          long long a0, long long a1,
+                                          long long a2, long long a3,
+                                          long long a4, long long a5,
+                                          long long a6, long long a7,
+                                          long long a8,
+                                          float f, double d,
+                                          int32_t* out) {
+    long long stackMix = a8 + a5 - a0;
+    double fp = (double)f + d + cfg->dscale;
+    int32_t cell = grid[i][j];
+    int32_t v = cell + cfg->bias + cfg->table[3] + (int32_t)fp;
+    *out = v;
+    return (long long)v + stackMix + a1;
 }
 
 static int has_case(const Options* opt, const char* name) {
@@ -380,8 +406,76 @@ done:
     return rc;
 }
 
+static int run_combo(const Options* opt) {
+    easyjit_context_t ctx = NULL;
+    easyjit_function_t fn = NULL;
+    int rc = 1;
+    BEComboConfig cfg;
+    int32_t grid[8][8];
+    int32_t out = 0;
+
+    cfg.bias = -77;
+    cfg.table[0] = 11;
+    cfg.table[1] = 22;
+    cfg.table[2] = 33;
+    cfg.table[3] = 44;
+    cfg.dscale = 2.75;
+    for (int r = 0; r < 8; ++r)
+        for (int c = 0; c < 8; ++c)
+            grid[r][c] = 1000 + r * 100 + c * 7;
+
+    if (new_ctx(&ctx)) goto done;
+    if (easyjit_context_set_snapshot(ctx, &cfg, sizeof(cfg)) != EASYJIT_OK) {
+        fprintf(stderr, "combo set_snapshot failed: %s\n", easyjit_get_last_error());
+        goto done;
+    }
+    for (unsigned i = 0; i < 15; ++i)
+        if (add_forward(ctx, i)) goto done;
+    if (set_common_opts(ctx, opt, "combo")) goto done;
+    if (compile_fn((void*)be_combo_kernel, ctx, &fn)) goto done;
+    void* raw = NULL;
+    if (get_ptr(fn, &raw)) goto done;
+
+    typedef long long (*Fn)(const int32_t[8][8], int, int,
+                            long long, long long, long long, long long,
+                            long long, long long, long long, long long,
+                            long long, float, double, int32_t*);
+    Fn jit = (Fn)raw;
+    for (int it = 0; it < opt->iters; ++it) {
+        int i = (it * 3 + 1) & 7;
+        int j = (it * 5 + 2) & 7;
+        long long a[9];
+        for (int k = 0; k < 9; ++k)
+            a[k] = (long long)(it * 19 + k * 23 - 50);
+        float f = (float)(it % 11) * 0.5f - 1.25f;
+        double d = (double)(it % 13) * 1.125 - 3.5;
+
+        out = 0;
+        long long got = jit(grid, i, j,
+                            a[0], a[1], a[2], a[3], a[4],
+                            a[5], a[6], a[7], a[8],
+                            f, d, &out);
+        long long stackMix = a[8] + a[5] - a[0];
+        double fp = (double)f + d + cfg.dscale;
+        int32_t wantOut = grid[i][j] + cfg.bias + cfg.table[3] + (int32_t)fp;
+        long long want = (long long)wantOut + stackMix + a[1];
+        if (got != want || out != wantOut) {
+            fprintf(stderr,
+                    "combo FAIL it=%d got=%lld want=%lld out=%d want_out=%d\n",
+                    it, got, want, out, wantOut);
+            goto done;
+        }
+    }
+    if (opt->verbose) printf("  combo OK (%d iters)\n", opt->iters);
+    rc = 0;
+done:
+    if (fn) easyjit_function_destroy(fn);
+    if (ctx) easyjit_context_destroy(ctx);
+    return rc;
+}
+
 static void usage(const char* argv0) {
-    printf("Usage: %s [--case all|mem,stack,fp,snapshot,pressure] "
+    printf("Usage: %s [--case all|mem,stack,fp,snapshot,pressure,combo] "
            "[--iters N] [--opt 0..3] [--dump-ir PREFIX] [--verbose]\n",
            argv0);
 }
@@ -446,6 +540,10 @@ int main(int argc, char** argv) {
     if (has_case(&opt, "pressure")) {
         printf("[case] pressure\n");
         failures += run_pressure(&opt);
+    }
+    if (has_case(&opt, "combo")) {
+        printf("[case] combo\n");
+        failures += run_combo(&opt);
     }
 
     if (failures) {
