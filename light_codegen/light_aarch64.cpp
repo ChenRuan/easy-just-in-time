@@ -54,6 +54,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <algorithm>
+#include <functional>
 
 using namespace light;
 using namespace llvm;
@@ -965,6 +967,20 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
   const unsigned numSavedScratch = lastSavedScratch - firstSavedScratch + 1;
   if (useSavedGprScratch)
     frameSize += (int32_t)numSavedScratch * 8;
+  // Round 10: reserve a small GPR-only spill area immediately above the
+  // callee-save block. Each slot is 8 bytes (one Xn). The area is only
+  // reserved when the function would otherwise be at risk of scratch
+  // OOM (i.e. useSavedGprScratch is on AND the estimated GPR live set
+  // already exceeds the combined caller-saved + saved scratch pool).
+  // Cap the reservation so the prologue/epilogue offset stays inside
+  // uimm12-scaled LDR/STR encodings. The cap is intentionally small —
+  // we are not building a full register allocator, just papering over
+  // the worst same-block pressure cliffs (e.g. the gauntlet kernel).
+  const int32_t spillBase = frameSize;
+  unsigned spillCap = 0;
+  if (useSavedGprScratch && estimatedGprValues > 16)
+    spillCap = std::min(32u, estimatedGprValues - 16u);
+  frameSize += (int32_t)spillCap * 8;
   // 16-byte align the final frame.
   if (frameSize) frameSize = (frameSize + 15) & ~15;
   if (frameSize > 0xFFF) {
@@ -1078,6 +1094,29 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
   unsigned nextFpReg = 16;
   std::vector<unsigned> freeRegs;
   std::vector<unsigned> freeFpRegs;
+  // Round 10: minimal GPR-only spill/reload state. `spilled` records
+  // SSA values whose register was reclaimed; `freeSpillSlots` recycles
+  // slot offsets after a reload; `reloading` guards against reentrant
+  // self-spill (we must never spill the value we are currently trying
+  // to reload); `pinnedFromSpill` protects values that the in-flight
+  // instruction has already fetched into a local (rn/rm/...) — those
+  // registers must keep their value until the instruction emits, so
+  // they are off-limits as spill victims for the remainder of this
+  // instruction. The set is cleared at the top of every instruction
+  // body and grows by one entry per successful valueInReg lookup.
+  struct SpillLoc { uint32_t off; bool is64; };
+  std::unordered_map<const Value *, SpillLoc> spilled;
+  std::unordered_set<const Value *> reloading;
+  std::unordered_set<const Value *> pinnedFromSpill;
+  std::vector<uint32_t> freeSpillSlots;
+  unsigned spillUsed = 0;
+  // Forward declaration for use inside assignReg's spill helper. The
+  // real definition lives further below (after regOf/freeRegs and the
+  // local-use-count tables are populated). See round-10 comment block
+  // near valueInReg for the data-flow invariants.
+  std::function<bool(const Value *)> isReloadableStackArgFwd;
+  std::unordered_map<const Value *, unsigned> *localUseCountPtr = nullptr;
+  std::unordered_map<const Value *, unsigned> *ptrTermUseCountPtr = nullptr;
   auto assignReg = [&](const Value *V) -> int {
     if (!freeRegs.empty()) {
       unsigned r = freeRegs.back();
@@ -1090,10 +1129,79 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
       nextReg = useSavedGprScratch ? 19 : 29;
     if (nextReg == 17 || nextReg == 18) nextReg = 19;
     unsigned lastScratch = useSavedGprScratch ? lastSavedScratch : 15;
-    if (nextReg > lastScratch) return -1;
-    unsigned r = nextReg++;
-    regOf[V] = r;
-    return (int)r;
+    if (nextReg <= lastScratch) {
+      unsigned r = nextReg++;
+      regOf[V] = r;
+      return (int)r;
+    }
+    // Round 10: scratch pool exhausted — try to spill an integer/ptr
+    // SSA temp that is still local-live in this BB.
+    if (spillCap == 0 && freeSpillSlots.empty()) return -1;
+    // Spill is only safe once the live-set bookkeeping is built (pass 2
+    // populates localUseCount / ptrTermUseCount). Early stack-arg / phi
+    // pre-assigns happen before that and must keep the original OOM.
+    if (!localUseCountPtr) return -1;
+    const Value *victim = nullptr;
+    unsigned victimReg = 0;
+    bool victimIs64 = false;
+    for (auto &kv : regOf) {
+      const Value *Vc = kv.first;
+      unsigned rc = kv.second;
+      if (Vc == V) continue;
+      if (reloading.count(Vc)) continue;
+      if (pinnedFromSpill.count(Vc)) continue;
+      const auto *Inst = dyn_cast<Instruction>(Vc);
+      if (!Inst) continue;                 // skip Argument
+      if (isa<PHINode>(Inst)) continue;    // PHIs are pre-pinned
+      Type *Ty = Inst->getType();
+      bool intLike = Ty->isIntegerTy() || Ty->isPointerTy();
+      if (!intLike) continue;
+      if (Ty->isIntegerTy() && !Ty->isIntegerTy(32) && !Ty->isIntegerTy(64))
+        continue;
+      // Must be in scratch register window (not arg regs, not x16/17/18).
+      if (!((rc >= argCount && rc <= 15) || (rc >= 19 && rc <= 28)))
+        continue;
+      // Must still be locally live (cross-BB / dead values are skipped).
+      if (localUseCountPtr) {
+        auto uci = localUseCountPtr->find(Vc);
+        if (uci == localUseCountPtr->end() || uci->second == 0) continue;
+      }
+      // Don't spill a value whose copy is still being consumed as a
+      // dynamic-GEP hidden index term.
+      if (ptrTermUseCountPtr) {
+        auto pti = ptrTermUseCountPtr->find(Vc);
+        if (pti != ptrTermUseCountPtr->end() && pti->second > 0) continue;
+      }
+      if (isReloadableStackArgFwd && isReloadableStackArgFwd(Vc)) continue;
+      victim = Vc;
+      victimReg = rc;
+      victimIs64 = (Ty->isIntegerTy(64) || Ty->isPointerTy());
+      break;
+    }
+    if (!victim) return -1;
+    // Allocate a spill slot.
+    uint32_t off;
+    if (!freeSpillSlots.empty()) {
+      off = freeSpillSlots.back();
+      freeSpillSlots.pop_back();
+    } else if (spillUsed < spillCap) {
+      off = (uint32_t)spillBase + spillUsed * 8u;
+      ++spillUsed;
+    } else {
+      return -1;
+    }
+    unsigned size = victimIs64 ? 3u : 2u;
+    unsigned scaled = off >> size;
+    if (scaled > 0xFFFu) {
+      // Cannot encode this slot; give it back and bail.
+      freeSpillSlots.push_back(off);
+      return -1;
+    }
+    if (!W.emit(encLdrStrUI(false, size, victimReg, 31, scaled))) return -1;
+    spilled[victim] = SpillLoc{off, victimIs64};
+    regOf.erase(victim);
+    regOf[V] = victimReg;
+    return (int)victimReg;
   };
   auto assignFpReg = [&](const Value *V) -> int {
     if (!freeFpRegs.empty()) {
@@ -1504,13 +1612,48 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
   auto isReloadableStackArg = [&](const Value *V) -> bool {
     return reloadableStackArg.find(V) != reloadableStackArg.end();
   };
+  // Round 10: now that isReloadableStackArg / localUseCount /
+  // ptrTermUseCount exist, wire them into the assignReg spill helper
+  // declared above. Prior to this point spill is a no-op (assignReg
+  // returns -1 on OOM, same as pre-round-10).
+  isReloadableStackArgFwd = [&](const Value *V) {
+    return isReloadableStackArg(V);
+  };
+  localUseCountPtr = &localUseCount;
+  ptrTermUseCountPtr = &ptrTermUseCount;
 
   // Helper: get a value into a register (returns true on success). Uses x16
   // as the scratch destination for materialized immediates. Caller supplies
   // the desired is64.
   auto valueInReg = [&](const Value *V, bool is64, unsigned &outReg) -> bool {
     auto it = regOf.find(V);
-    if (it != regOf.end()) { outReg = it->second; return true; }
+    if (it != regOf.end()) {
+      outReg = it->second;
+      // Round 10: pin V's reg so a subsequent reload-spill cannot
+      // clobber it before this instruction emits.
+      pinnedFromSpill.insert(V);
+      return true;
+    }
+    // Round 10: V was previously spilled — reload from its stack slot.
+    {
+      auto si = spilled.find(V);
+      if (si != spilled.end()) {
+        reloading.insert(V);
+        int rd = assignReg(V);
+        reloading.erase(V);
+        if (rd < 0) return false;
+        unsigned size = si->second.is64 ? 3u : 2u;
+        unsigned scaled = si->second.off >> size;
+        if (scaled > 0xFFFu) return false;
+        if (!W.emit(encLdrStrUI(true, size, (unsigned)rd, 31, scaled)))
+          return false;
+        freeSpillSlots.push_back(si->second.off);
+        spilled.erase(si);
+        outReg = (unsigned)rd;
+        pinnedFromSpill.insert(V);
+        return true;
+      }
+    }
     if (isReloadableStackArg(V)) {
       outReg = 16;
       return loadReloadableStackArg(V, is64, outReg);
@@ -1535,6 +1678,14 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
   };
 
   auto freeMappedValue = [&](const Value *V) {
+    // Round 10: if V was spilled and never reloaded (i.e. it died
+    // between spill and any pending use), drop the slot record and
+    // recycle the slot offset.
+    if (auto SI = spilled.find(V); SI != spilled.end()) {
+      freeSpillSlots.push_back(SI->second.off);
+      spilled.erase(SI);
+    }
+    pinnedFromSpill.erase(V);
     if (auto RI = regOf.find(V); RI != regOf.end()) {
       unsigned rr = RI->second;
       regOf.erase(RI);
@@ -1800,6 +1951,11 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
     pendingFCmp.I = nullptr;
 
     for (const Instruction &I : BB) {
+      // Round 10: clear the per-instruction "pinned" set so the spill
+      // helper can pick freshly-eligible victims for the next emit.
+      // Operand fetches by valueInReg below repopulate it within the
+      // window between operand load and instruction emit.
+      pinnedFromSpill.clear();
       // Skip instructions whose effect was already modeled in passes 0/2.
       if (isa<AllocaInst>(&I)) continue;
       // Pointer-shaped bitcasts have already been folded into ptrLoc in

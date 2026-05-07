@@ -122,6 +122,43 @@ final-mile claim is deferred to a target-machine validation pass.
   operands before writing the destination. The reloadable-stack-arg
   path keeps the original ordering (allocate `rd` first, then load the
   arg into it) so that loading op0 cannot clobber op1's value.
+- Minimal GPR spill/reload (round 10): when `assignReg` runs out of
+  scratch registers, the emitter now picks one currently-mapped local
+  integer/pointer SSA temp as a spill victim, emits an
+  `STR W/X, [sp, #spillOff]` into a frame-resident slot, evicts the
+  victim from `regOf`, and hands the freed register to the requester.
+  When the spilled value is next consumed, `valueInReg` allocates a
+  fresh register (which may itself trigger another spill) and emits
+  `LDR W/X, [sp, #spillOff]` to materialize the value, then recycles
+  the slot. The spill area is reserved between the saved `x19..x28`
+  block and the final 16-byte alignment, capped at 32 slots (256 B);
+  reservation only happens when `useSavedGprScratch` is on AND the
+  estimated GPR live set already exceeds the combined caller-saved
+  plus saved-scratch pool. The mechanism is intentionally conservative:
+    * Only `i32`, `i64`, and pointer-width SSA temps (Instructions) are
+      spilled. PHIs, function `Argument`s, dynamic-GEP hidden index
+      terms while still in use, the `ptrLoc` owner, the
+      reloadable-stack-arg lazy-load reg, and any Value that is live
+      across basic blocks are off-limits as victims.
+    * FP / V-register temps are never spilled.
+    * The recursion guard `reloading` prevents the value being reloaded
+      from being picked as its own victim, and `pinnedFromSpill`
+      protects all values that the in-flight instruction has already
+      pulled into a local (`rn`/`rm`/...) so that a reload that piggy-
+      backs on the same allocation cannot clobber an active operand
+      register before the instruction emits. The pin set is cleared at
+      the top of every instruction body.
+    * If no eligible victim exists or the slot offset cannot be encoded
+      in the LDR/STR uimm12 scaled immediate, the lowering falls back
+      to the original `"scratch OOM (binop)"` (or equivalent)
+      `Status::Unsupported` rejection — same as pre-round-10.
+  This is the missing rung that lets the explicit
+  `be_backend_probe_o0 --case gauntlet` case compile under
+  `EASYJIT_LIGHT=force`. It is **not** a full register allocator: there
+  is no live-range analysis, no cross-block spill, no rematerialization,
+  no FP/vector spill, no PHI spill, and no support for spilling values
+  that participate in `ptrLoc` address calculations or stack-arg lazy
+  reload locations.
 - Fixed-size executable code allocation: each light-compiled function
   currently gets four host pages of RX code storage (typically 16 KiB),
   mapped RW during emission and flipped RX before return. This is still
@@ -453,12 +490,17 @@ it is not part of default `all`:
 
     EASYJIT_LIGHT=force ./be_backend_probe --case gauntlet --iters 20 --verbose
 
-The gauntlet currently still rejects with `scratch OOM (binop)` because
-the integer scratch pool (8 caller-saved x{argCount}..x15 plus 10
-callee-saved x19..x28) is exhausted by ~26 simultaneously-live i32/i64
-SSA values; round 8m only relaxes the lifetime model far enough to
-keep the regular `--case all` workload comfortable. A proper spill
-slot allocator is the planned next step for that case.
+As of round 10 the gauntlet compiles and executes correctly under
+`EASYJIT_LIGHT=force`. The integer scratch pool (8 caller-saved
+`x{argCount}..x15` plus 10 callee-saved `x19..x28`) is no longer the
+hard ceiling: when the ~26 simultaneously-live i32/i64 SSA values in
+the gauntlet exceed the 18-slot pool, the round-10 minimal GPR
+spill/reload mechanism described above kicks in and parks the excess
+locals in the dedicated frame area. The mechanism is still narrow —
+FP / vector / cross-block / PHI / argument values are not spilled —
+so harder kernels can still reject with `scratch OOM (...)` or `frame
+> 4095B` if they exceed the spill-slot cap (32 × 8 bytes) or push the
+total frame past the uimm12-scaled offset budget.
 
 A sixth optional target `check-light-be-smoke` builds a freestanding
 static `aarch64_be` ELF from `light_codegen/test_be_smoke.S` and runs
