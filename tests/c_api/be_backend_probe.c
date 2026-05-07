@@ -44,6 +44,15 @@ typedef struct {
 } BEComboConfig;
 
 typedef struct {
+    int32_t bias;
+    uint16_t gain;
+    uint8_t small;
+    float fscale;
+    double dscale;
+    const int32_t* extra;
+} BEStressConfig;
+
+typedef struct {
     int iters;
     int verbose;
     unsigned opt_level;
@@ -121,6 +130,46 @@ long long EASY_JIT_EXPOSE be_combo_kernel(const BEComboConfig* cfg,
     int32_t v = cell + mirror + cfg->bias + cfg->table[3] + (int32_t)fp;
     *out = v;
     return (long long)v + stackMix + a1 - a2 + a4 - a6;
+}
+
+/*
+ * Heavier mixed-shape probe: snapshot sub-word fields + bound pointee array
+ * + two dynamic 2D GEPs + computed dynamic index + stack-passed GPR/FP args
+ * + f32/f64 conversions + two stores + enough straight-line SSA pressure to
+ * exercise local scratch reuse.
+ */
+long long EASY_JIT_EXPOSE be_stress_kernel(const BEStressConfig* cfg,
+                                           const int32_t grid[8][8],
+                                           const double coeff[8],
+                                           int i, int j, int k,
+                                           long long a0, long long a1,
+                                           long long a2, long long a3,
+                                           long long a4, long long a5,
+                                           long long a6, long long a7,
+                                           long long a8, long long a9,
+                                           float f, double d0, double d1,
+                                           int32_t* out_i,
+                                           double* out_d) {
+    int idx = (i + j + k) & 7;
+    int32_t cell0 = grid[i][j];
+    int32_t cell1 = grid[j][k];
+    int32_t cell2 = grid[k][i];
+    int32_t ext = cfg->extra[idx];
+    int32_t sub = (int32_t)cfg->gain - (int32_t)cfg->small;
+    int32_t base = cell0 + cell1 - cell2 + cfg->bias + ext + sub;
+
+    double fp0 = (double)f * (double)cfg->fscale;
+    double fp1 = d0 + d1 + cfg->dscale + coeff[idx];
+    double fp = fp0 + fp1 + (double)base;
+    int32_t narrowed = (int32_t)(float)fp;
+
+    long long mix0 = a8 + a9 + (a3 ^ a7);
+    long long mix1 = (a0 - a1) + (a2 * 3LL) - (a4 * 2LL);
+    long long mix2 = (a5 + 17LL) ^ (a6 - 23LL);
+    int32_t stored = narrowed + (int32_t)(mix0 + mix1 - mix2);
+    *out_i = stored;
+    *out_d = fp + (double)(mix0 - mix1 + mix2);
+    return (long long)stored + mix0 + mix1 - mix2;
 }
 
 static int has_case(const Options* opt, const char* name) {
@@ -477,8 +526,112 @@ done:
     return rc;
 }
 
+static int run_stress(const Options* opt) {
+    easyjit_context_t ctx = NULL;
+    easyjit_function_t fn = NULL;
+    int rc = 1;
+    BEStressConfig cfg;
+    int32_t extra[8];
+    int32_t grid[8][8];
+    double coeff[8];
+    int32_t out_i = 0;
+    double out_d = 0.0;
+
+    cfg.bias = -313;
+    cfg.gain = 4091;
+    cfg.small = 37;
+    cfg.fscale = 1.75f;
+    cfg.dscale = -2.625;
+    cfg.extra = extra;
+    for (int i = 0; i < 8; ++i) {
+        extra[i] = 700 + i * 19;
+        coeff[i] = (double)i * 0.625 - 1.25;
+        for (int j = 0; j < 8; ++j)
+            grid[i][j] = 5000 + i * 131 - j * 17;
+    }
+
+    if (new_ctx(&ctx)) goto done;
+    if (easyjit_context_set_snapshot(ctx, &cfg, sizeof(cfg)) != EASYJIT_OK) {
+        fprintf(stderr, "stress set_snapshot failed: %s\n",
+                easyjit_get_last_error());
+        goto done;
+    }
+    if (easyjit_context_bind_array(ctx, offsetof(BEStressConfig, extra),
+                                   extra, 8, sizeof(extra[0])) != EASYJIT_OK) {
+        fprintf(stderr, "stress bind_array failed: %s\n",
+                easyjit_get_last_error());
+        goto done;
+    }
+    for (unsigned i = 0; i < 20; ++i)
+        if (add_forward(ctx, i)) goto done;
+    if (set_common_opts(ctx, opt, "stress")) goto done;
+    if (compile_fn((void*)be_stress_kernel, ctx, &fn)) goto done;
+    void* raw = NULL;
+    if (get_ptr(fn, &raw)) goto done;
+
+    typedef long long (*Fn)(const int32_t[8][8], const double[8],
+                            int, int, int,
+                            long long, long long, long long, long long,
+                            long long, long long, long long, long long,
+                            long long, long long,
+                            float, double, double,
+                            int32_t*, double*);
+    Fn jit = (Fn)raw;
+    for (int it = 0; it < opt->iters; ++it) {
+        int i = (it * 3 + 1) & 7;
+        int j = (it * 5 + 2) & 7;
+        int k = (it * 7 + 3) & 7;
+        long long a[10];
+        for (int n = 0; n < 10; ++n)
+            a[n] = (long long)(it * 29 + n * 31 - 90);
+        float f = (float)(it % 17) * 0.375f - 2.0f;
+        double d0 = (double)(it % 19) * 1.125 - 5.0;
+        double d1 = (double)(it % 23) * -0.75 + 4.5;
+
+        out_i = 0;
+        out_d = 0.0;
+        long long got = jit(grid, coeff, i, j, k,
+                            a[0], a[1], a[2], a[3], a[4],
+                            a[5], a[6], a[7], a[8], a[9],
+                            f, d0, d1, &out_i, &out_d);
+
+        int idx = (i + j + k) & 7;
+        int32_t cell0 = grid[i][j];
+        int32_t cell1 = grid[j][k];
+        int32_t cell2 = grid[k][i];
+        int32_t ext = extra[idx];
+        int32_t sub = (int32_t)cfg.gain - (int32_t)cfg.small;
+        int32_t base = cell0 + cell1 - cell2 + cfg.bias + ext + sub;
+        double fp0 = (double)f * (double)cfg.fscale;
+        double fp1 = d0 + d1 + cfg.dscale + coeff[idx];
+        double fp = fp0 + fp1 + (double)base;
+        int32_t narrowed = (int32_t)(float)fp;
+        long long mix0 = a[8] + a[9] + (a[3] ^ a[7]);
+        long long mix1 = (a[0] - a[1]) + (a[2] * 3LL) - (a[4] * 2LL);
+        long long mix2 = (a[5] + 17LL) ^ (a[6] - 23LL);
+        int32_t wantOutI = narrowed + (int32_t)(mix0 + mix1 - mix2);
+        double wantOutD = fp + (double)(mix0 - mix1 + mix2);
+        long long want = (long long)wantOutI + mix0 + mix1 - mix2;
+
+        if (got != want || out_i != wantOutI ||
+            fabs(out_d - wantOutD) > 1e-9) {
+            fprintf(stderr,
+                    "stress FAIL it=%d got=%lld want=%lld out_i=%d want_i=%d "
+                    "out_d=%.12f want_d=%.12f\n",
+                    it, got, want, out_i, wantOutI, out_d, wantOutD);
+            goto done;
+        }
+    }
+    if (opt->verbose) printf("  stress OK (%d iters)\n", opt->iters);
+    rc = 0;
+done:
+    if (fn) easyjit_function_destroy(fn);
+    if (ctx) easyjit_context_destroy(ctx);
+    return rc;
+}
+
 static void usage(const char* argv0) {
-    printf("Usage: %s [--case all|mem,stack,fp,snapshot,pressure,combo] "
+    printf("Usage: %s [--case all|mem,stack,fp,snapshot,pressure,combo,stress] "
            "[--iters N] [--opt 0..3] [--dump-ir PREFIX] [--verbose]\n",
            argv0);
 }
@@ -547,6 +700,10 @@ int main(int argc, char** argv) {
     if (has_case(&opt, "combo")) {
         printf("[case] combo\n");
         failures += run_combo(&opt);
+    }
+    if (has_case(&opt, "stress")) {
+        printf("[case] stress\n");
+        failures += run_stress(&opt);
     }
 
     if (failures) {
