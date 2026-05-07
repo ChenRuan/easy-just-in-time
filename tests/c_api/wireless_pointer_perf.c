@@ -80,6 +80,7 @@ typedef struct {
     int mode_snapshot;
     int mode_pointer;
     int verbose;
+    const char *dump_ir;
 } Options;
 
 typedef struct {
@@ -244,6 +245,20 @@ static int set_opt(easyjit_context_t ctx, const Options *opt) {
     return 0;
 }
 
+static int set_dump_ir_for_key(easyjit_context_t ctx, const Options *opt,
+                               const char *tag, int key_index) {
+    char path[512];
+    if (!opt->dump_ir || opt->dump_ir[0] == '\0') return 0;
+    snprintf(path, sizeof(path), "%s.%s.key%d.ll", opt->dump_ir, tag,
+             g_keys[key_index].key);
+    if (easyjit_context_set_dump_ir(ctx, path) != EASYJIT_OK) {
+        fprintf(stderr, "set_dump_ir(%s) failed: %s\n",
+                path, easyjit_get_last_error());
+        return 1;
+    }
+    return 0;
+}
+
 static void destroy_jit_set(JitSet *set, int keys) {
     for (int i = 0; i < keys; i++) {
         if (set->handles[i]) {
@@ -296,6 +311,11 @@ static int compile_one(const Options *opt, int key_index, int snapshot,
     }
 
     if (set_opt(ctx, opt)) {
+        easyjit_context_destroy(ctx);
+        return 1;
+    }
+    if (set_dump_ir_for_key(ctx, opt, snapshot ? "snapshot" : "pointer",
+                            key_index)) {
         easyjit_context_destroy(ctx);
         return 1;
     }
@@ -352,6 +372,10 @@ static int compile_block_one(const Options *opt, int key_index,
         return 1;
     }
     if (set_opt(ctx, opt)) {
+        easyjit_context_destroy(ctx);
+        return 1;
+    }
+    if (set_dump_ir_for_key(ctx, opt, "block", key_index)) {
         easyjit_context_destroy(ctx);
         return 1;
     }
@@ -656,7 +680,8 @@ static void usage(const char *argv0) {
     printf("Usage: %s [--scenario block|pointer|both] [--mode both|snapshot|pointer]\n",
            argv0);
     printf("          [--run-iters N] [--compile-rounds N] [--keys 1..12]\n");
-    printf("          [--block-items 16|32|64|128|256] [--opt 0..3] [--verbose]\n");
+    printf("          [--block-items 16|32|64|128|256] [--opt 0..3]\n");
+    printf("          [--dump-ir PREFIX] [--verbose]\n");
     printf("\n");
     printf("Run the same binary twice to compare backend policies:\n");
     printf("  EASYJIT_LIGHT=off   %s --run-iters 1000000\n", argv0);
@@ -674,6 +699,7 @@ static int parse_args(int argc, char **argv, Options *opt) {
     opt->mode_snapshot = 1;
     opt->mode_pointer = 1;
     opt->verbose = 0;
+    opt->dump_ir = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--scenario") == 0 && i + 1 < argc) {
@@ -716,6 +742,8 @@ static int parse_args(int argc, char **argv, Options *opt) {
             opt->opt_level = atoi(argv[++i]);
             if (opt->opt_level < 0) opt->opt_level = 0;
             if (opt->opt_level > 3) opt->opt_level = 3;
+        } else if (strcmp(argv[i], "--dump-ir") == 0 && i + 1 < argc) {
+            opt->dump_ir = argv[++i];
         } else if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
             opt->verbose = 1;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
