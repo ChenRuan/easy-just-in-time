@@ -52,6 +52,7 @@
 #include <unistd.h>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace light;
@@ -1057,7 +1058,15 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
   // every return restores them before handing control back to the caller.
   unsigned nextReg = argCount;
   unsigned nextFpReg = 16;
+  std::vector<unsigned> freeRegs;
+  std::vector<unsigned> freeFpRegs;
   auto assignReg = [&](const Value *V) -> int {
+    if (!freeRegs.empty()) {
+      unsigned r = freeRegs.back();
+      freeRegs.pop_back();
+      regOf[V] = r;
+      return (int)r;
+    }
     // Skip x16/x17 temps and x18 platform register.
     if (nextReg == 16)
       nextReg = useSavedGprScratch ? 19 : 29;
@@ -1069,6 +1078,12 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
     return (int)r;
   };
   auto assignFpReg = [&](const Value *V) -> int {
+    if (!freeFpRegs.empty()) {
+      unsigned r = freeFpRegs.back();
+      freeFpRegs.pop_back();
+      fpRegOf[V] = r;
+      return (int)r;
+    }
     // s31 is reserved as a transient FP-immediate scratch register.
     if (nextFpReg > 30) return -1;
     unsigned r = nextFpReg++;
@@ -1211,6 +1226,43 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         continue;
       }
     }
+  }
+
+  // Local SSA scratch reuse. The emitter is still not a general register
+  // allocator, but many post-specialization expressions are straight-line
+  // chains inside one basic block. Reclaiming an instruction result after
+  // its last same-block use avoids the old "permanent scratch slot per SSA"
+  // cliff without reasoning about cross-block liveness.
+  std::unordered_map<const Value *, unsigned> localUseCount;
+  std::unordered_set<const Value *> nonLocalValue;
+  for (const BasicBlock &BB : Fn) {
+    for (const Instruction &I : BB) {
+      for (const Use &U : I.operands()) {
+        auto *Def = dyn_cast<Instruction>(U.get());
+        if (!Def || isa<PHINode>(Def)) continue;
+        if (Def->getParent() == &BB) {
+          localUseCount[Def]++;
+        } else {
+          nonLocalValue.insert(Def);
+        }
+      }
+      if (auto *PN = dyn_cast<PHINode>(&I)) {
+        for (const Use &U : PN->incoming_values()) {
+          if (auto *Def = dyn_cast<Instruction>(U.get()))
+            nonLocalValue.insert(Def);
+        }
+      }
+    }
+  }
+  for (const Value *V : nonLocalValue)
+    localUseCount.erase(V);
+  // Dynamic-GEP index values are consumed later through PtrLoc metadata
+  // rather than as ordinary load/store operands, so do not reclaim their
+  // registers via the local SSA use counter.
+  for (const auto &KV : ptrLoc) {
+    const PtrLoc &PL = KV.second;
+    for (unsigned t = 0; t < PL.numTerms; ++t)
+      localUseCount.erase(PL.terms[t].value);
   }
 
   // ---------- Pass 3: BB layout + code emission. ----------
@@ -1416,6 +1468,45 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
       return materializeFpConstToReg(CFP, outReg);
     }
     return false;
+  };
+
+  auto releaseIfDead = [&](const Value *V) {
+    auto UC = localUseCount.find(V);
+    if (UC == localUseCount.end()) return;
+    if (UC->second == 0) return;
+    --UC->second;
+    if (UC->second != 0) return;
+    if (auto RI = regOf.find(V); RI != regOf.end()) {
+      unsigned rr = RI->second;
+      regOf.erase(RI);
+      bool stillMapped = false;
+      for (const auto &KV : regOf) {
+        if (KV.second == rr) {
+          stillMapped = true;
+          break;
+        }
+      }
+      if (!stillMapped && rr != 16 && rr != 17 && rr != 18)
+        freeRegs.push_back(rr);
+    }
+    if (auto FI = fpRegOf.find(V); FI != fpRegOf.end()) {
+      unsigned fr = FI->second;
+      fpRegOf.erase(FI);
+      bool stillMapped = false;
+      for (const auto &KV : fpRegOf) {
+        if (KV.second == fr) {
+          stillMapped = true;
+          break;
+        }
+      }
+      if (!stillMapped && fr != 31)
+        freeFpRegs.push_back(fr);
+    }
+  };
+
+  auto releaseOperands = [&](const Instruction &I) {
+    for (const Use &U : I.operands())
+      releaseIfDead(U.get());
   };
 
   // Helper: load uimm12-scaled offset check.
@@ -1644,6 +1735,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
           if (!W.emit(encFmaddS((unsigned)rd, rn, rm, ra))) {
             r.status = Status::TooLarge; return r;
           }
+          releaseOperands(I);
           continue;
         }
         if (II->getIntrinsicID() == Intrinsic::memcpy) {
@@ -1656,6 +1748,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
           if (!emitMemcpy(dit->second, sit->second, N->getZExtValue())) {
             r.status = Status::Unsupported; r.reason = "memcpy size/alignment"; return r;
           }
+          releaseOperands(I);
           continue;
         }
         // lifetime.* / dbg.* / assume: ignore
@@ -1922,6 +2015,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
                                : encFpLdrStrUIS(false, rs, baseReg, imm))) {
             r.status = Status::TooLarge; return r;
           }
+          releaseOperands(I);
           continue;
         }
         unsigned bits = 0;
@@ -1974,6 +2068,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
                                       (unsigned)scaled))) {
                 r.status=Status::TooLarge; return r;
               }
+              releaseOperands(I);
               continue;
             }
             r.status = Status::Unsupported;
@@ -2003,6 +2098,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         if (!emitStore(it->second, accessSize, rs)) {
           r.status = Status::Unsupported; r.reason = "store offset/encoding"; return r;
         }
+        releaseOperands(I);
         continue;
       }
 
@@ -2220,6 +2316,15 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         }
 
         // select lowered; clear pendingCmp / pendingFCmp
+        if (isIcmp && pendingCmp.I) {
+          releaseIfDead(pendingCmp.I->getOperand(0));
+          releaseIfDead(pendingCmp.I->getOperand(1));
+        }
+        if (isFcmp && pendingFCmp.I) {
+          releaseIfDead(pendingFCmp.lhs);
+          releaseIfDead(pendingFCmp.rhs);
+        }
+        releaseOperands(I);
         pendingCmp.I = nullptr;
         pendingFCmp.I = nullptr;
         continue;
@@ -2271,6 +2376,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
           default: break;
           }
           if (!ok) { r.status = Status::TooLarge; return r; }
+          releaseOperands(I);
           continue;
         }
         if (!BO->getType()->isIntegerTy()) { r.status=Status::Unsupported; r.reason="binop non-int"; return r; }
@@ -2287,10 +2393,12 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         auto opc = BO->getOpcode();
         if (opc == Instruction::Add && imm >= 0) {
           if (!W.emit(encAddSubImm(false, is64, (unsigned)rd, rn, (unsigned)imm))) { r.status=Status::TooLarge; return r; }
+          releaseOperands(I);
           continue;
         }
         if (opc == Instruction::Sub && imm >= 0) {
           if (!W.emit(encAddSubImm(true, is64, (unsigned)rd, rn, (unsigned)imm))) { r.status=Status::TooLarge; return r; }
+          releaseOperands(I);
           continue;
         }
         if (opc == Instruction::Shl || opc == Instruction::LShr || opc == Instruction::AShr) {
@@ -2302,6 +2410,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
                     (opc == Instruction::LShr) ? W.emit(encLsrImm(is64, (unsigned)rd, rn, sh)) :
                                                  W.emit(encAsrImm(is64, (unsigned)rd, rn, sh));
           if (!ok) { r.status=Status::TooLarge; return r; }
+          releaseOperands(I);
           continue;
         }
         // reg-reg fallback (or imm-materialized into x16)
@@ -2320,6 +2429,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         default: r.status=Status::Unsupported; r.reason="binop kind"; return r;
         }
         if (!ok) { r.status=Status::TooLarge; return r; }
+        releaseOperands(I);
         continue;
       }
 
@@ -2371,6 +2481,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
                                : encFcvtzsWS((unsigned)rd, it->second));
           }
           if (!W.emit(opc)) { r.status = Status::TooLarge; return r; }
+          releaseOperands(I);
           continue;
         }
         // -------- SIToFP / UIToFP (GPR -> FP) --------
@@ -2413,6 +2524,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
                                : encScvtfSW((unsigned)rd, srcReg));
           }
           if (!W.emit(opc)) { r.status = Status::TooLarge; return r; }
+          releaseOperands(I);
           continue;
         }
         // -------- FPExt (float -> double) --------
@@ -2432,6 +2544,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
           if (!W.emit(encFcvtDS((unsigned)rd, it->second))) {
             r.status = Status::TooLarge; return r;
           }
+          releaseOperands(I);
           continue;
         }
         // -------- FPTrunc (double -> float) --------
@@ -2451,6 +2564,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
           if (!W.emit(encFcvtSD((unsigned)rd, it->second))) {
             r.status = Status::TooLarge; return r;
           }
+          releaseOperands(I);
           continue;
         }
         // -------- BitCast (FP <-> int reinterpret only) --------
@@ -2493,6 +2607,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
                           : encFmovWFromS((unsigned)rd, it->second))) {
               r.status = Status::TooLarge; return r;
             }
+            releaseOperands(I);
             continue;
           }
           if (i32ToFloat || i64ToDouble) {
@@ -2510,6 +2625,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
                           : encFmovSFromW((unsigned)rd, srcReg))) {
               r.status = Status::TooLarge; return r;
             }
+            releaseOperands(I);
             continue;
           }
           // Same-class same-width int<->int bitcasts (rare but valid):
@@ -2550,6 +2666,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
             if (!W.emit(encExtendBits(true, dstBits == 64, (unsigned)rd, srcReg, srcBits))) {
               r.status = Status::TooLarge; return r;
             }
+            releaseOperands(I);
             continue;
           }
           if (CI->getOpcode() == Instruction::ZExt &&
@@ -2562,9 +2679,11 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
             if (!W.emit(encExtendBits(false, dstBits == 64, (unsigned)rd, srcReg, srcBits))) {
               r.status = Status::TooLarge; return r;
             }
+            releaseOperands(I);
             continue;
           }
           regOf[&I] = srcReg;
+          releaseOperands(I);
           continue;
         }
         r.status = Status::Unsupported; r.reason = "cast kind"; return r;
@@ -2724,6 +2843,17 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         size_t bFalsePos = W.pos;
         if (!W.emit(encBStub())) { r.status=Status::TooLarge; return r; }
         fixups.push_back({bFalsePos, Fsucc, false, 0});
+        if (brIsIcmp && pendingCmp.I) {
+          releaseIfDead(pendingCmp.I->getOperand(0));
+          releaseIfDead(pendingCmp.I->getOperand(1));
+        }
+        if (brIsFcmp && pendingFCmp.I) {
+          releaseIfDead(pendingFCmp.lhs);
+          releaseIfDead(pendingFCmp.rhs);
+        }
+        releaseOperands(I);
+        pendingCmp.I = nullptr;
+        pendingFCmp.I = nullptr;
         continue;
       }
 

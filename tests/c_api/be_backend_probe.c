@@ -114,12 +114,13 @@ long long EASY_JIT_EXPOSE be_combo_kernel(const BEComboConfig* cfg,
                                           long long a8,
                                           float f, double d,
                                           int32_t* out) {
-    long long stackMix = a8 + a5 - a0;
+    long long stackMix = a8 + a5 - a0 + (a3 ^ a7);
     double fp = (double)f + d + cfg->dscale;
     int32_t cell = grid[i][j];
-    int32_t v = cell + cfg->bias + cfg->table[3] + (int32_t)fp;
+    int32_t mirror = grid[j][i];
+    int32_t v = cell + mirror + cfg->bias + cfg->table[3] + (int32_t)fp;
     *out = v;
-    return (long long)v + stackMix + a1;
+    return (long long)v + stackMix + a1 - a2 + a4 - a6;
 }
 
 static int has_case(const Options* opt, const char* name) {
@@ -455,10 +456,12 @@ static int run_combo(const Options* opt) {
                             a[0], a[1], a[2], a[3], a[4],
                             a[5], a[6], a[7], a[8],
                             f, d, &out);
-        long long stackMix = a[8] + a[5] - a[0];
+        long long stackMix = a[8] + a[5] - a[0] + (a[3] ^ a[7]);
         double fp = (double)f + d + cfg.dscale;
-        int32_t wantOut = grid[i][j] + cfg.bias + cfg.table[3] + (int32_t)fp;
-        long long want = (long long)wantOut + stackMix + a[1];
+        int32_t wantOut = grid[i][j] + grid[j][i] + cfg.bias +
+                          cfg.table[3] + (int32_t)fp;
+        long long want = (long long)wantOut + stackMix + a[1] - a[2] +
+                         a[4] - a[6];
         if (got != want || out != wantOut) {
             fprintf(stderr,
                     "combo FAIL it=%d got=%lld want=%lld out=%d want_out=%d\n",

@@ -103,6 +103,13 @@ final-mile claim is deferred to a target-machine validation pass.
   full SSA spill/reload allocator: GPR-heavy scalar expressions that need
   up to 18 scratch registers now compile, while shapes requiring more
   simultaneously assigned GPR values still reject cleanly.
+- Local SSA scratch reuse (round 8m): within one basic block, temporary
+  instruction results are returned to a small free list after their last
+  same-block use. This lets straight-line post-specialization expression
+  chains reuse GPR and FP scratch registers instead of permanently
+  consuming one slot per SSA name. Values that cross blocks, feed PHIs, or
+  act as dynamic-GEP index terms stay pinned to avoid hidden address-use
+  lifetime bugs.
 - Fixed-size stack frame, constant-offset alloca GEP.
 - Dynamic scaled GEP with up to **two** dynamic terms (round 8k):
 
@@ -266,11 +273,12 @@ final-mile claim is deferred to a target-machine validation pass.
   `"fp scratch OOM (stack arg)"`), and
   offsets that don't fit in the scaled `LDR` uimm12 encoding
   (rejected with `"stack arg offset/encoding"`).
-- Full SSA spilling/reloading under very high register pressure. Round
-  8l expands the GPR scratch pool by saving `x19..x28`, but it does not
-  yet spill arbitrary live SSA values to stack slots and reload them on
-  demand. FP scratch remains capped at `d16..d30` plus the reserved
-  constant scratch `d31`.
+- Full SSA spilling/reloading under very high register pressure. Rounds
+  8l/8m expand the practical envelope with saved GPR scratch registers
+  and same-block scratch reuse, but the backend still does not spill
+  arbitrary live SSA values to stack slots and reload them on demand. FP
+  scratch remains capped at `d16..d30` plus the reserved constant scratch
+  `d31`.
 - Dynamic GEP shapes beyond the round-8k two-term form: more than
   two dynamic indices in the GEP chain, dynamic index scales that
   are not powers of two, scales with `log2 > 12`, and arithmetic
