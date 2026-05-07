@@ -361,6 +361,16 @@ static uint32_t encFmulD(unsigned rd, unsigned rn, unsigned rm) {
 static uint32_t encFdivD(unsigned rd, unsigned rn, unsigned rm) {
   return 0x1E601800u | ((rm & 0x1Fu) << 16) | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
 }
+// Scalar FNEG (ARM ARM C6.2.91). Encoding family
+// 0001_1110_0X1_00001_010000_nnnnn_ddddd, type=00 → single, type=01 → double.
+//   FNEG S: 0x1E21_4000 base
+//   FNEG D: 0x1E61_4000 base
+static uint32_t encFnegS(unsigned rd, unsigned rn) {
+  return 0x1E214000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
+static uint32_t encFnegD(unsigned rd, unsigned rn) {
+  return 0x1E614000u | ((rn & 0x1Fu) << 5) | (rd & 0x1Fu);
+}
 // FCMP Sn, Sm (scalar single, ARM ARM C6.2.84). Sets NZCV per IEEE-754:
 //   ordered <  → NZCV=1000   ordered ==  → 0110
 //   ordered >  → NZCV=0010   unordered   → 0011  (V=1 for NaN)
@@ -2433,6 +2443,40 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         continue;
       }
 
+      // Unary FP ops: only FNeg is recognised. Clang lowers `-f` /
+      // `0.0 - f` directly to `fneg` since LLVM 13, so without this
+      // every fp-select with a negated alternative bails out. The
+      // encoding is the standard scalar FNEG (single/double) and lives
+      // entirely in the V register file.
+      if (auto *UO = dyn_cast<UnaryOperator>(&I)) {
+        if (UO->getOpcode() != Instruction::FNeg) {
+          r.status = Status::Unsupported;
+          r.reason = std::string("unop: ") + UO->getOpcodeName();
+          return r;
+        }
+        Type *Ty = UO->getType();
+        if (!Ty->isFloatTy() && !Ty->isDoubleTy()) {
+          r.status = Status::Unsupported; r.reason = "fneg type"; return r;
+        }
+        bool isDouble = Ty->isDoubleTy();
+        unsigned rn;
+        if (!valueInFpReg(UO->getOperand(0), rn)) {
+          r.status = Status::Unsupported; r.reason = "fneg src"; return r;
+        }
+        // Release dead operand mapping before assigning rd so the
+        // freed FP scratch can be reused as the destination (FNEG
+        // reads rn before writing rd).
+        releaseOperands(I);
+        int rd = assignFpReg(&I);
+        if (rd < 0) {
+          r.status = Status::Unsupported; r.reason = "fp scratch OOM (fneg)"; return r;
+        }
+        bool ok = isDouble ? W.emit(encFnegD((unsigned)rd, rn))
+                           : W.emit(encFnegS((unsigned)rd, rn));
+        if (!ok) { r.status = Status::TooLarge; return r; }
+        continue;
+      }
+
       // Binary ops
       if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
         // FP binary ops (fadd/fsub/fmul/fdiv) — scalar f32 and f64 are
@@ -2466,6 +2510,10 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
           if (!valueInFpReg(R, rm)) {
             r.status = Status::Unsupported; r.reason = "fp binop rhs"; return r;
           }
+          // Round 8m: release dead operand mappings before allocating
+          // rd so a freshly freed FP scratch can be reused as the
+          // destination. The FP encodings read rn/rm before writing rd.
+          releaseOperands(I);
           int rd = assignFpReg(&I);
           if (rd < 0) {
             r.status = Status::Unsupported; r.reason = "fp scratch OOM (binop)"; return r;
@@ -2479,65 +2527,128 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
           default: break;
           }
           if (!ok) { r.status = Status::TooLarge; return r; }
-          releaseOperands(I);
           continue;
         }
         if (!BO->getType()->isIntegerTy()) { r.status=Status::Unsupported; r.reason="binop non-int"; return r; }
         unsigned bits = BO->getType()->getIntegerBitWidth();
         if (bits != 32 && bits != 64) { r.status=Status::Unsupported; r.reason="binop width"; return r; }
         bool is64 = (bits == 64);
-        int rd = assignReg(&I);
-        if (rd < 0) { r.status=Status::Unsupported; r.reason="scratch OOM (binop)"; return r; }
-        unsigned rn;
-        if (isReloadableStackArg(BO->getOperand(0))) {
+
+        // Round 8m: defer rd allocation until after operand registers
+        // are pinned and dead operand mappings released. Releasing dead
+        // operands FIRST lets assignReg reuse op0/op1's physical regs
+        // for rd. The encodings below all read rn/rm before writing rd
+        // in a single instruction, so rd == rn or rd == rm is safe. This
+        // drops scratch pressure dramatically for chained arithmetic
+        // expressions (e.g. the gauntlet kernel).
+        //
+        // Caveat: when op0 is a reloadable stack arg, the load into rd
+        // happens AFTER assignReg and would clobber rm if rd reused
+        // rm's just-freed reg. So in that path we keep the original
+        // ordering (assignReg first, then read op1) — stack args are
+        // few enough that the lost reuse is not what causes OOM.
+        bool op0Reload = isReloadableStackArg(BO->getOperand(0));
+        unsigned rn = 0;
+        int imm = asImm12(BO->getOperand(1));
+        auto opc = BO->getOpcode();
+        bool useImmAdd = (opc == Instruction::Add && imm >= 0);
+        bool useImmSub = (opc == Instruction::Sub && imm >= 0);
+        bool isShift = (opc == Instruction::Shl ||
+                        opc == Instruction::LShr ||
+                        opc == Instruction::AShr);
+        unsigned shiftAmt = 0;
+        unsigned rm = 0;
+
+        if (op0Reload) {
+          int rd = assignReg(&I);
+          if (rd < 0) { r.status=Status::Unsupported; r.reason="scratch OOM (binop)"; return r; }
           if (!loadReloadableStackArg(BO->getOperand(0), is64, (unsigned)rd)) {
             r.status=Status::Unsupported; r.reason="binop op0"; return r;
           }
           rn = (unsigned)rd;
-        } else if (!valueInReg(BO->getOperand(0), is64, rn)) {
-          r.status=Status::Unsupported; r.reason="binop op0"; return r;
-        }
-        int imm = asImm12(BO->getOperand(1));
-        auto opc = BO->getOpcode();
-        if (opc == Instruction::Add && imm >= 0) {
-          if (!W.emit(encAddSubImm(false, is64, (unsigned)rd, rn, (unsigned)imm))) { r.status=Status::TooLarge; return r; }
-          releaseOperands(I);
-          continue;
-        }
-        if (opc == Instruction::Sub && imm >= 0) {
-          if (!W.emit(encAddSubImm(true, is64, (unsigned)rd, rn, (unsigned)imm))) { r.status=Status::TooLarge; return r; }
-          releaseOperands(I);
-          continue;
-        }
-        if (opc == Instruction::Shl || opc == Instruction::LShr || opc == Instruction::AShr) {
-          auto *CI = dyn_cast<ConstantInt>(BO->getOperand(1));
-          if (!CI) { r.status=Status::Unsupported; r.reason="variable shift"; return r; }
-          unsigned sh = (unsigned)CI->getZExtValue();
-          if (sh >= (is64 ? 64u : 32u)) { r.status=Status::Unsupported; r.reason="shift oversize"; return r; }
-          bool ok = (opc == Instruction::Shl)  ? W.emit(encLslImm(is64, (unsigned)rd, rn, sh)) :
-                    (opc == Instruction::LShr) ? W.emit(encLsrImm(is64, (unsigned)rd, rn, sh)) :
-                                                 W.emit(encAsrImm(is64, (unsigned)rd, rn, sh));
+          if (isShift) {
+            auto *CI = dyn_cast<ConstantInt>(BO->getOperand(1));
+            if (!CI) { r.status=Status::Unsupported; r.reason="variable shift"; return r; }
+            shiftAmt = (unsigned)CI->getZExtValue();
+            if (shiftAmt >= (is64 ? 64u : 32u)) { r.status=Status::Unsupported; r.reason="shift oversize"; return r; }
+          } else if (!useImmAdd && !useImmSub) {
+            if (!valueInReg(BO->getOperand(1), is64, rm)) {
+              r.status=Status::Unsupported; r.reason="binop op1"; return r;
+            }
+          }
+          bool ok = false;
+          if (useImmAdd) {
+            ok = W.emit(encAddSubImm(false, is64, (unsigned)rd, rn, (unsigned)imm));
+          } else if (useImmSub) {
+            ok = W.emit(encAddSubImm(true, is64, (unsigned)rd, rn, (unsigned)imm));
+          } else if (isShift) {
+            ok = (opc == Instruction::Shl)  ? W.emit(encLslImm(is64, (unsigned)rd, rn, shiftAmt)) :
+                 (opc == Instruction::LShr) ? W.emit(encLsrImm(is64, (unsigned)rd, rn, shiftAmt)) :
+                                              W.emit(encAsrImm(is64, (unsigned)rd, rn, shiftAmt));
+          } else {
+            switch (opc) {
+            case Instruction::Add: ok = W.emit(encAddSubReg(false, is64, (unsigned)rd, rn, rm)); break;
+            case Instruction::Sub: ok = W.emit(encAddSubReg(true , is64, (unsigned)rd, rn, rm)); break;
+            case Instruction::Mul: ok = W.emit(encMul(is64, (unsigned)rd, rn, rm)); break;
+            case Instruction::And: ok = W.emit(encLogicReg(0, is64, (unsigned)rd, rn, rm)); break;
+            case Instruction::Or:  ok = W.emit(encLogicReg(1, is64, (unsigned)rd, rn, rm)); break;
+            case Instruction::Xor: ok = W.emit(encLogicReg(2, is64, (unsigned)rd, rn, rm)); break;
+            default: r.status=Status::Unsupported; r.reason="binop kind"; return r;
+            }
+          }
           if (!ok) { r.status=Status::TooLarge; return r; }
           releaseOperands(I);
           continue;
         }
-        // reg-reg fallback (or imm-materialized into x16)
-        unsigned rm;
-        if (!valueInReg(BO->getOperand(1), is64, rm)) {
-          r.status=Status::Unsupported; r.reason="binop op1"; return r;
+
+        if (!valueInReg(BO->getOperand(0), is64, rn)) {
+          r.status=Status::Unsupported; r.reason="binop op0"; return r;
         }
+        if (isShift) {
+          auto *CI = dyn_cast<ConstantInt>(BO->getOperand(1));
+          if (!CI) { r.status=Status::Unsupported; r.reason="variable shift"; return r; }
+          shiftAmt = (unsigned)CI->getZExtValue();
+          if (shiftAmt >= (is64 ? 64u : 32u)) { r.status=Status::Unsupported; r.reason="shift oversize"; return r; }
+        } else if (!useImmAdd && !useImmSub) {
+          if (!valueInReg(BO->getOperand(1), is64, rm)) {
+            r.status=Status::Unsupported; r.reason="binop op1"; return r;
+          }
+        }
+
+        // Drop dead operand mappings before allocating rd so a freshly
+        // freed reg can be picked up as the destination.
+        releaseOperands(I);
+
+        int rd = assignReg(&I);
+        if (rd < 0) {
+          if (getenv("EASYJIT_LIGHT_DIAG")) {
+            fprintf(stderr, "[diag] OOM(binop) op0Reload=%d nextReg=%u useSavedGpr=%d regOf.size=%zu freeRegs=%zu inst='", (int)op0Reload, nextReg, (int)useSavedGprScratch, regOf.size(), freeRegs.size());
+            I.print(llvm::errs(), false); fprintf(stderr, "'\n");
+          }
+          r.status=Status::Unsupported; r.reason="scratch OOM (binop)"; return r;
+        }
+
         bool ok = false;
-        switch (opc) {
-        case Instruction::Add: ok = W.emit(encAddSubReg(false, is64, (unsigned)rd, rn, rm)); break;
-        case Instruction::Sub: ok = W.emit(encAddSubReg(true , is64, (unsigned)rd, rn, rm)); break;
-        case Instruction::Mul: ok = W.emit(encMul(is64, (unsigned)rd, rn, rm)); break;
-        case Instruction::And: ok = W.emit(encLogicReg(0, is64, (unsigned)rd, rn, rm)); break;
-        case Instruction::Or:  ok = W.emit(encLogicReg(1, is64, (unsigned)rd, rn, rm)); break;
-        case Instruction::Xor: ok = W.emit(encLogicReg(2, is64, (unsigned)rd, rn, rm)); break;
-        default: r.status=Status::Unsupported; r.reason="binop kind"; return r;
+        if (useImmAdd) {
+          ok = W.emit(encAddSubImm(false, is64, (unsigned)rd, rn, (unsigned)imm));
+        } else if (useImmSub) {
+          ok = W.emit(encAddSubImm(true, is64, (unsigned)rd, rn, (unsigned)imm));
+        } else if (isShift) {
+          ok = (opc == Instruction::Shl)  ? W.emit(encLslImm(is64, (unsigned)rd, rn, shiftAmt)) :
+               (opc == Instruction::LShr) ? W.emit(encLsrImm(is64, (unsigned)rd, rn, shiftAmt)) :
+                                            W.emit(encAsrImm(is64, (unsigned)rd, rn, shiftAmt));
+        } else {
+          switch (opc) {
+          case Instruction::Add: ok = W.emit(encAddSubReg(false, is64, (unsigned)rd, rn, rm)); break;
+          case Instruction::Sub: ok = W.emit(encAddSubReg(true , is64, (unsigned)rd, rn, rm)); break;
+          case Instruction::Mul: ok = W.emit(encMul(is64, (unsigned)rd, rn, rm)); break;
+          case Instruction::And: ok = W.emit(encLogicReg(0, is64, (unsigned)rd, rn, rm)); break;
+          case Instruction::Or:  ok = W.emit(encLogicReg(1, is64, (unsigned)rd, rn, rm)); break;
+          case Instruction::Xor: ok = W.emit(encLogicReg(2, is64, (unsigned)rd, rn, rm)); break;
+          default: r.status=Status::Unsupported; r.reason="binop kind"; return r;
+          }
         }
         if (!ok) { r.status=Status::TooLarge; return r; }
-        releaseOperands(I);
         continue;
       }
 

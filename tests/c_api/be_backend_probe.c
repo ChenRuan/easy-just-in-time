@@ -225,6 +225,41 @@ long long EASY_JIT_EXPOSE be_gauntlet_kernel(const BEStressConfig* cfg,
     return stored_l + (long long)stored_i + total - 12345LL;
 }
 
+/*
+ * Multi-BB / PHI / select / branch / writeback case (round 8m).
+ *
+ * Existing kernels were all single-block straight-line. This adds the
+ * control-flow shape the user asked for explicitly:
+ *   - i32 icmp + select
+ *   - br on icmp -> two BBs producing a value -> phi at merge
+ *   - fcmp + fp select
+ *   - mixed i32/double arithmetic that lives across the merge phi
+ *   - sub-word load via cfg->small (snapshot-folded), keeping the snapshot
+ *     coverage shape exercised
+ *   - writeback through *out and validation in the host code
+ *
+ * The design is deliberately small (one if/else + two selects) so the
+ * light backend's existing branch/phi/select paths get a real test
+ * without piling on more pressure than the gauntlet case.
+ */
+int EASY_JIT_EXPOSE be_branch_kernel(const BEProbeConfig* cfg,
+                                     int x, int y, int n, double f,
+                                     int32_t* out) {
+    int sign = (x < 0) ? -1 : 1;            /* select i32           */
+    int v;
+    if (n > 0) {                            /* br i1                */
+        v = x * 3 + y + cfg->bias;          /* then BB              */
+    } else {
+        v = x - y * 2 - (int)cfg->small;    /* else BB              */
+    }
+    /* phi i32 [v.then, v.else] at merge   */
+    double g = (f > 0.0) ? f * 2.0 : -f;    /* fcmp + fp select     */
+    int gi = (int)g;                        /* fptosi               */
+    int picked = v + gi + sign;
+    *out = picked + 7;
+    return picked - sign;
+}
+
 static int has_case(const Options* opt, const char* name) {
     if (!opt->cases || strcmp(opt->cases, "all") == 0) return 1;
     const char* p = opt->cases;
@@ -683,6 +718,69 @@ done:
     return rc;
 }
 
+static int run_branch(const Options* opt) {
+    easyjit_context_t ctx = NULL;
+    easyjit_function_t fn = NULL;
+    int rc = 1;
+    BEProbeConfig cfg;
+    int32_t table[8] = {0};
+
+    cfg.bias = 11;
+    cfg.gain = 333;
+    cfg.small = 5;
+    cfg.scale = 1.0;
+    cfg.table = table;
+
+    if (new_ctx(&ctx)) goto done;
+    if (easyjit_context_set_snapshot(ctx, &cfg, sizeof(cfg)) != EASYJIT_OK) {
+        fprintf(stderr, "branch set_snapshot failed: %s\n",
+                easyjit_get_last_error());
+        goto done;
+    }
+    /* Five runtime args after cfg: x, y, n, f, *out. */
+    for (unsigned i = 0; i < 5; ++i)
+        if (add_forward(ctx, i)) goto done;
+    if (set_common_opts(ctx, opt, "branch")) goto done;
+    if (compile_fn((void*)be_branch_kernel, ctx, &fn)) goto done;
+    void* raw = NULL;
+    if (get_ptr(fn, &raw)) goto done;
+
+    typedef int (*Fn)(int, int, int, double, int32_t*);
+    Fn jit = (Fn)raw;
+    int32_t out = 0;
+    for (int it = 0; it < opt->iters; ++it) {
+        int x = (it & 1) ? -(it + 3) : (it + 3);
+        int y = (it * 7) - 11;
+        int n = ((it % 5) - 2);                /* spans <=0 and >0 */
+        double f = (it & 2) ? -((double)it * 0.75 + 0.25)
+                            :  ((double)it * 0.5 + 1.0);
+        int sign = (x < 0) ? -1 : 1;
+        int v = (n > 0) ? (x * 3 + y + cfg.bias)
+                        : (x - y * 2 - (int)cfg.small);
+        double g = (f > 0.0) ? (f * 2.0) : -f;
+        int gi = (int)g;
+        int picked = v + gi + sign;
+        int want_out = picked + 7;
+        int want_ret = picked - sign;
+
+        out = 0;
+        int got = jit(x, y, n, f, &out);
+        if (got != want_ret || out != want_out) {
+            fprintf(stderr,
+                    "branch FAIL it=%d x=%d y=%d n=%d f=%.3f "
+                    "got=%d want=%d out=%d want_out=%d\n",
+                    it, x, y, n, f, got, want_ret, out, want_out);
+            goto done;
+        }
+    }
+    if (opt->verbose) printf("  branch OK (%d iters)\n", opt->iters);
+    rc = 0;
+done:
+    if (fn) easyjit_function_destroy(fn);
+    if (ctx) easyjit_context_destroy(ctx);
+    return rc;
+}
+
 static int run_gauntlet(const Options* opt) {
     easyjit_context_t ctx = NULL;
     easyjit_function_t fn = NULL;
@@ -801,7 +899,7 @@ done:
 }
 
 static void usage(const char* argv0) {
-    printf("Usage: %s [--case all|mem,stack,fp,snapshot,pressure,combo,stress,gauntlet] "
+    printf("Usage: %s [--case all|mem,stack,fp,snapshot,pressure,combo,stress,branch,gauntlet] "
            "[--iters N] [--opt 0..3] [--dump-ir PREFIX] [--verbose]\n",
            argv0);
     printf("  note: gauntlet is an explicit high-pressure case and is not included in all\n");
@@ -875,6 +973,10 @@ int main(int argc, char** argv) {
     if (has_case(&opt, "stress")) {
         printf("[case] stress\n");
         failures += run_stress(&opt);
+    }
+    if (has_case(&opt, "branch")) {
+        printf("[case] branch\n");
+        failures += run_branch(&opt);
     }
     if (strcmp(opt.cases, "all") != 0 && has_case(&opt, "gauntlet")) {
         printf("[case] gauntlet\n");

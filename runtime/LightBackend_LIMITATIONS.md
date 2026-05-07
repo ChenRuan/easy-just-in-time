@@ -114,6 +114,14 @@ final-mile claim is deferred to a target-machine validation pass.
   uses have been materialised. Dynamic-GEP terms are counted separately
   from ordinary SSA uses and released after the final `LDR`/`STR`
   address materialisation; PHIs and arguments remain pinned.
+  Round 8m extends this to the binop emit path itself: integer and FP
+  binops now drop their dead operand mappings *before* the destination
+  register is allocated, so a freshly-released operand register can be
+  reused as the destination in the same instruction. This is safe
+  because every supported AArch64 ALU/FP encoding here reads its source
+  operands before writing the destination. The reloadable-stack-arg
+  path keeps the original ordering (allocate `rd` first, then load the
+  arg into it) so that loading op0 cannot clobber op1's value.
 - Fixed-size executable code allocation: each light-compiled function
   currently gets four host pages of RX code storage (typically 16 KiB),
   mapped RW during emission and flipped RX before return. This is still
@@ -189,6 +197,15 @@ final-mile claim is deferred to a target-machine validation pass.
   the zero fast path uses `FMOV Dn, XZR`. The scratch slot is `d31`,
   which is the same V register as `s31`; the existing "both ops are
   scratch consts" pre-flight check applies unchanged.
+- `fneg` on `float` and `double` (round 8m). Lowered to scalar
+  `FNEG Sd, Sn` / `FNEG Dd, Dn` (encoding family
+  `0001_1110_0X1_00001_010000_nnnnn_ddddd`, type=00 for single,
+  type=01 for double). Required because clang since LLVM 13 emits
+  `fneg` directly for both `-x` and `0.0 - x`, so a select branch
+  with a negated alternative now stays inside the light backend
+  instead of falling back. The dead-operand release runs before the
+  destination register is allocated, mirroring the round-8m binop
+  fix below.
 - Scalar single-precision ordered comparisons (round 8f, hardened in
   round 8g), fused into the immediately-following conditional branch
   or `select`. Supported predicates: `FCMP_OEQ` (EQ), `FCMP_OGT` (GT),
@@ -424,13 +441,24 @@ when the light backend is enabled.
 The C API probe `tests/c_api/be_backend_probe.c` is the board-friendly
 runtime smoke used for LE and BE machines. Its default `--case all`
 currently covers memory, stack arguments, scalar FP, snapshots, GPR
-pressure, combo, and stress cases. A heavier explicit case is available
+pressure, combo, stress, and a multi-BB / PHI / select / branch case
+(`--case branch`, round 8m). The branch case exercises an `if/else`
+with phi-merged i32 result, an `fcmp`-driven FP select with `fneg` on
+the negative arm, snapshot-folded sub-word constants, and a writeback
+through `*out`. A heavier explicit case is available
 as `--case gauntlet`; it mixes pointer-heavy work, FP work, overflow
 stack args, dynamic GEPs, and many scalar operations in one kernel. The
 gauntlet is intended for optimized builds or board-side spot checks, so
 it is not part of default `all`:
 
     EASYJIT_LIGHT=force ./be_backend_probe --case gauntlet --iters 20 --verbose
+
+The gauntlet currently still rejects with `scratch OOM (binop)` because
+the integer scratch pool (8 caller-saved x{argCount}..x15 plus 10
+callee-saved x19..x28) is exhausted by ~26 simultaneously-live i32/i64
+SSA values; round 8m only relaxes the lifetime model far enough to
+keep the regular `--case all` workload comfortable. A proper spill
+slot allocator is the planned next step for that case.
 
 A sixth optional target `check-light-be-smoke` builds a freestanding
 static `aarch64_be` ELF from `light_codegen/test_be_smoke.S` and runs
