@@ -1008,8 +1008,14 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
     int32_t  incomingOff; // bytes from entry SP (caller's NSAA base).
     bool     isFp;
     bool     is64;        // i64/ptr/double; false for i32/float.
+    bool     isPointer;
+  };
+  struct StackReloadLoc {
+    int32_t off; // bytes from adjusted SP.
+    bool    is64;
   };
   std::vector<StackArgEnt> stackArgs;
+  std::unordered_map<const Value *, StackReloadLoc> reloadableStackArg;
   unsigned argCount = 0;
   unsigned fpArgCount = 0;
   int32_t  incomingStackOff = 0;
@@ -1030,7 +1036,8 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
           return r;
         }
         incomingStackOff = (incomingStackOff + 7) & ~7;
-        stackArgs.push_back({&A, incomingStackOff, /*isFp=*/false, is64});
+        stackArgs.push_back({&A, incomingStackOff, /*isFp=*/false, is64,
+                             T->isPointerTy()});
         incomingStackOff += 8;
       } else if (T->isFloatTy() || T->isDoubleTy()) {
         if (fpArgCount < 8) {
@@ -1043,7 +1050,8 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         }
         bool isDouble = T->isDoubleTy();
         incomingStackOff = (incomingStackOff + 7) & ~7;
-        stackArgs.push_back({&A, incomingStackOff, /*isFp=*/true, isDouble});
+        stackArgs.push_back({&A, incomingStackOff, /*isFp=*/true, isDouble,
+                             /*isPointer=*/false});
         incomingStackOff += 8;
       } else {
         r.status = Status::Unsupported; r.reason = "non-int/ptr/float arg"; return r;
@@ -1128,6 +1136,10 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
                   : W.emit(encFpLdrStrUIS(true, (unsigned)rd, 31, (unsigned)s));
       if (!ok) { r.status = Status::TooLarge; return r; }
     } else {
+      if (!SE.isPointer) {
+        reloadableStackArg[SE.arg] = {off, SE.is64};
+        continue;
+      }
       int rd = assignReg(SE.arg);
       if (rd < 0) {
         r.status = Status::Unsupported;
@@ -1256,13 +1268,36 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
   }
   for (const Value *V : nonLocalValue)
     localUseCount.erase(V);
-  // Dynamic-GEP index values are consumed later through PtrLoc metadata
-  // rather than as ordinary load/store operands, so do not reclaim their
-  // registers via the local SSA use counter.
-  for (const auto &KV : ptrLoc) {
-    const PtrLoc &PL = KV.second;
-    for (unsigned t = 0; t < PL.numTerms; ++t)
+  std::unordered_map<const Value *, unsigned> ptrTermUseCount;
+  auto countPtrLocTerms = [&](const Value *P) {
+    auto It = ptrLoc.find(P);
+    if (It == ptrLoc.end()) return;
+    const PtrLoc &PL = It->second;
+    if (PL.kind != PtrLoc::AbsoluteScaledIndex &&
+        PL.kind != PtrLoc::InRegScaledIndex)
+      return;
+    for (unsigned t = 0; t < PL.numTerms; ++t) {
       localUseCount.erase(PL.terms[t].value);
+      ptrTermUseCount[PL.terms[t].value]++;
+    }
+  };
+  for (const BasicBlock &BB : Fn) {
+    for (const Instruction &I : BB) {
+      if (auto *LI = dyn_cast<LoadInst>(&I)) {
+        countPtrLocTerms(LI->getPointerOperand());
+        continue;
+      }
+      if (auto *SI = dyn_cast<StoreInst>(&I)) {
+        countPtrLocTerms(SI->getPointerOperand());
+        continue;
+      }
+      if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
+        if (II->getIntrinsicID() == Intrinsic::memcpy) {
+          countPtrLocTerms(II->getArgOperand(0));
+          countPtrLocTerms(II->getArgOperand(1));
+        }
+      }
+    }
   }
 
   // ---------- Pass 3: BB layout + code emission. ----------
@@ -1445,12 +1480,31 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
     return emitMovImm(16, is64, CI->getValue());
   };
 
+  auto loadReloadableStackArg = [&](const Value *V, bool is64,
+                                    unsigned rd) -> bool {
+    (void)is64;
+    auto it = reloadableStackArg.find(V);
+    if (it == reloadableStackArg.end()) return false;
+    unsigned sz = it->second.is64 ? 3u : 2u;
+    int s = fitsScaledLocal(it->second.off, sz);
+    if (s < 0) return false;
+    return W.emit(encLdrStrUI(true, sz, rd, 31, (unsigned)s));
+  };
+
+  auto isReloadableStackArg = [&](const Value *V) -> bool {
+    return reloadableStackArg.find(V) != reloadableStackArg.end();
+  };
+
   // Helper: get a value into a register (returns true on success). Uses x16
   // as the scratch destination for materialized immediates. Caller supplies
   // the desired is64.
   auto valueInReg = [&](const Value *V, bool is64, unsigned &outReg) -> bool {
     auto it = regOf.find(V);
     if (it != regOf.end()) { outReg = it->second; return true; }
+    if (isReloadableStackArg(V)) {
+      outReg = 16;
+      return loadReloadableStackArg(V, is64, outReg);
+    }
     if (auto *CI = dyn_cast<ConstantInt>(V))
       return materializeImmAny(CI, is64, outReg);
     return false;
@@ -1470,12 +1524,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
     return false;
   };
 
-  auto releaseIfDead = [&](const Value *V) {
-    auto UC = localUseCount.find(V);
-    if (UC == localUseCount.end()) return;
-    if (UC->second == 0) return;
-    --UC->second;
-    if (UC->second != 0) return;
+  auto freeMappedValue = [&](const Value *V) {
     if (auto RI = regOf.find(V); RI != regOf.end()) {
       unsigned rr = RI->second;
       regOf.erase(RI);
@@ -1502,6 +1551,15 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
       if (!stillMapped && fr != 31)
         freeFpRegs.push_back(fr);
     }
+  };
+
+  auto releaseIfDead = [&](const Value *V) {
+    auto UC = localUseCount.find(V);
+    if (UC == localUseCount.end()) return;
+    if (UC->second == 0) return;
+    --UC->second;
+    if (UC->second != 0) return;
+    freeMappedValue(V);
   };
 
   auto releaseOperands = [&](const Instruction &I) {
@@ -1551,43 +1609,64 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
   //
   // x16 is treated as scratch in the >4 path — safe here because no
   // immediate-materialization runs between us and the final LDR/STR.
+  std::string addrFailReason;
   auto materializeScaledAddrToX17 = [&](const PtrLoc &P) -> bool {
+    addrFailReason.clear();
     if (P.kind == PtrLoc::AbsoluteScaledIndex) {
-      if (!materializeAddrToX17(P.addr)) return false;
+      if (!materializeAddrToX17(P.addr)) { addrFailReason = "base"; return false; }
     } else if (P.kind == PtrLoc::InRegScaledIndex) {
-      if ((P.reg) != 17 && !W.emit(encMovReg(true, 17, P.reg))) return false;
+      if ((P.reg) != 17 && !W.emit(encMovReg(true, 17, P.reg))) { addrFailReason = "base"; return false; }
       if (P.spOff != 0) {
-        if (P.spOff < 0 || P.spOff > 0xFFF) return false;
-        if (!W.emit(encAddSubImm(false, true, 17, 17, (unsigned)P.spOff))) return false;
+        if (P.spOff < 0 || P.spOff > 0xFFF) { addrFailReason = "base offset"; return false; }
+        if (!W.emit(encAddSubImm(false, true, 17, 17, (unsigned)P.spOff))) { addrFailReason = "base offset"; return false; }
       }
     } else {
+      addrFailReason = "kind";
       return false;
     }
-    if (P.numTerms == 0 || P.numTerms > 2) return false;
+    if (P.numTerms == 0 || P.numTerms > 2) { addrFailReason = "term count"; return false; }
     for (unsigned t = 0; t < P.numTerms; ++t) {
       const PtrLoc::Term &T = P.terms[t];
       unsigned idxReg;
-      if (!valueInReg(T.value, T.is64, idxReg)) return false;
+      if (!valueInReg(T.value, T.is64, idxReg)) {
+        addrFailReason = std::string("term") + std::to_string(t) + " value";
+        return false;
+      }
       unsigned option;
       if (T.is64)             option = 3; // UXTX (64-bit no-op)
       else if (T.isSigned)    option = 6; // SXTW
       else                    option = 2; // UXTW
       if (T.scaleLog2 <= 4) {
-        if (!W.emit(encAddExtReg64(17, 17, idxReg, option, T.scaleLog2)))
-          return false;
+        if (!W.emit(encAddExtReg64(17, 17, idxReg, option, T.scaleLog2))) {
+          addrFailReason = "term add"; return false;
+        }
       } else {
         // 3-instruction: extend idx -> x16, LSL x16, ADD x17,x17,x16,UXTX#0
         if (T.is64) {
-          if (idxReg != 16 && !W.emit(encMovReg(true, 16, idxReg))) return false;
+          if (idxReg != 16 && !W.emit(encMovReg(true, 16, idxReg))) { addrFailReason = "term move"; return false; }
         } else {
           // SXTW or UXTW into x16. encExtendBits(sign, to64=true, rd=16, rn=idx, fromBits=32)
-          if (!W.emit(encExtendBits(T.isSigned, true, 16, idxReg, 32))) return false;
+          if (!W.emit(encExtendBits(T.isSigned, true, 16, idxReg, 32))) { addrFailReason = "term extend"; return false; }
         }
-        if (!W.emit(encLslImm(true, 16, 16, T.scaleLog2))) return false;
-        if (!W.emit(encAddExtReg64(17, 17, 16, /*UXTX*/3, 0))) return false;
+        if (!W.emit(encLslImm(true, 16, 16, T.scaleLog2))) { addrFailReason = "term shift"; return false; }
+        if (!W.emit(encAddExtReg64(17, 17, 16, /*UXTX*/3, 0))) { addrFailReason = "term add"; return false; }
       }
     }
     return true;
+  };
+
+  auto releasePtrLocTerms = [&](const PtrLoc &P) {
+    if (P.kind != PtrLoc::AbsoluteScaledIndex &&
+        P.kind != PtrLoc::InRegScaledIndex)
+      return;
+    for (unsigned t = 0; t < P.numTerms; ++t) {
+      const Value *V = P.terms[t].value;
+      auto UC = ptrTermUseCount.find(V);
+      if (UC == ptrTermUseCount.end() || UC->second == 0) continue;
+      --UC->second;
+      if (UC->second == 0 && isa<Instruction>(V) && !isa<PHINode>(V))
+        freeMappedValue(V);
+    }
   };
 
   auto accessSizeForBits = [](unsigned bits, unsigned &size) -> bool {
@@ -1601,11 +1680,16 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
   };
 
   // Helper: emit a load from PtrLoc into reg rt, size in {0,1,2,3}.
+  std::string memFailReason;
   auto emitLoad = [&](PtrLoc base, unsigned size, unsigned rt) -> bool {
+    memFailReason.clear();
     if (base.kind == PtrLoc::StackRel) {
       int s = fitsScaled(base.spOff, size);
-      if (s < 0) return false;
-      return W.emit(encLdrStrUI(true, size, rt, 31 /*sp*/, (unsigned)s));
+      if (s < 0) { memFailReason = "stack offset"; return false; }
+      if (!W.emit(encLdrStrUI(true, size, rt, 31 /*sp*/, (unsigned)s))) {
+        memFailReason = "code buffer"; return false;
+      }
+      return true;
     }
     if (base.kind == PtrLoc::Absolute) {
       // Materialize host address into x17 then LDR rt, [x17, #0]. We don't
@@ -1613,17 +1697,30 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
       // by access size (1/4/8) and most snapshot addresses aren't aligned
       // to 4096B; staying with full-width MOVZ/MOVK + offset 0 is simple
       // and always correct.
-      if (!materializeAddrToX17(base.addr)) return false;
-      return W.emit(encLdrStrUI(true, size, rt, 17, 0));
+      if (!materializeAddrToX17(base.addr)) { memFailReason = "absolute addr"; return false; }
+      if (!W.emit(encLdrStrUI(true, size, rt, 17, 0))) {
+        memFailReason = "code buffer"; return false;
+      }
+      return true;
     }
     if (base.kind == PtrLoc::AbsoluteScaledIndex ||
         base.kind == PtrLoc::InRegScaledIndex) {
-      if (!materializeScaledAddrToX17(base)) return false;
-      return W.emit(encLdrStrUI(true, size, rt, 17, 0));
+      if (!materializeScaledAddrToX17(base)) {
+        memFailReason = std::string("dyn addr ") + addrFailReason;
+        return false;
+      }
+      releasePtrLocTerms(base);
+      if (!W.emit(encLdrStrUI(true, size, rt, 17, 0))) {
+        memFailReason = "code buffer"; return false;
+      }
+      return true;
     }
     int s = fitsScaled(base.spOff, size);
-    if (s < 0) return false;
-    return W.emit(encLdrStrUI(true, size, rt, base.reg, (unsigned)s));
+    if (s < 0) { memFailReason = "reg offset"; return false; }
+    if (!W.emit(encLdrStrUI(true, size, rt, base.reg, (unsigned)s))) {
+      memFailReason = "code buffer"; return false;
+    }
+    return true;
   };
   auto emitStore = [&](PtrLoc base, unsigned size, unsigned rt) -> bool {
     if (base.kind == PtrLoc::StackRel) {
@@ -1638,6 +1735,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
     if (base.kind == PtrLoc::AbsoluteScaledIndex ||
         base.kind == PtrLoc::InRegScaledIndex) {
       if (!materializeScaledAddrToX17(base)) return false;
+      releasePtrLocTerms(base);
       return W.emit(encLdrStrUI(false, size, rt, 17, 0));
     }
     int s = fitsScaled(base.spOff, size);
@@ -1804,6 +1902,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
           } else if (base.kind == PtrLoc::AbsoluteScaledIndex ||
                      base.kind == PtrLoc::InRegScaledIndex) {
             if (!materializeScaledAddrToX17(base)) { r.status = Status::Unsupported; r.reason = "float dyn addr"; return r; }
+            releasePtrLocTerms(base);
             baseReg = 17; imm = 0;
           } else {
             int s = fitsScaled(base.spOff, scaleShift);
@@ -1964,7 +2063,10 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         int rd = assignReg(LI);
         if (rd < 0) { r.status = Status::Unsupported; r.reason = "scratch OOM (load)"; return r; }
         if (!emitLoad(it->second, accessSize, (unsigned)rd)) {
-          r.status = Status::Unsupported; r.reason = "load offset/encoding"; return r;
+          r.status = Status::Unsupported;
+          r.reason = memFailReason.empty() ? "load offset/encoding"
+                                           : std::string("load ") + memFailReason;
+          return r;
         }
         continue;
       }
@@ -2004,6 +2106,7 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
           } else if (base.kind == PtrLoc::AbsoluteScaledIndex ||
                      base.kind == PtrLoc::InRegScaledIndex) {
             if (!materializeScaledAddrToX17(base)) { r.status = Status::Unsupported; r.reason = "float dyn addr"; return r; }
+            releasePtrLocTerms(base);
             baseReg = 17; imm = 0;
           } else {
             int s = fitsScaled(base.spOff, scaleShift);
@@ -2386,7 +2489,12 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         int rd = assignReg(&I);
         if (rd < 0) { r.status=Status::Unsupported; r.reason="scratch OOM (binop)"; return r; }
         unsigned rn;
-        if (!valueInReg(BO->getOperand(0), is64, rn)) {
+        if (isReloadableStackArg(BO->getOperand(0))) {
+          if (!loadReloadableStackArg(BO->getOperand(0), is64, (unsigned)rd)) {
+            r.status=Status::Unsupported; r.reason="binop op0"; return r;
+          }
+          rn = (unsigned)rd;
+        } else if (!valueInReg(BO->getOperand(0), is64, rn)) {
           r.status=Status::Unsupported; r.reason="binop op0"; return r;
         }
         int imm = asImm12(BO->getOperand(1));
@@ -2644,11 +2752,6 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
         if (CI->getOpcode() == Instruction::Trunc ||
             CI->getOpcode() == Instruction::ZExt  ||
             CI->getOpcode() == Instruction::SExt) {
-          auto it = regOf.find(CI->getOperand(0));
-          if (it == regOf.end()) {
-            r.status = Status::Unsupported; r.reason = "cast src not in reg"; return r;
-          }
-          unsigned srcReg = it->second;
           Type *SrcTy = CI->getOperand(0)->getType();
           Type *DstTy = CI->getType();
           if (!SrcTy->isIntegerTy() || !DstTy->isIntegerTy()) {
@@ -2656,10 +2759,29 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
           }
           unsigned srcBits = SrcTy->getIntegerBitWidth();
           unsigned dstBits = DstTy->getIntegerBitWidth();
+          bool srcIs64 = srcBits == 64;
+          unsigned srcReg = 0;
+          bool srcReload = isReloadableStackArg(CI->getOperand(0));
+          if (srcReload) {
+            int rd = assignReg(&I);
+            if (rd < 0) {
+              r.status = Status::Unsupported; r.reason = "scratch OOM (cast reload)"; return r;
+            }
+            if (!loadReloadableStackArg(CI->getOperand(0), srcIs64, (unsigned)rd)) {
+              r.status = Status::Unsupported; r.reason = "cast src not in reg"; return r;
+            }
+            srcReg = (unsigned)rd;
+          } else {
+            auto it = regOf.find(CI->getOperand(0));
+            if (it == regOf.end()) {
+              r.status = Status::Unsupported; r.reason = "cast src not in reg"; return r;
+            }
+            srcReg = it->second;
+          }
           if (CI->getOpcode() == Instruction::SExt &&
               (srcBits == 8 || srcBits == 16) &&
               (dstBits == 32 || dstBits == 64)) {
-            int rd = assignReg(&I);
+            int rd = srcReload ? (int)srcReg : assignReg(&I);
             if (rd < 0) {
               r.status = Status::Unsupported; r.reason = "scratch OOM (sext)"; return r;
             }
@@ -2669,10 +2791,22 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
             releaseOperands(I);
             continue;
           }
+          if (CI->getOpcode() == Instruction::SExt &&
+              srcBits == 32 && dstBits == 64) {
+            int rd = srcReload ? (int)srcReg : assignReg(&I);
+            if (rd < 0) {
+              r.status = Status::Unsupported; r.reason = "scratch OOM (sext)"; return r;
+            }
+            if (!W.emit(encExtendBits(true, true, (unsigned)rd, srcReg, 32))) {
+              r.status = Status::TooLarge; return r;
+            }
+            releaseOperands(I);
+            continue;
+          }
           if (CI->getOpcode() == Instruction::ZExt &&
               (srcBits == 8 || srcBits == 16) &&
               (dstBits == 32 || dstBits == 64)) {
-            int rd = assignReg(&I);
+            int rd = srcReload ? (int)srcReg : assignReg(&I);
             if (rd < 0) {
               r.status = Status::Unsupported; r.reason = "scratch OOM (zext)"; return r;
             }
@@ -2892,14 +3026,15 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
 void *light::compile(const Function &Fn, Result &out,
                      const GlobalSymbol *globals, size_t nglobals) {
   const size_t pageSize = (size_t)sysconf(_SC_PAGESIZE);
-  void *page = ::mmap(nullptr, pageSize, PROT_READ | PROT_WRITE,
+  const size_t codeSize = pageSize * 4;
+  void *page = ::mmap(nullptr, codeSize, PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (page == MAP_FAILED) { out.status = Status::TooLarge; out.reason = "mmap"; return nullptr; }
-  out = emit(Fn, (uint8_t *)page, pageSize, globals, nglobals);
-  if (out.status != Status::Ok) { ::munmap(page, pageSize); return nullptr; }
+  out = emit(Fn, (uint8_t *)page, codeSize, globals, nglobals);
+  if (out.status != Status::Ok) { ::munmap(page, codeSize); return nullptr; }
   __builtin___clear_cache((char *)page, (char *)page + out.codeBytes);
-  if (::mprotect(page, pageSize, PROT_READ | PROT_EXEC) != 0) {
-    ::munmap(page, pageSize);
+  if (::mprotect(page, codeSize, PROT_READ | PROT_EXEC) != 0) {
+    ::munmap(page, codeSize);
     out.status = Status::TooLarge; out.reason = "mprotect"; return nullptr;
   }
   return page;

@@ -78,24 +78,25 @@ final-mile claim is deferred to a target-machine validation pass.
   pool and `fpRegOf` register numbering are shared between `float`
   and `double` arguments.
 - Stack-passed scalar arguments beyond the first eight GPR-class /
-  FP-class slots (round 8j). The supported subset is
+  FP-class slots (round 8j, refined after the pressure gauntlet). The supported subset is
   `i32`, `i64`, pointer, `float`, `double`. Each overflow argument
   occupies an 8-byte AAPCS64 NSAA slot regardless of natural width;
   GPR-overflow and FP-overflow share a single overflow area in
   original parameter order (per AAPCS64 §6.4 NSAA — they do **not**
-  start at independent zero offsets). Stack-arg lowering preloads
-  every overflow argument once, immediately after the entry prologue,
-  via a single `LDR W/X/S/D, [sp, #frameSize+incomingOff]`. The
-  preloaded value lives in a normal scratch register (caller-saved
-  `x8..x15`, plus saved `x19..x28` for GPR-class values; `d16..d30`
-  for FP-class values) for the rest of the function and feeds the existing
-  binop / load / store / GEP / fcmp / select / ret / cast paths just
-  like an in-register argument. Pointer stack args correctly drive
-  pointer-tracking (`ptrLoc[&A] = InReg{regOf[&A]}`). When too many
-  stack args exhaust the scratch pool the lowering rejects with
-  `"scratch OOM (stack arg)"` / `"fp scratch OOM (stack arg)"`; if
-  the offset cannot be encoded in the LDR uimm12 the rejection is
-  `"stack arg offset/encoding"`.
+  start at independent zero offsets). Pointer and FP overflow args are
+  still preloaded immediately after the entry prologue, via a single
+  `LDR X/S/D, [sp, #frameSize+incomingOff]`, because pointer tracking
+  and V-register use need stable locations. Non-pointer GPR overflow
+  args are lazy-reloadable: the lowering records their incoming slot and
+  reloads them with `LDR W/X` only at the integer use site, which avoids
+  permanently consuming one scratch register per stack argument. The
+  reloaded values feed the existing binop / load / store / GEP / fcmp /
+  select / ret / cast paths just like in-register arguments. Pointer
+  stack args correctly drive pointer-tracking (`ptrLoc[&A] =
+  InReg{regOf[&A]}`). When too many preloaded stack args exhaust the
+  scratch pool the lowering rejects with `"scratch OOM (stack arg)"` /
+  `"fp scratch OOM (stack arg)"`; if the offset cannot be encoded in the
+  LDR uimm12 the rejection is `"stack arg offset/encoding"`.
 - Extended GPR scratch pool (round 8l): the emitter saves `x19..x28`
   into the local frame in the prologue, makes those registers available
   after the caller-saved `x8..x15` pool is exhausted, and restores them
@@ -103,13 +104,21 @@ final-mile claim is deferred to a target-machine validation pass.
   full SSA spill/reload allocator: GPR-heavy scalar expressions that need
   up to 18 scratch registers now compile, while shapes requiring more
   simultaneously assigned GPR values still reject cleanly.
-- Local SSA scratch reuse (round 8m): within one basic block, temporary
+- Local SSA scratch reuse (round 8m, refined for dynamic-GEP address
+  terms): within one basic block, temporary
   instruction results are returned to a small free list after their last
   same-block use. This lets straight-line post-specialization expression
   chains reuse GPR and FP scratch registers instead of permanently
   consuming one slot per SSA name. Values that cross blocks, feed PHIs, or
-  act as dynamic-GEP index terms stay pinned to avoid hidden address-use
-  lifetime bugs.
+  act as dynamic-GEP index terms stay pinned until their hidden address
+  uses have been materialised. Dynamic-GEP terms are counted separately
+  from ordinary SSA uses and released after the final `LDR`/`STR`
+  address materialisation; PHIs and arguments remain pinned.
+- Fixed-size executable code allocation: each light-compiled function
+  currently gets four host pages of RX code storage (typically 16 KiB),
+  mapped RW during emission and flipped RX before return. This is still
+  intentionally simple: functions whose emitted code would exceed the
+  fixed cap reject instead of growing the mapping.
 - Fixed-size stack frame, constant-offset alloca GEP.
 - Dynamic scaled GEP with up to **two** dynamic terms (round 8k):
 
@@ -264,21 +273,24 @@ final-mile claim is deferred to a target-machine validation pass.
   binop both ops are scratch consts"`).
 - Stack-passed scalar arguments beyond the first eight GPR-class /
   FP-class slots are now supported for `i32`/`i64`/pointer/`float`/
-  `double` (round 8j, see preamble). Still unsupported in the
+  `double` (round 8j plus the lazy GPR reload refinement, see
+  preamble). Still unsupported in the
   stack-arg path: aggregate-by-value, homogeneous floating-point
   aggregates (HFA), varargs, `i8`/`i16` overflow args (rejected with
   reason `"stack arg shape (i8/i16)"`), scratch register exhaustion
-  in the preload phase after the saved-`x19..x28` extension is also
+  for pointer/FP preloads after the saved-`x19..x28` extension is also
   exhausted (rejected with `"scratch OOM (stack arg)"` /
-  `"fp scratch OOM (stack arg)"`), and
+  `"fp scratch OOM (stack arg)"`), later use-site scratch exhaustion
+  when too many lazy-reloaded GPR stack args are live at once, and
   offsets that don't fit in the scaled `LDR` uimm12 encoding
   (rejected with `"stack arg offset/encoding"`).
 - Full SSA spilling/reloading under very high register pressure. Rounds
-  8l/8m expand the practical envelope with saved GPR scratch registers
-  and same-block scratch reuse, but the backend still does not spill
-  arbitrary live SSA values to stack slots and reload them on demand. FP
-  scratch remains capped at `d16..d30` plus the reserved constant scratch
-  `d31`.
+  8l/8m plus the lazy stack-arg reload refinement expand the practical
+  envelope with saved GPR scratch registers, same-block scratch reuse,
+  and demand-loaded non-pointer GPR overflow args, but the backend still
+  does not spill arbitrary live SSA values to stack slots and reload
+  them on demand. FP scratch remains capped at `d16..d30` plus the
+  reserved constant scratch `d31`.
 - Dynamic GEP shapes beyond the round-8k two-term form: more than
   two dynamic indices in the GEP chain, dynamic index scales that
   are not powers of two, scales with `log2 > 12`, and arithmetic
@@ -408,6 +420,17 @@ registers. Run it directly:
 
 It is also pulled in automatically by the top-level `check` target
 when the light backend is enabled.
+
+The C API probe `tests/c_api/be_backend_probe.c` is the board-friendly
+runtime smoke used for LE and BE machines. Its default `--case all`
+currently covers memory, stack arguments, scalar FP, snapshots, GPR
+pressure, combo, and stress cases. A heavier explicit case is available
+as `--case gauntlet`; it mixes pointer-heavy work, FP work, overflow
+stack args, dynamic GEPs, and many scalar operations in one kernel. The
+gauntlet is intended for optimized builds or board-side spot checks, so
+it is not part of default `all`:
+
+    EASYJIT_LIGHT=force ./be_backend_probe --case gauntlet --iters 20 --verbose
 
 A sixth optional target `check-light-be-smoke` builds a freestanding
 static `aarch64_be` ELF from `light_codegen/test_be_smoke.S` and runs

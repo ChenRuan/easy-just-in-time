@@ -374,8 +374,8 @@ Report TryLightCompile(const char *Name,
               Name, r.codeBytes, PolicyName(policy));
 
   // Transfer ownership of the code page + module into the holder.
-  const size_t pageSize = (size_t)sysconf(_SC_PAGESIZE);
-  auto *holderRaw = new LightCodeHolder(code, pageSize, std::move(Ctx), std::move(M));
+  const size_t codeSize = (size_t)sysconf(_SC_PAGESIZE) * 4;
+  auto *holderRaw = new LightCodeHolder(code, codeSize, std::move(Ctx), std::move(M));
   holderRaw->dataBuffers_ = std::move(dataBufs);
   holderRaw->nameBuffers_ = std::move(nameBufs);
   std::unique_ptr<LLVMHolder> Holder(holderRaw);

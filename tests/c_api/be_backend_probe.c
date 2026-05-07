@@ -172,6 +172,59 @@ long long EASY_JIT_EXPOSE be_stress_kernel(const BEStressConfig* cfg,
     return (long long)stored + mix0 + mix1 - mix2;
 }
 
+/*
+ * Higher-pressure gauntlet: 20 GPR-class runtime parameters after snapshot
+ * specialization, forcing 12 AAPCS64 GPR overflow slots. It also mixes bound
+ * arrays, three 2-D dynamic GEPs, FP
+ * conversions, wide integer constants, two stores, and local scratch reuse.
+ */
+long long EASY_JIT_EXPOSE be_gauntlet_kernel(const BEStressConfig* cfg,
+                                             const int32_t grid[8][8],
+                                             const double coeff[8],
+                                             int i, int j, int k,
+                                             long long a0, long long a1,
+                                             long long a2, long long a3,
+                                             long long a4, long long a5,
+                                             long long a6, long long a7,
+                                             long long a8, long long a9,
+                                             long long a10, long long a11,
+                                             float f0, float f1,
+                                             double d0, double d1, double d2,
+                                             int32_t* out_i,
+                                             long long* out_l,
+                                             double* out_d) {
+    int idx0 = (i + j + k) & 7;
+    int idx1 = (i + (k << 1)) & 7;
+    int idx2 = (j + (i << 1)) & 7;
+
+    int32_t g0 = grid[i][j];
+    int32_t g1 = grid[j][k];
+    int32_t g2 = grid[k][i];
+    int32_t e0 = cfg->extra[idx0];
+    int32_t e1 = cfg->extra[idx1];
+    int32_t sub = (int32_t)cfg->gain - (int32_t)cfg->small;
+    int32_t ibase = g0 - g1 + g2 + cfg->bias + e0 - e1 + sub;
+
+    double fp0 = (double)(f0 + f1) * (double)cfg->fscale;
+    double fp1 = d0 - d1 + d2 + cfg->dscale + coeff[idx2];
+    double fp2 = fp0 + fp1 + (double)ibase;
+    int32_t fp_i = (int32_t)(float)fp2;
+
+    long long p0 = (a8 + a9) - (a10 + a11);
+    long long p1 = (a10 ^ a3) + (a11 - a4);
+    long long p2 = (a8 * 3LL) - (a9 * 2LL);
+    long long p3 = (a0 - a1) + (a2 ^ a5) - (a6 + 0x12345LL) + a7;
+    long long total = p0 + p1 + p2 + p3;
+    int32_t stored_i = fp_i + (int32_t)total;
+    long long stored_l = total + (long long)ibase + (long long)fp_i;
+    double stored_d = fp2 + (double)(total - stored_l);
+
+    *out_i = stored_i;
+    *out_l = stored_l;
+    *out_d = stored_d;
+    return stored_l + (long long)stored_i + total - 12345LL;
+}
+
 static int has_case(const Options* opt, const char* name) {
     if (!opt->cases || strcmp(opt->cases, "all") == 0) return 1;
     const char* p = opt->cases;
@@ -630,10 +683,128 @@ done:
     return rc;
 }
 
+static int run_gauntlet(const Options* opt) {
+    easyjit_context_t ctx = NULL;
+    easyjit_function_t fn = NULL;
+    int rc = 1;
+    BEStressConfig cfg;
+    int32_t extra[8];
+    int32_t grid[8][8];
+    double coeff[8];
+    int32_t out_i = 0;
+    long long out_l = 0;
+    double out_d = 0.0;
+
+    cfg.bias = 917;
+    cfg.gain = 5309;
+    cfg.small = 41;
+    cfg.fscale = -1.25f;
+    cfg.dscale = 3.875;
+    cfg.extra = extra;
+    for (int i = 0; i < 8; ++i) {
+        extra[i] = -300 + i * 43;
+        coeff[i] = 9.5 - (double)i * 0.875;
+        for (int j = 0; j < 8; ++j)
+            grid[i][j] = -2000 + i * 211 + j * 29;
+    }
+
+    if (new_ctx(&ctx)) goto done;
+    if (easyjit_context_set_snapshot(ctx, &cfg, sizeof(cfg)) != EASYJIT_OK) {
+        fprintf(stderr, "gauntlet set_snapshot failed: %s\n",
+                easyjit_get_last_error());
+        goto done;
+    }
+    if (easyjit_context_bind_array(ctx, offsetof(BEStressConfig, extra),
+                                   extra, 8, sizeof(extra[0])) != EASYJIT_OK) {
+        fprintf(stderr, "gauntlet bind_array failed: %s\n",
+                easyjit_get_last_error());
+        goto done;
+    }
+    for (unsigned i = 0; i < 25; ++i)
+        if (add_forward(ctx, i)) goto done;
+    if (set_common_opts(ctx, opt, "gauntlet")) goto done;
+    if (compile_fn((void*)be_gauntlet_kernel, ctx, &fn)) goto done;
+    void* raw = NULL;
+    if (get_ptr(fn, &raw)) goto done;
+
+    typedef long long (*Fn)(const int32_t[8][8], const double[8],
+                            int, int, int,
+                            long long, long long, long long, long long,
+                            long long, long long, long long, long long,
+                            long long, long long, long long, long long,
+                            float, float, double, double, double,
+                            int32_t*, long long*, double*);
+    Fn jit = (Fn)raw;
+    for (int it = 0; it < opt->iters; ++it) {
+        int i = (it * 5 + 1) & 7;
+        int j = (it * 3 + 6) & 7;
+        int k = (it * 7 + 2) & 7;
+        long long a[12];
+        for (int n = 0; n < 12; ++n)
+            a[n] = (long long)(it * 37 + n * 17 - 120);
+        float f0 = (float)(it % 13) * 0.5f - 3.0f;
+        float f1 = (float)(it % 11) * -0.25f + 1.5f;
+        double d0 = (double)(it % 17) * 1.25 - 8.0;
+        double d1 = (double)(it % 19) * -0.5 + 2.25;
+        double d2 = (double)(it % 23) * 0.375 - 1.125;
+
+        out_i = 0;
+        out_l = 0;
+        out_d = 0.0;
+        long long got = jit(grid, coeff, i, j, k,
+                            a[0], a[1], a[2], a[3], a[4], a[5],
+                            a[6], a[7], a[8], a[9], a[10], a[11],
+                            f0, f1, d0, d1, d2,
+                            &out_i, &out_l, &out_d);
+
+        int idx0 = (i + j + k) & 7;
+        int idx1 = (i + (k << 1)) & 7;
+        int idx2 = (j + (i << 1)) & 7;
+        int32_t g0 = grid[i][j];
+        int32_t g1 = grid[j][k];
+        int32_t g2 = grid[k][i];
+        int32_t e0 = extra[idx0];
+        int32_t e1 = extra[idx1];
+        int32_t sub = (int32_t)cfg.gain - (int32_t)cfg.small;
+        int32_t ibase = g0 - g1 + g2 + cfg.bias + e0 - e1 + sub;
+        double fp0 = (double)(f0 + f1) * (double)cfg.fscale;
+        double fp1 = d0 - d1 + d2 + cfg.dscale + coeff[idx2];
+        double fp2 = fp0 + fp1 + (double)ibase;
+        int32_t fp_i = (int32_t)(float)fp2;
+        long long p0 = (a[8] + a[9]) - (a[10] + a[11]);
+        long long p1 = (a[10] ^ a[3]) + (a[11] - a[4]);
+        long long p2 = (a[8] * 3LL) - (a[9] * 2LL);
+        long long p3 = (a[0] - a[1]) + (a[2] ^ a[5]) -
+                       (a[6] + 0x12345LL) + a[7];
+        long long total = p0 + p1 + p2 + p3;
+        int32_t wantOutI = fp_i + (int32_t)total;
+        long long wantOutL = total + (long long)ibase + (long long)fp_i;
+        double wantOutD = fp2 + (double)(total - wantOutL);
+        long long want = wantOutL + (long long)wantOutI + total - 12345LL;
+
+        if (got != want || out_i != wantOutI || out_l != wantOutL ||
+            fabs(out_d - wantOutD) > 1e-9) {
+            fprintf(stderr,
+                    "gauntlet FAIL it=%d got=%lld want=%lld out_i=%d want_i=%d "
+                    "out_l=%lld want_l=%lld out_d=%.12f want_d=%.12f\n",
+                    it, got, want, out_i, wantOutI, out_l, wantOutL,
+                    out_d, wantOutD);
+            goto done;
+        }
+    }
+    if (opt->verbose) printf("  gauntlet OK (%d iters)\n", opt->iters);
+    rc = 0;
+done:
+    if (fn) easyjit_function_destroy(fn);
+    if (ctx) easyjit_context_destroy(ctx);
+    return rc;
+}
+
 static void usage(const char* argv0) {
-    printf("Usage: %s [--case all|mem,stack,fp,snapshot,pressure,combo,stress] "
+    printf("Usage: %s [--case all|mem,stack,fp,snapshot,pressure,combo,stress,gauntlet] "
            "[--iters N] [--opt 0..3] [--dump-ir PREFIX] [--verbose]\n",
            argv0);
+    printf("  note: gauntlet is an explicit high-pressure case and is not included in all\n");
 }
 
 static int parse_args(int argc, char** argv, Options* opt) {
@@ -704,6 +875,10 @@ int main(int argc, char** argv) {
     if (has_case(&opt, "stress")) {
         printf("[case] stress\n");
         failures += run_stress(&opt);
+    }
+    if (strcmp(opt.cases, "all") != 0 && has_case(&opt, "gauntlet")) {
+        printf("[case] gauntlet\n");
+        failures += run_gauntlet(&opt);
     }
 
     if (failures) {
