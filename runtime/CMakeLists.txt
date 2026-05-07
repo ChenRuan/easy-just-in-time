@@ -81,6 +81,7 @@ if (EASYJIT_LIGHT_BACKEND_ONLY)
     bitreader
     bitwriter
     core
+    instcombine
     ipo
     linker
     scalaropts

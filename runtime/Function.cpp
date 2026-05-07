@@ -19,6 +19,7 @@
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Transforms/IPO.h>
+#include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar.h>
 #include <llvm/Transforms/Utils.h>
 #if !EASYJIT_LIGHT_BACKEND_ONLY
@@ -232,6 +233,7 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
   //   mem2reg                - lift remaining non-struct allocas to SSA
   //   ConstStructPropagate   - second round, picks up constants that
   //                            mem2reg exposed
+  //   InstCombine            - cheap canonical cleanup after specialization
   //   CFGSimplification      - prune now-dead branches/blocks
   //   Internalize            - hide everything but the JIT entry
   //   GlobalDCE              - drop now-unreachable globals/functions
@@ -262,6 +264,8 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
   MPM.add(llvm::createPromoteMemoryToRegisterPass());
   // Second round picks up constants exposed by mem2reg.
   MPM.add(easy::createConstStructPropagatePass(Name));
+  // Canonicalize simple arithmetic and casts after constants are exposed.
+  MPM.add(llvm::createInstructionCombiningPass());
   // Minimal cleanup.
   MPM.add(llvm::createCFGSimplificationPass());
   MPM.add(llvm::createInternalizePass([Name](const llvm::GlobalValue &GV) {

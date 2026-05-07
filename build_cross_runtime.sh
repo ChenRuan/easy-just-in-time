@@ -55,6 +55,7 @@ LLVM_COMPONENTS_LIGHT_ONLY=(
   bitreader
   bitwriter
   core
+  instcombine
   ipo
   linker
   scalaropts
