@@ -93,3 +93,24 @@ target_link_libraries(... PRIVATE ${EASYJIT_LIB} pthread dl)
 - `docs/easyjit_integration_zh/01_easyjit_cpp_usage.md` — C++ API 使用细节。
 - `docs/easyjit_integration_zh/02_cmake_use_cpp_and_link_easyjit.md` — 更完整的 CMake 接入说明。
 - `runtime/LightBackend_LIMITATIONS.md` — 轻量后端当前覆盖与限制。
+
+## 7. 只想快速跑 selfcheck？
+
+如果你**只**是想在板子上确认一遍 EasyJIT 是否能正常工作（而不是真的接业务工程），可以跳过 CMake，直接用仓库自带的 `tools/build_easyjit_light_selfcheck.sh` 一行命令编出 `tools/easyjit_light_selfcheck.cpp`：
+
+```bash
+# native
+tools/build_easyjit_light_selfcheck.sh \
+  --clangxx     /abs/llvm15/bin/clang++ \
+  --easyjit-root . \
+  --easyjit-lib  /abs/libEasyJitRuntime{.so|WithNeededLLVM.a} \
+  --easyjit-pass /abs/EasyJitPass.so \
+  --output       /tmp/easyjit_light_selfcheck
+
+EASYJIT_LIGHT=force EASYJIT_LIGHT_VERBOSE=1 \
+  /tmp/easyjit_light_selfcheck --iters 10 --verbose
+```
+
+cross 时再加 `--target aarch64-linux-gnu --sysroot ...`。
+
+这个脚本**只用于编 selfcheck**，业务工程仍应使用本目录的 `CMakeLists.txt` 模板接入 EasyJIT。

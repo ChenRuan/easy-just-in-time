@@ -512,3 +512,40 @@ EASYJIT_LIGHT_VERBOSE=1
 
 `examples/easyjit_cpp_minimal/README.md` 列出了 4 个常见坑（plugin ABI 不匹配、bitcode 缺失、链接顺序、
 LINKER_LANGUAGE）和对应排查办法，遇到链接错误可以先翻一遍。
+
+## 附 2：一键构建 selfcheck 的辅助脚本
+
+仓库根目录下的 `tools/build_easyjit_light_selfcheck.sh` 用来一行命令编出 `tools/easyjit_light_selfcheck.cpp`。它**不参与业务工程构建**，只是替业务侧省掉手拼 `clang -Xclang -fpass-plugin=...`、`-I include/`、静态库路径这些细节。
+
+native 示例（在仓库根目录执行）：
+
+```bash
+tools/build_easyjit_light_selfcheck.sh \
+  --clangxx     ../build/bin/clang++ \
+  --easyjit-root . \
+  --easyjit-lib  build-llvm15-global/bin/libEasyJitRuntime.so \
+  --easyjit-pass build-llvm15-global/bin/EasyJitPass.so \
+  --output       /tmp/easyjit_light_selfcheck
+
+EASYJIT_LIGHT=force EASYJIT_LIGHT_VERBOSE=1 \
+  /tmp/easyjit_light_selfcheck --iters 10 --verbose
+```
+
+cross 示例（板端胖静态库 + sysroot）：
+
+```bash
+tools/build_easyjit_light_selfcheck.sh \
+  --clangxx      /opt/llvm15-cross/bin/clang++ \
+  --target       aarch64-linux-gnu \
+  --sysroot      /opt/sysroots/aarch64 \
+  --easyjit-root . \
+  --easyjit-lib  /deliverables/libEasyJitRuntimeWithNeededLLVM.a \
+  --easyjit-pass build-llvm15-global/bin/EasyJitPass.so \
+  --output       tools/output/easyjit_light_selfcheck.aarch64
+```
+
+可选参数：`--stdlib libstdc++|libc++|none`、`--extra-cxxflags "..."`、`--extra-ldflags "..."`。脚本会把最终的 clang 命令完整打印一遍，链接失败时直接对着那一行排查。
+
+`--easyjit-lib` 默认依次尝试：`build-llvm15-light-only/bin/libEasyJitRuntime.a` → `build-llvm15-global/bin/libEasyJitRuntime.a` → `build-llvm15-global/bin/libEasyJitRuntime.so`。仓库里那两个 `.a` 是**普通归档**（只包含 EasyJIT 自己的目标文件，没有把 LLVM 打进去），独立链接会缺一堆 LLVM 符号；这种情况下传一个胖静态库（例如交付物里的 `libEasyJitRuntimeWithNeededLLVM.a`）或 `.so` 给 `--easyjit-lib`。
+
+业务工程**不**应该靠这个脚本接入 EasyJIT，仍然按本文档前面的 CMake 片段或 `examples/easyjit_cpp_minimal/` 模板来。
