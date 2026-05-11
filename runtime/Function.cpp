@@ -234,6 +234,13 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
   //   ConstStructPropagate   - second round, picks up constants that
   //                            mem2reg exposed
   //   InstCombine            - cheap canonical cleanup after specialization
+  //   LoopSimplify/LCSSA     - canonical form for loop transforms (Opt>=2)
+  //   LoopRotate             - canonical do-while shape (Opt>=2)
+  //   LoopUnroll             - fully unroll loops whose trip count became
+  //                            a compile-time constant after specialization
+  //                            (Opt>=2). Light backend friendly: produces
+  //                            straight-line scalar IR, no vector IR.
+  //   InstCombine (2nd)      - cleanup after unroll exposes new constants
   //   CFGSimplification      - prune now-dead branches/blocks
   //   Internalize            - hide everything but the JIT entry
   //   GlobalDCE              - drop now-unreachable globals/functions
@@ -266,6 +273,36 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
   MPM.add(easy::createConstStructPropagatePass(Name));
   // Canonicalize simple arithmetic and casts after constants are exposed.
   MPM.add(llvm::createInstructionCombiningPass());
+  // Scalar loop unroll (light backend friendly).
+  //
+  // EasyJIT specialization typically turns runtime-fixed loop bounds
+  // (e.g. cfg->n bound to a constant via snapshot/InlineParameters /
+  // ConstStructPropagate) into compile-time constants. Once the trip
+  // count is statically known, LLVM's legacy LoopUnroll pass can fully
+  // unroll the loop into straight-line scalar IR -- which is exactly
+  // the shape the light AArch64 backend can lower (it does not support
+  // vector IR or NEON). We only enable this at OptLevel >= 2 so a
+  // user explicitly opting into -O0/-O1 sees the original loop shape.
+  //
+  // We do NOT add the LoopVectorize / SLPVectorize passes -- the light
+  // backend cannot consume vector IR. Users with vectorizer-friendly
+  // hot loops should compile their JIT-relevant TUs with
+  //   -fno-vectorize -fno-slp-vectorize
+  // see runtime/LightBackend_LIMITATIONS.md.
+  if (OptLevel >= 2) {
+    MPM.add(llvm::createLoopSimplifyPass());
+    MPM.add(llvm::createLCSSAPass());
+    MPM.add(llvm::createLoopRotatePass());
+    MPM.add(llvm::createLoopUnrollPass(
+        /*OptLevel=*/(int)OptLevel,
+        /*OnlyWhenForced=*/false,
+        /*ForgetAllSCEV=*/false));
+    // NOTE: a 2nd InstCombine here would further canonicalise the
+    // unrolled body, but it also re-shapes IR in non-loop functions
+    // (gauntlet kernel hit "cast src not in reg" after the rerun).
+    // The downstream CFGSimplify + the light backend's per-instruction
+    // emitter handle the loop-unroll output without a second pass.
+  }
   // Minimal cleanup.
   MPM.add(llvm::createCFGSimplificationPass());
   MPM.add(llvm::createInternalizePass([Name](const llvm::GlobalValue &GV) {

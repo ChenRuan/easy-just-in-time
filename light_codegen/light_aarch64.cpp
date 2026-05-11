@@ -860,6 +860,51 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
   if (Fn.isDeclaration() || Fn.empty()) {
     r.status = Status::Unsupported; r.reason = "no body"; return r;
   }
+  // Round 11: explicit, early vector-IR rejection.
+  //
+  // The light backend is a *scalar* AArch64 emitter. It does not lower
+  // vector loads/stores, NEON arithmetic, shuffle/extract/insert, etc.
+  // Without this guard a vector value would surface much later as a
+  // confusing "load width" / "non-int/ptr/float arg" / "non-int phi"
+  // reason, which makes triage harder for users who accidentally let
+  // the loop vectorizer run. Fail fast with one clear reason instead.
+  //
+  // We accept loop unroll (it produces scalar IR) but reject anything
+  // that *uses* a VectorType anywhere: argument, return, instruction
+  // result, or instruction operand.
+  {
+    auto isVecTy = [](llvm::Type *T) {
+      return T && T->isVectorTy();
+    };
+    if (isVecTy(Fn.getReturnType())) {
+      r.status = Status::Unsupported;
+      r.reason = "vector IR unsupported (return type)";
+      return r;
+    }
+    for (const Argument &A : Fn.args()) {
+      if (isVecTy(A.getType())) {
+        r.status = Status::Unsupported;
+        r.reason = "vector IR unsupported (argument)";
+        return r;
+      }
+    }
+    for (const BasicBlock &BB : Fn) {
+      for (const Instruction &I : BB) {
+        if (isVecTy(I.getType())) {
+          r.status = Status::Unsupported;
+          r.reason = "vector IR unsupported (instruction)";
+          return r;
+        }
+        for (const Use &U : I.operands()) {
+          if (U.get() && isVecTy(U.get()->getType())) {
+            r.status = Status::Unsupported;
+            r.reason = "vector IR unsupported (operand)";
+            return r;
+          }
+        }
+      }
+    }
+  }
   // Round-8j: stack-passed scalar args are now supported, so the
   // pre-flight `arg_size() > 8` gate has been removed. Per-argument
   // classification + overflow-area handling lives in pass 1 below.

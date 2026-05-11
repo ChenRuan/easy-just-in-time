@@ -52,6 +52,21 @@ typedef struct {
     const int32_t* extra;
 } BEStressConfig;
 
+/*
+ * Round 11 scalar loop-unroll probe config.
+ *
+ * `n` and `scale` are baked in via the snapshot so InlineParameters +
+ * ConstStructPropagate fold them to constants. With OptLevel >= 2 the
+ * runtime pipeline's LoopUnroll pass should fully unroll the body into
+ * straight-line scalar IR (no vector IR), which is the only loop shape
+ * the light AArch64 backend can lower.
+ */
+typedef struct {
+    int32_t n;
+    int32_t scale;
+    int32_t bias;
+} BEUnrollConfig;
+
 typedef struct {
     int iters;
     int verbose;
@@ -223,6 +238,32 @@ long long EASY_JIT_EXPOSE be_gauntlet_kernel(const BEStressConfig* cfg,
     *out_l = stored_l;
     *out_d = stored_d;
     return stored_l + (long long)stored_i + total - 12345LL;
+}
+
+/*
+ * Round 11 scalar loop-unroll probe kernel.
+ *
+ * The loop trip count `cfg->n` and per-iteration constant `cfg->scale`
+ * are baked in via the snapshot. After the runtime Optimize pipeline
+ * (OptLevel >= 2) the loop must be fully unrolled into straight-line
+ * scalar IR -- the light backend cannot lower vector IR or NEON. The
+ * runtime args are the two input arrays plus a writeback pointer. The
+ * cross-iteration accumulator becomes a tree of adds after unroll, so
+ * we deliberately keep `n` small (4 or 8) to avoid stretching GPR
+ * pressure / spill capacity.
+ *
+ * Reduction is i32 to stay in the scalar GPR path.
+ */
+int EASY_JIT_EXPOSE be_unroll_kernel(const BEUnrollConfig* cfg,
+                                     const int32_t* a,
+                                     const int32_t* b,
+                                     int32_t* out) {
+    int acc = cfg->bias;
+    for (int i = 0; i < cfg->n; ++i) {
+        acc += (a[i] + b[i]) * cfg->scale;
+    }
+    *out = acc;
+    return acc;
 }
 
 /*
@@ -718,6 +759,80 @@ done:
     return rc;
 }
 
+static int run_unroll_with_n(const Options* opt, int32_t n, int32_t scale,
+                             int32_t bias, const char* tag) {
+    easyjit_context_t ctx = NULL;
+    easyjit_function_t fn = NULL;
+    int rc = 1;
+    BEUnrollConfig cfg;
+    int32_t a[16];
+    int32_t b[16];
+    int32_t out = 0;
+
+    cfg.n = n;
+    cfg.scale = scale;
+    cfg.bias = bias;
+    for (int i = 0; i < 16; ++i) {
+        a[i] = 1000 + i * 7;
+        b[i] = -50 + i * 11;
+    }
+
+    if (new_ctx(&ctx)) goto done;
+    if (easyjit_context_set_snapshot(ctx, &cfg, sizeof(cfg)) != EASYJIT_OK) {
+        fprintf(stderr, "unroll(%s) set_snapshot failed: %s\n",
+                tag, easyjit_get_last_error());
+        goto done;
+    }
+    /* Three runtime args after cfg: a, b, out. */
+    for (unsigned i = 0; i < 3; ++i)
+        if (add_forward(ctx, i)) goto done;
+    if (set_common_opts(ctx, opt, tag)) goto done;
+    if (compile_fn((void*)be_unroll_kernel, ctx, &fn)) goto done;
+    void* raw = NULL;
+    if (get_ptr(fn, &raw)) goto done;
+
+    typedef int (*Fn)(const int32_t*, const int32_t*, int32_t*);
+    Fn jit = (Fn)raw;
+    for (int it = 0; it < opt->iters; ++it) {
+        /* Rotate inputs per iter so runtime values vary while
+           n/scale/bias stay baked. */
+        int32_t a_local[16];
+        int32_t b_local[16];
+        for (int i = 0; i < 16; ++i) {
+            a_local[i] = a[i] + it;
+            b_local[i] = b[i] - it;
+        }
+        out = 0;
+        int got = jit(a_local, b_local, &out);
+        int want = bias;
+        for (int i = 0; i < n; ++i)
+            want += (a_local[i] + b_local[i]) * scale;
+        if (got != want || out != want) {
+            fprintf(stderr,
+                    "unroll(%s) FAIL it=%d n=%d scale=%d got=%d want=%d "
+                    "out=%d\n",
+                    tag, it, n, scale, got, want, out);
+            goto done;
+        }
+    }
+    if (opt->verbose)
+        printf("  unroll(%s) OK n=%d scale=%d (%d iters)\n",
+               tag, n, scale, opt->iters);
+    rc = 0;
+done:
+    if (fn) easyjit_function_destroy(fn);
+    if (ctx) easyjit_context_destroy(ctx);
+    return rc;
+}
+
+static int run_unroll(const Options* opt) {
+    /* Cover both a small (4) and a medium (8) constant trip count. */
+    int rc = 0;
+    rc += run_unroll_with_n(opt, 4, 3, -25, "unroll_n4");
+    rc += run_unroll_with_n(opt, 8, 5,  17, "unroll_n8");
+    return rc;
+}
+
 static int run_branch(const Options* opt) {
     easyjit_context_t ctx = NULL;
     easyjit_function_t fn = NULL;
@@ -899,7 +1014,7 @@ done:
 }
 
 static void usage(const char* argv0) {
-    printf("Usage: %s [--case all|mem,stack,fp,snapshot,pressure,combo,stress,branch,gauntlet] "
+    printf("Usage: %s [--case all|mem,stack,fp,snapshot,pressure,combo,stress,branch,unroll,gauntlet] "
            "[--iters N] [--opt 0..3] [--dump-ir PREFIX] [--verbose]\n",
            argv0);
     printf("  note: gauntlet is an explicit high-pressure case and is not included in all\n");
@@ -977,6 +1092,10 @@ int main(int argc, char** argv) {
     if (has_case(&opt, "branch")) {
         printf("[case] branch\n");
         failures += run_branch(&opt);
+    }
+    if (has_case(&opt, "unroll")) {
+        printf("[case] unroll\n");
+        failures += run_unroll(&opt);
     }
     if (strcmp(opt.cases, "all") != 0 && has_case(&opt, "gauntlet")) {
         printf("[case] gauntlet\n");

@@ -521,3 +521,96 @@ prints a skip message and succeeds so normal local `check` remains
 portable. Passing this smoke is stronger than emit-time parity, but it
 is still QEMU user-mode coverage rather than execution on real
 `aarch64_be` silicon.
+
+## Round 11 — Scalar Loop Unroll (no NEON, no vector IR)
+
+Round 11 adds two things, both intentionally small:
+
+1. **Pipeline change in `runtime/Function.cpp::Optimize`** — at
+   `OptLevel >= 2` the runtime now runs
+   `LoopSimplify` → `LCSSA` → `LoopRotate` → `LoopUnroll(OptLevel)`
+   between the second `ConstStructPropagate`/`InstCombine` pair and the
+   final `CFGSimplification`. The pipeline still does **not** add
+   `LoopVectorize` or `SLPVectorize`, and there is no second
+   `InstCombine` after the unroller (a second InstCombine triggered a
+   regression in the gauntlet kernel: `cast src not in reg`).
+
+2. **Explicit vector-IR rejection in
+   `light_codegen/light_aarch64.cpp`** — `light::emit` now pre-scans
+   the function for any use of a `VectorType` (return type, argument,
+   instruction result, instruction operand) and rejects with one of:
+       - `"vector IR unsupported (return type)"`
+       - `"vector IR unsupported (argument)"`
+       - `"vector IR unsupported (instruction)"`
+       - `"vector IR unsupported (operand)"`
+   This replaces the older indirect rejections (`"load width"`,
+   `"non-int/ptr/float arg"`, `"non-int phi"`) for vector shapes with a
+   single clear reason that mentions vector IR by name.
+
+### What “loop unroll support” actually means
+
+The light backend does **not** lower loops. What round 11 buys you is:
+
+- If the trip count of a loop is a compile-time constant after EasyJIT
+  specialization (e.g. `cfg->n` is baked through the snapshot and
+  `ConstStructPropagate` folds it to a literal), then the runtime's
+  Optimize pipeline will fully unroll the loop into straight-line
+  scalar IR before the light backend sees it.
+- The light backend then lowers the unrolled body using the existing
+  scalar paths: integer load/store, integer/FP arithmetic, GEP,
+  conditional branch/select, snapshot-folded constants, etc.
+- No `LoopVectorize` / `SLPVectorize` runs in the JIT pipeline, so
+  vector IR cannot appear from those passes. Vector intrinsics or
+  vector IR coming in directly from the front-end are rejected
+  with one of the messages above.
+
+### Recommended frontend flags
+
+When the JIT-relevant translation unit is compiled by clang on a
+build that uses the light backend, prefer the following flags to
+avoid building vector IR that the JIT then has to reject:
+
+    -fno-vectorize -fno-slp-vectorize
+
+If unroll-driven code size or GPR pressure becomes a problem
+(spill cap is 32 slots, frame is capped at 4 KiB), add:
+
+    -fno-unroll-loops
+
+at the front-end side, or keep the runtime's JIT `opt_level` at 1.
+
+### Validation coverage
+
+`tests/c_api/be_backend_probe.c` adds the `unroll` case (run via
+`be_backend_probe --case unroll` or as part of `--case all`). It
+JIT-compiles `be_unroll_kernel`, which performs
+
+```c
+acc = bias;
+for (i = 0; i < cfg->n; ++i)
+    acc += (a[i] + b[i]) * cfg->scale;
+```
+
+with `n` baked to a snapshot constant (4 and 8). The dumped post-
+Optimize IR for `n=4` contains 4 unrolled iterations of two i32
+loads + add + mul + add, a single store, and a single `ret i32` —
+no `br`, no `phi`, no loop. The probe validates numerical equality
+between the JIT'd output and a scalar host reference over 50
+iterations of varying input data, while keeping the baked
+parameters constant.
+
+### Still unsupported in round 11
+
+- Vector IR / NEON of any kind — same as round 10, but now rejected
+  earlier and with a clearer reason.
+- Runtime-variable loop bounds. If `cfg->n` is not a snapshot constant
+  the loop body stays as a loop. The light backend's existing
+  branch/PHI support may or may not lower that loop — there is no
+  intentional regression test for non-unrolled loops; that path is
+  out of scope.
+- Loops whose unrolled body would exceed the light backend's local
+  scratch + spill capacity (`scratch OOM (...)`, `spill cap`),
+  exceed the 4 KiB frame cap, or exceed the fixed RX code allocation
+  (four host pages). These remain hard rejection points.
+- Cross-BB SSA spill, FP spill, PHI spill, vector spill — same as
+  round 10.

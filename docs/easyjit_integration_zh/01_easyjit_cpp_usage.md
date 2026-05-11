@@ -340,3 +340,51 @@ EASYJIT_LIGHT_VERBOSE=1
 7. 再做性能对比，区分 compile time、execute time、amortized total time。
 
 最开始不要追求一次接入很大的业务流程。EasyJIT 更适合先从“参数稳定、调用频繁、计算密集”的小 kernel 开始。
+
+## 10. Light backend 与 loop unroll / vector IR（round 11）
+
+从 round 11 起，EasyJIT 运行时的优化 pipeline 在 `OptLevel >= 2`
+时会自动加入 LLVM 的标量 loop unroll passes
+（`LoopSimplify` → `LCSSA` → `LoopRotate` → `LoopUnroll`）。
+配合 EasyJIT 自身的 snapshot / `ConstStructPropagate` 折叠能力，
+**循环边界在 JIT 时变成常量后，会被完整展开成 straight-line scalar IR**，
+light backend 就能继续走原有的标量 load/store/arith/branch 路径完成编译。
+
+典型可被展开的模式：
+
+```cpp
+struct Cfg { int n; int scale; };
+
+int kernel(const Cfg* cfg, const int* a, const int* b) {
+    int acc = 0;
+    for (int i = 0; i < cfg->n; ++i)
+        acc += (a[i] + b[i]) * cfg->scale;
+    return acc;
+}
+// JIT 时把 cfg 绑死 (n=8, scale=K)，runtime 只传 a/b
+```
+
+### 重要边界
+
+- **light backend 仍然不支持 vector IR / NEON**。loop unroll 只是把
+  循环展开成多次 scalar 操作，不会引入 vector 指令。
+- 如果业务侧的编译器（特别是 `clang -O3`）在前端生成了 vector IR，
+  light backend 现在会以下面这类清晰原因 reject：
+  - `vector IR unsupported (return type)`
+  - `vector IR unsupported (argument)`
+  - `vector IR unsupported (instruction)`
+  - `vector IR unsupported (operand)`
+- 因此**编译 JIT 相关的 TU 时**，推荐加：
+
+  ```
+  -fno-vectorize -fno-slp-vectorize
+  ```
+
+  避免在前端阶段先把循环 vectorize 掉。
+- 若展开后的代码体过大、寄存器压力过高，light backend 会以
+  `scratch OOM`/`spill cap`/`frame > 4095B` 等原因 reject。
+  此时可以在前端额外加 `-fno-unroll-loops`，
+  或者把 runtime 的 `opt_level` 降到 1。
+
+详细行为参见 `runtime/LightBackend_LIMITATIONS.md` 的
+“Round 11 — Scalar Loop Unroll” 一节。
