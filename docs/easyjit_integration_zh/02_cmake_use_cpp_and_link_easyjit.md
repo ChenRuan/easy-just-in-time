@@ -495,3 +495,20 @@ EASYJIT_LIGHT_VERBOSE=1
 ```
 
 查看 reject reason。先换一个更小、更简单的函数验证接入链路，再处理复杂函数形态。
+
+## 附：可直接拷贝的最小 CMake 模板
+
+仓库根目录下的 `examples/easyjit_cpp_minimal/CMakeLists.txt` 是一份**独立、自包含**的最小模板，
+不 `add_subdirectory` 主仓库，对接路径全部走三个 cache 变量
+（`EASYJIT_ROOT` / `EASYJIT_LIB` / `EASYJIT_PASS`）。
+
+第一次把 EasyJIT 接进产品工程时，建议：
+
+1. 先在那个目录里 `cmake -S . -B build -DEASYJIT_ROOT=... -DEASYJIT_LIB=... -DEASYJIT_PASS=...`
+   把 demo 编出来跑通；
+2. 把它的 `target_compile_options(... -Xclang -fpass-plugin=...)` 和
+   `target_link_libraries(... ${EASYJIT_LIB} pthread dl)` 两段照抄进你的工程；
+3. 板端再跑一次 `tools/easyjit_light_selfcheck.cpp` 做端到端自检。
+
+`examples/easyjit_cpp_minimal/README.md` 列出了 4 个常见坑（plugin ABI 不匹配、bitcode 缺失、链接顺序、
+LINKER_LANGUAGE）和对应排查办法，遇到链接错误可以先翻一遍。

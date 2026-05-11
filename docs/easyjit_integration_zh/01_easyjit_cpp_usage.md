@@ -388,3 +388,17 @@ int kernel(const Cfg* cfg, const int* a, const int* b) {
 
 详细行为参见 `runtime/LightBackend_LIMITATIONS.md` 的
 “Round 11 — Scalar Loop Unroll” 一节。
+
+## 11. 跑一遍仓库自带的最小用例与自检
+
+写新代码前，强烈建议先在你的目标环境上跑通仓库自带的两份样例：
+
+- `examples/easyjit_cpp_minimal/`（4 个 case：`int` / snapshot / 小循环 / cache）
+  - 独立 CMake 工程模板，不依赖主仓库构建系统，可以直接拷到产品工程里改路径。
+  - 详见该目录下的 `README.md`。
+- `tools/easyjit_light_selfcheck.cpp`（6 个 case：`int` / `double` / snapshot / pointer load-store / unroll(n=8) / cache）
+  - 板端自检程序。一行 clang 命令编出来，配 `EASYJIT_LIGHT=force EASYJIT_LIGHT_VERBOSE=1` 用，
+    一次性确认轻量 AArch64 后端在目标板子上 6 条路径全 PASS。
+  - 文件头的注释里直接列出了推荐的编译命令。
+
+跑完这两步再去把 EasyJIT 接到真实业务函数上，能少 90% 的“是接入坏了还是后端坏了”二义性。
