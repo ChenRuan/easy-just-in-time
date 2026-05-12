@@ -402,3 +402,40 @@ int kernel(const Cfg* cfg, const int* a, const int* b) {
   - 文件头的注释里直接列出了推荐的编译命令。
 
 跑完这两步再去把 EasyJIT 接到真实业务函数上，能少 90% 的“是接入坏了还是后端坏了”二义性。
+
+## 12. dump 出 light backend 真正生成的机器码
+
+如果只看 IR 已经无法回答“是不是后端这一改让代码变差了”，可以让 runtime 把每个被 light backend 接受的函数的**机器码 bytes** 落盘：
+
+| 环境变量 | 作用 |
+| --- | --- |
+| `EASYJIT_LIGHT_DUMP_CODE_DIR=<dir>` | 每个成功编译的函数写一个 `<dir>/NNNN_<fnname>.bin`（4 位序号原子递增、线程安全）。目录不存在会尝试 `mkdir(0755)`，失败只在 stderr 打一条 warning，不影响 JIT 继续跑。 |
+| `EASYJIT_LIGHT_DUMP_META=1` | stderr 多打一行 `[easyjit][light] code name=<n> bytes=<n> file=<path>`。 |
+| `EASYJIT_LIGHT_DUMP_CODE_BASENAME=<prefix>` | 可选，在序号前再加前缀，便于一个目录里做 A/B 对比。 |
+
+输出文件就是裸的 AArch64 指令流（小端、每条 4 字节），不含 ELF 头，文件大小等于 `bytes=`。反汇编一下：
+
+```bash
+# 仓库根目录跑一遍 selfcheck 同时 dump
+rm -rf /tmp/ejcode
+EASYJIT_LIGHT=force \
+EASYJIT_LIGHT_VERBOSE=1 \
+EASYJIT_LIGHT_DUMP_CODE_DIR=/tmp/ejcode \
+EASYJIT_LIGHT_DUMP_META=1 \
+  /tmp/easyjit_light_selfcheck --iters 1 --verbose
+
+# 反汇编
+aarch64-linux-gnu-objdump -D -b binary -m aarch64 /tmp/ejcode/0001_*.bin
+# 或者
+llvm-objdump -D -b binary -m aarch64 /tmp/ejcode/0001_*.bin
+# 或者
+hexdump -Cv /tmp/ejcode/0001_*.bin
+```
+
+排查性能问题时建议两个 dump 一起开：
+
+1. 先 `easy::options::dump_ir("/tmp/foo.ll")` 拿到 specialized IR；
+2. 再 `EASYJIT_LIGHT_DUMP_CODE_DIR=...` 拿到对应的机器码；
+3. 比较 `*.ll` 和 `*.bin` 能直接告诉你回归到底是“相同 IR 后端劣化”还是“optimizer 在 backend 前生成了不同 IR”。
+
+详见 `runtime/LightBackend_LIMITATIONS.md` 的 “Round 12 — Code Dump Diagnostics” 一节。

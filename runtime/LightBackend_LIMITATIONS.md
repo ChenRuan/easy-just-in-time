@@ -614,3 +614,69 @@ parameters constant.
   (four host pages). These remain hard rejection points.
 - Cross-BB SSA spill, FP spill, PHI spill, vector spill — same as
   round 10.
+
+## Round 12 — Code Dump Diagnostics
+
+The light backend now supports dumping the raw machine-code bytes of
+each accepted function. This is intended for backend-quality analysis
+(comparing the same IR before/after a backend change, counting
+instructions, looking for redundant spills, etc.). It is not a hot-path
+feature — there is no overhead when the env vars are unset.
+
+### Environment variables
+
+| Variable | Effect |
+| --- | --- |
+| `EASYJIT_LIGHT_DUMP_CODE_DIR=<dir>` | After each successful light-backend compile, write `Result::codeBytes` of raw machine code to `<dir>/NNNN_<sanitized_function_name>.bin`. `NNNN` is a 4-digit atomic counter (thread-safe). If `<dir>` does not exist, the runtime tries `mkdir(0755)` once; failure is logged as a warning to stderr and the JIT continues normally. |
+| `EASYJIT_LIGHT_DUMP_META=1` | Emit one stderr line per dumped function: `[easyjit][light] code name=<n> bytes=<n> file=<path>`. |
+| `EASYJIT_LIGHT_DUMP_CODE_BASENAME=<prefix>` | Optional. Prepended to the file name before the counter, e.g. `runA_0001_foo.bin`. Useful when scripting A/B comparisons in a shared directory. |
+
+Notes:
+
+* Only the actual `Result::codeBytes` are dumped — **not** the
+  4-page mmap region. So the on-disk size of every `.bin` equals
+  the `bytes=` value printed by `EASYJIT_LIGHT_VERBOSE=1`.
+* Rejected functions do not produce a `.bin`. The
+  `EASYJIT_LIGHT_VERBOSE=1/2` reject path is unchanged.
+* ORC fallback compiles do not produce a `.bin` (only the light
+  backend hooks the dump).
+* File-name sanitization: anything outside `[A-Za-z0-9_.+-]` is
+  replaced with `_`; an empty / null function name becomes `unknown`;
+  names are truncated to 96 characters.
+
+### How to inspect the dump
+
+The files contain a flat stream of AArch64 instructions (little-endian,
+4 bytes per insn). No ELF headers, no relocations. Disassemble with
+any raw-binary-aware tool:
+
+```bash
+# system binutils (on aarch64 host or with cross-binutils installed)
+aarch64-linux-gnu-objdump -D -b binary -m aarch64 /tmp/ejcode/0001_foo.bin
+
+# llvm-objdump (LLVM 11+)
+llvm-objdump -D -b binary -m aarch64 /tmp/ejcode/0001_foo.bin
+
+# raw hex if neither is available
+hexdump -Cv /tmp/ejcode/0001_foo.bin
+```
+
+Example for `int add(int x, int y){return x+y;}` JIT'd as
+`easy::jit(add, _1, 7)` (12 bytes, 3 insns):
+
+```
+0:   11001c01    add     w1, w0, #0x7
+4:   2a0103e0    mov     w0, w1
+8:   d65f03c0    ret
+```
+
+### Recommended workflow
+
+1. Reproduce the problem under `EASYJIT_LIGHT=force`.
+2. Add `easy::options::dump_ir("/tmp/foo.ll")` to capture the
+   **specialized** IR the light backend actually consumed.
+3. Set `EASYJIT_LIGHT_DUMP_CODE_DIR=/tmp/ejcode EASYJIT_LIGHT_DUMP_META=1`
+   to capture the corresponding **machine code**.
+4. Compare. The pair (`*.ll`, `*.bin`) tells you whether a suspected
+   regression is "the backend produced worse code from identical IR"
+   vs "the optimizer produced different IR before the backend ran".

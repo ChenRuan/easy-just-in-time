@@ -21,8 +21,13 @@
 #include <llvm/ADT/Triple.h>
 
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <fcntl.h>
 #include <unistd.h>
 
+#include <atomic>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
@@ -257,6 +262,120 @@ static bool HostIsAArch64() {
 #endif
 }
 
+// ----------------------------------------------------------- code dump
+//
+// EASYJIT_LIGHT_DUMP_CODE_DIR=<dir>   write each accepted function's
+//                                     raw machine-code bytes to
+//                                     <dir>/NNNN_<sanitized_name>.bin
+// EASYJIT_LIGHT_DUMP_META=1           print one stderr line per dump:
+//                                     [easyjit][light] code name=<n>
+//                                     bytes=<n> file=<path>
+//
+// The dump is best-effort: failure to mkdir / open / write only emits
+// a one-line warning to stderr and never aborts the JIT. POSIX
+// open/write are used so this works in light-only builds that do not
+// link against <filesystem>.
+
+static std::string SanitizeForFilename(const char *Name) {
+  std::string out;
+  if (!Name || !*Name) {
+    out = "unknown";
+    return out;
+  }
+  out.reserve(64);
+  for (const char *p = Name; *p; ++p) {
+    unsigned char c = (unsigned char)*p;
+    bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '.' ||
+              c == '-' || c == '+';
+    out.push_back(ok ? (char)c : '_');
+    if (out.size() >= 96) break; // keep file names sane
+  }
+  if (out.empty()) out = "unknown";
+  return out;
+}
+
+// Try to create `dir` (mkdir -p style, last component only — we expect
+// the parent path to already exist on the target). Returns true on
+// success or if the directory already exists.
+static bool EnsureDumpDir(const char *dir) {
+  if (!dir || !*dir) return false;
+  if (::mkdir(dir, 0755) == 0) return true;
+  if (errno == EEXIST) {
+    struct stat st;
+    if (::stat(dir, &st) == 0 && S_ISDIR(st.st_mode)) return true;
+  }
+  return false;
+}
+
+// Best-effort dump. Never throws, never aborts.
+static void MaybeDumpLightCode(const char *Name, const void *Code,
+                               size_t Bytes) {
+  const char *dir = std::getenv("EASYJIT_LIGHT_DUMP_CODE_DIR");
+  if (!dir || !*dir || !Code || Bytes == 0) return;
+
+  if (!EnsureDumpDir(dir)) {
+    std::fprintf(stderr,
+                 "[easyjit][light] warning: cannot create dump dir '%s'"
+                 " (errno=%d), skipping code dump for %s\n",
+                 dir, errno, Name ? Name : "<null>");
+    return;
+  }
+
+  // Atomic counter so multiple threads producing dumps don't clobber.
+  static std::atomic<unsigned> Counter{0};
+  unsigned idx = Counter.fetch_add(1, std::memory_order_relaxed) + 1;
+
+  const char *basePrefix = std::getenv("EASYJIT_LIGHT_DUMP_CODE_BASENAME");
+  char filename[512];
+  std::snprintf(filename, sizeof(filename), "%s/%s%04u_%s.bin",
+                dir,
+                (basePrefix && *basePrefix) ? basePrefix : "",
+                idx,
+                SanitizeForFilename(Name).c_str());
+
+  int fd = ::open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) {
+    std::fprintf(stderr,
+                 "[easyjit][light] warning: open('%s') failed errno=%d,"
+                 " skipping code dump for %s\n",
+                 filename, errno, Name ? Name : "<null>");
+    return;
+  }
+
+  const uint8_t *p = (const uint8_t *)Code;
+  size_t left = Bytes;
+  bool wrote_ok = true;
+  while (left > 0) {
+    ssize_t n = ::write(fd, p, left);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      wrote_ok = false;
+      break;
+    }
+    if (n == 0) { wrote_ok = false; break; }
+    p += (size_t)n;
+    left -= (size_t)n;
+  }
+  ::close(fd);
+
+  if (!wrote_ok) {
+    std::fprintf(stderr,
+                 "[easyjit][light] warning: write('%s') failed (errno=%d,"
+                 " %zu/%zu bytes), dump may be truncated\n",
+                 filename, errno, Bytes - left, Bytes);
+    return;
+  }
+
+  if (const char *meta = std::getenv("EASYJIT_LIGHT_DUMP_META");
+      meta && *meta && std::strcmp(meta, "0") != 0) {
+    std::fprintf(stderr,
+                 "[easyjit][light] code name=%s bytes=%zu file=%s\n",
+                 Name ? Name : "<null>", Bytes, filename);
+    std::fflush(stderr);
+  }
+}
+
 // Convert easy::GlobalMapping (Name, Address) <-> light::GlobalSymbol
 // (name, address). The struct layouts happen to be identical, but we
 // copy explicitly so the runtime does not depend on that invariant.
@@ -372,6 +491,11 @@ Report TryLightCompile(const char *Name,
                  Name, code, r.codeBytes);
   LIGHT_TRACE("fn=%s ACCEPTED bytes=%zu policy=%s\n",
               Name, r.codeBytes, PolicyName(policy));
+
+  // Optional diagnostic: dump raw machine-code bytes for later
+  // inspection. Controlled by EASYJIT_LIGHT_DUMP_CODE_DIR; see helper
+  // comment above. Best-effort, never aborts the JIT.
+  MaybeDumpLightCode(Name, code, r.codeBytes);
 
   // Transfer ownership of the code page + module into the holder.
   const size_t codeSize = (size_t)sysconf(_SC_PAGESIZE) * 4;

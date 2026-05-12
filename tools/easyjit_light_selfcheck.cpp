@@ -21,6 +21,14 @@
 //   EASYJIT_LIGHT=force EASYJIT_LIGHT_VERBOSE=1 \
 //     ./easyjit_light_selfcheck --iters 10 --verbose
 //
+// To additionally capture the raw AArch64 machine code emitted by the
+// light backend (for backend-quality analysis), set:
+//
+//   EASYJIT_LIGHT_DUMP_CODE_DIR=/tmp/ejcode EASYJIT_LIGHT_DUMP_META=1
+//
+// See runtime/LightBackend_LIMITATIONS.md "Round 12 — Code Dump
+// Diagnostics" for the file-name scheme and how to disassemble.
+//
 // Options:
 //   --iters N        run each case N times (default 5)
 //   --dump-ir PFX    write the optimized IR for the int+unroll cases to
