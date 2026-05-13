@@ -17,7 +17,6 @@
 #include <memory>
 #include <new>
 #include <unordered_map>
-#include <string>
 #include <cstdio>
 
 #ifndef EASYJIT_RUNTIME_DEBUG
@@ -70,14 +69,18 @@ static void set_scalar_layout(easy::Context &ctx) {
 /*  Thread-local error message                                         */
 /* ------------------------------------------------------------------ */
 
-static thread_local std::string g_last_error;
+static thread_local char g_last_error[1024];
 
 static void set_last_error(const char* msg) {
-    g_last_error = msg ? msg : "";
+    if (!msg) {
+        g_last_error[0] = '\0';
+        return;
+    }
+    std::snprintf(g_last_error, sizeof(g_last_error), "%s", msg);
 }
 
 static void clear_last_error() {
-    g_last_error.clear();
+    g_last_error[0] = '\0';
 }
 
 template <class T>
@@ -110,7 +113,7 @@ static void easyjit_free_handle(T* p) noexcept {
 }
 
 extern "C" const char* easyjit_get_last_error(void) {
-    return g_last_error.c_str();
+    return g_last_error;
 }
 
 /* ------------------------------------------------------------------ */
