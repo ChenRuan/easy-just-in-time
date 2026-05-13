@@ -4,11 +4,17 @@
 
 // Central replacement point for process-wide C++ allocation hooks used by
 // EasyJIT's static/runtime builds. Keep the public operator signatures stable;
-// define EASYJIT_USE_CUSTOM_NEW_DELETE=1 and replace the custom branch below
-// when wiring in a platform allocator.
+// compile this file only when EASYJIT_DEFINE_GLOBAL_NEW_DELETE=1. Define
+// EASYJIT_USE_CUSTOM_NEW_DELETE=1 and replace the custom branch below when
+// wiring in a platform allocator.
+#ifndef EASYJIT_DEFINE_GLOBAL_NEW_DELETE
+#define EASYJIT_DEFINE_GLOBAL_NEW_DELETE 1
+#endif
 #ifndef EASYJIT_USE_CUSTOM_NEW_DELETE
 #define EASYJIT_USE_CUSTOM_NEW_DELETE 0
 #endif
+
+#if EASYJIT_DEFINE_GLOBAL_NEW_DELETE
 
 #if EASYJIT_USE_CUSTOM_NEW_DELETE
 extern "C" void *XXX_MemAlloc(int ulSidPid, signed char ucptNo,
@@ -171,3 +177,5 @@ void operator delete[](void *p, std::align_val_t,
   ::operator delete[](p);
 }
 #endif
+
+#endif // EASYJIT_DEFINE_GLOBAL_NEW_DELETE

@@ -1,6 +1,13 @@
-option(EASYJIT_USE_CUSTOM_NEW_DELETE
-       "Route global C++ new/delete through the platform allocation hooks"
+option(EASYJIT_DEFINE_GLOBAL_NEW_DELETE
+       "Define process-wide global C++ operator new/delete from EasyJIT"
        OFF)
+option(EASYJIT_USE_CUSTOM_NEW_DELETE
+       "Route EasyJIT-defined global C++ new/delete through platform hooks"
+       OFF)
+if (EASYJIT_USE_CUSTOM_NEW_DELETE)
+  set(EASYJIT_DEFINE_GLOBAL_NEW_DELETE ON CACHE BOOL
+      "Forced ON by EASYJIT_USE_CUSTOM_NEW_DELETE" FORCE)
+endif()
 set(EASY_JIT_RUNTIME_TYPE "SHARED" CACHE STRING
     "Build EasyJitRuntime as SHARED or STATIC")
 set_property(CACHE EASY_JIT_RUNTIME_TYPE PROPERTY STRINGS SHARED STATIC)
@@ -43,7 +50,6 @@ set(EASYJIT_RUNTIME_SOURCES
   Context.cpp
   Function.cpp
   Utils.cpp
-  custom_new_delete.cpp
   easyjit_c.cpp
   pass/ContextAnalysis.cpp
   pass/DevirtualizeConstant.cpp
@@ -51,6 +57,9 @@ set(EASYJIT_RUNTIME_SOURCES
   pass/InlineParametersHelper.cpp
   pass/ConstStructPropagate.cpp
 )
+if (EASYJIT_DEFINE_GLOBAL_NEW_DELETE)
+  list(APPEND EASYJIT_RUNTIME_SOURCES custom_new_delete.cpp)
+endif()
 if (NOT EASYJIT_LIGHT_BACKEND_ONLY)
   # Full mode keeps the ORC backend and native-target initialization.
   list(APPEND EASYJIT_RUNTIME_SOURCES
@@ -65,12 +74,15 @@ endif()
 
 add_library(EasyJitRuntime ${EASY_JIT_RUNTIME_TYPE} ${EASYJIT_RUNTIME_SOURCES})
 target_compile_definitions(EasyJitRuntime PRIVATE
+  EASYJIT_DEFINE_GLOBAL_NEW_DELETE=$<IF:$<BOOL:${EASYJIT_DEFINE_GLOBAL_NEW_DELETE}>,1,0>
   EASYJIT_USE_CUSTOM_NEW_DELETE=$<IF:$<BOOL:${EASYJIT_USE_CUSTOM_NEW_DELETE}>,1,0>
   EASYJIT_LIGHT_BACKEND_ENABLED=$<IF:$<BOOL:${EASYJIT_ENABLE_LIGHT_BACKEND}>,1,0>
   EASYJIT_LIGHT_BACKEND_ONLY=$<IF:$<BOOL:${EASYJIT_LIGHT_BACKEND_ONLY}>,1,0>)
 
 message(STATUS "EasyJIT LightBackend: ${EASYJIT_ENABLE_LIGHT_BACKEND} (target processor: ${CMAKE_SYSTEM_PROCESSOR})")
 message(STATUS "EasyJIT LightBackendOnly: ${EASYJIT_LIGHT_BACKEND_ONLY}")
+message(STATUS "EasyJIT define global new/delete: ${EASYJIT_DEFINE_GLOBAL_NEW_DELETE}")
+message(STATUS "EasyJIT custom new/delete hooks: ${EASYJIT_USE_CUSTOM_NEW_DELETE}")
 
 if (EASYJIT_LIGHT_BACKEND_ONLY)
   # Minimal LLVM component closure for light-only mode: no codegen, no

@@ -24,6 +24,7 @@ LIBCXX_LIB_DIR=""
 LIBCXXABI_LIB_DIR=""
 LIBUNWIND_LIB_DIR=""
 RUNTIME_TYPE="shared"
+DEFINE_GLOBAL_NEW_DELETE=0
 USE_CUSTOM_NEW_DELETE=0
 BUNDLE_LLVM_STATIC=0
 BUNDLE_LLVM_NEEDED_STATIC=0
@@ -85,8 +86,14 @@ Optional:
   --build-dir <path>         Output build dir, default: ./build-cross-runtime-<sanitized-target>
   --target-cpu <cpu>         Optional -mcpu
   --runtime-type <type>      Runtime output: shared or static, default: shared
+  --define-global-new-delete
+                             Define process-wide C++ operator new/delete from
+                             EasyJIT. Off by default to avoid duplicate symbols
+                             when product code or the C++ runtime already
+                             provides them.
   --use-custom-new-delete    Route EasyJIT's global new/delete through
-                             the platform XXX_MemAlloc/XXX_MemFree hooks
+                             the platform XXX_MemAlloc/XXX_MemFree hooks.
+                             Implies --define-global-new-delete.
   --bundle-llvm-static       With --runtime-type static, also emit
                              libEasyJitRuntimeWithLLVM.a containing EasyJIT
                              runtime objects plus LLVM static archive members.
@@ -563,7 +570,8 @@ while [[ $# -gt 0 ]]; do
     --build-dir) BUILD_DIR="$2"; shift 2 ;;
     --target-cpu) TARGET_CPU="$2"; shift 2 ;;
     --runtime-type) RUNTIME_TYPE="$2"; shift 2 ;;
-    --use-custom-new-delete) USE_CUSTOM_NEW_DELETE=1; shift ;;
+    --define-global-new-delete) DEFINE_GLOBAL_NEW_DELETE=1; shift ;;
+    --use-custom-new-delete) DEFINE_GLOBAL_NEW_DELETE=1; USE_CUSTOM_NEW_DELETE=1; shift ;;
     --bundle-llvm-static) BUNDLE_LLVM_STATIC=1; shift ;;
     --bundle-llvm-needed-static) BUNDLE_LLVM_NEEDED_STATIC=1; shift ;;
     --gcc-toolchain) GCC_TOOLCHAIN="$2"; shift 2 ;;
@@ -641,6 +649,7 @@ echo "  sysroot         = $SYSROOT"
 echo "  target_llvm_dir = $TARGET_LLVM_DIR"
 echo "  host_llvm_build = $HOST_LLVM_BUILD"
 echo "  runtime_type    = $RUNTIME_TYPE"
+echo "  define_global_new_delete = $DEFINE_GLOBAL_NEW_DELETE"
 echo "  custom_new_delete = $USE_CUSTOM_NEW_DELETE"
 echo "  bundle_llvm_static = $BUNDLE_LLVM_STATIC"
 echo "  bundle_llvm_needed_static = $BUNDLE_LLVM_NEEDED_STATIC"
@@ -756,6 +765,7 @@ CMAKE_ARGS=(
   -DLLVM_LINK_LLVM_DYLIB=OFF
   -DEASY_JIT_BUILD_PASS=OFF
   -DEASY_JIT_RUNTIME_TYPE="${RUNTIME_TYPE^^}"
+  -DEASYJIT_DEFINE_GLOBAL_NEW_DELETE="$DEFINE_GLOBAL_NEW_DELETE"
   -DEASYJIT_USE_CUSTOM_NEW_DELETE="$USE_CUSTOM_NEW_DELETE"
   -DCMAKE_BUILD_TYPE="$CMAKE_BUILD_TYPE"
   -DCMAKE_SYSTEM_NAME=Linux

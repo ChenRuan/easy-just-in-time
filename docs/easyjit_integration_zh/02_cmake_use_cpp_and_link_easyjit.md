@@ -56,6 +56,32 @@ set_target_properties(their_app PROPERTIES
 
 静态库不是运行时 `dlopen` 加载的文件，而是在最终链接时打进可执行文件或业务 `.so`。板子上通常只需要部署最终产物，不需要单独部署这个 `.a`。
 
+默认交付的 EasyJIT runtime **不再定义全局 `operator new/delete`**，避免和业务工程、平台 SDK 或 C++ runtime 自带的符号冲突。如果业务确实需要让 EasyJIT 提供全局 new/delete，有两个开关：
+
+```bash
+# 只定义全局 operator new/delete，内部仍走 malloc/free
+-DEASYJIT_DEFINE_GLOBAL_NEW_DELETE=ON
+
+# 定义全局 operator new/delete，并改走平台 XXX_MemAlloc/XXX_MemFree
+# 这个选项会自动打开 EASYJIT_DEFINE_GLOBAL_NEW_DELETE
+-DEASYJIT_USE_CUSTOM_NEW_DELETE=ON
+```
+
+用 `build_cross_runtime.sh` 时对应：
+
+```bash
+--define-global-new-delete
+--use-custom-new-delete
+```
+
+如果最终链接报：
+
+```text
+Symbol _ZdlPv multi-defined
+```
+
+其中 `_ZdlPv` 是 `operator delete(void*)`。这说明 EasyJIT 包、业务代码、平台库或 C++ runtime 里有多份全局 delete 定义。默认不要打开上面两个选项；只有全进程确定由 EasyJIT 接管 C++ allocation hooks 时再打开。
+
 ## 2. 根 CMake 启用 C++
 
 如果原来是：
