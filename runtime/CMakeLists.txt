@@ -4,6 +4,9 @@ option(EASYJIT_DEFINE_GLOBAL_NEW_DELETE
 option(EASYJIT_USE_CUSTOM_NEW_DELETE
        "Route EasyJIT-defined global C++ new/delete through platform hooks"
        OFF)
+option(EASYJIT_C_API_MALLOC_HANDLES
+       "Allocate C API handle objects with malloc/free plus placement new"
+       OFF)
 if (EASYJIT_USE_CUSTOM_NEW_DELETE)
   set(EASYJIT_DEFINE_GLOBAL_NEW_DELETE ON CACHE BOOL
       "Forced ON by EASYJIT_USE_CUSTOM_NEW_DELETE" FORCE)
@@ -76,6 +79,7 @@ add_library(EasyJitRuntime ${EASY_JIT_RUNTIME_TYPE} ${EASYJIT_RUNTIME_SOURCES})
 target_compile_definitions(EasyJitRuntime PRIVATE
   EASYJIT_DEFINE_GLOBAL_NEW_DELETE=$<IF:$<BOOL:${EASYJIT_DEFINE_GLOBAL_NEW_DELETE}>,1,0>
   EASYJIT_USE_CUSTOM_NEW_DELETE=$<IF:$<BOOL:${EASYJIT_USE_CUSTOM_NEW_DELETE}>,1,0>
+  EASYJIT_C_API_MALLOC_HANDLES=$<IF:$<BOOL:${EASYJIT_C_API_MALLOC_HANDLES}>,1,0>
   EASYJIT_LIGHT_BACKEND_ENABLED=$<IF:$<BOOL:${EASYJIT_ENABLE_LIGHT_BACKEND}>,1,0>
   EASYJIT_LIGHT_BACKEND_ONLY=$<IF:$<BOOL:${EASYJIT_LIGHT_BACKEND_ONLY}>,1,0>)
 
@@ -83,6 +87,7 @@ message(STATUS "EasyJIT LightBackend: ${EASYJIT_ENABLE_LIGHT_BACKEND} (target pr
 message(STATUS "EasyJIT LightBackendOnly: ${EASYJIT_LIGHT_BACKEND_ONLY}")
 message(STATUS "EasyJIT define global new/delete: ${EASYJIT_DEFINE_GLOBAL_NEW_DELETE}")
 message(STATUS "EasyJIT custom new/delete hooks: ${EASYJIT_USE_CUSTOM_NEW_DELETE}")
+message(STATUS "EasyJIT C API malloc handles: ${EASYJIT_C_API_MALLOC_HANDLES}")
 
 if (EASYJIT_LIGHT_BACKEND_ONLY)
   # Minimal LLVM component closure for light-only mode: no codegen, no
