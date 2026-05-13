@@ -74,20 +74,6 @@ set_target_properties(their_app PROPERTIES
 --use-custom-new-delete
 ```
 
-如果只是想排查 C API 句柄创建时的 `new/delete` 是否触发了平台问题，可以临时打开：
-
-```bash
--DEASYJIT_C_API_MALLOC_HANDLES=ON
-```
-
-或使用脚本参数：
-
-```bash
---c-api-malloc-handles
-```
-
-这个选项只影响 `easyjit_context_create/destroy`、`easyjit_compile/easyjit_function_destroy`、`easyjit_cache_create/destroy` 这类 C API handle 对象的外层分配：它会改成 `malloc + placement new` / 显式析构 + `free`，不再通过全局 `operator new/delete` 分配这些 handle。它不会改变 EasyJIT 内部 LLVM/C++ 容器的分配行为。
-
 如果最终链接报：
 
 ```text

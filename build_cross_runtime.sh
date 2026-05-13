@@ -26,7 +26,6 @@ LIBUNWIND_LIB_DIR=""
 RUNTIME_TYPE="shared"
 DEFINE_GLOBAL_NEW_DELETE=0
 USE_CUSTOM_NEW_DELETE=0
-C_API_MALLOC_HANDLES=0
 BUNDLE_LLVM_STATIC=0
 BUNDLE_LLVM_NEEDED_STATIC=0
 STATIC_LIBUNWIND=0
@@ -95,10 +94,6 @@ Optional:
   --use-custom-new-delete    Route EasyJIT's global new/delete through
                              the platform XXX_MemAlloc/XXX_MemFree hooks.
                              Implies --define-global-new-delete.
-  --c-api-malloc-handles     Allocate C API handle objects with malloc/free
-                             plus placement new instead of global operator
-                             new/delete. Useful for diagnosing platform
-                             allocator symbol conflicts.
   --bundle-llvm-static       With --runtime-type static, also emit
                              libEasyJitRuntimeWithLLVM.a containing EasyJIT
                              runtime objects plus LLVM static archive members.
@@ -577,7 +572,6 @@ while [[ $# -gt 0 ]]; do
     --runtime-type) RUNTIME_TYPE="$2"; shift 2 ;;
     --define-global-new-delete) DEFINE_GLOBAL_NEW_DELETE=1; shift ;;
     --use-custom-new-delete) DEFINE_GLOBAL_NEW_DELETE=1; USE_CUSTOM_NEW_DELETE=1; shift ;;
-    --c-api-malloc-handles) C_API_MALLOC_HANDLES=1; shift ;;
     --bundle-llvm-static) BUNDLE_LLVM_STATIC=1; shift ;;
     --bundle-llvm-needed-static) BUNDLE_LLVM_NEEDED_STATIC=1; shift ;;
     --gcc-toolchain) GCC_TOOLCHAIN="$2"; shift 2 ;;
@@ -657,7 +651,6 @@ echo "  host_llvm_build = $HOST_LLVM_BUILD"
 echo "  runtime_type    = $RUNTIME_TYPE"
 echo "  define_global_new_delete = $DEFINE_GLOBAL_NEW_DELETE"
 echo "  custom_new_delete = $USE_CUSTOM_NEW_DELETE"
-echo "  c_api_malloc_handles = $C_API_MALLOC_HANDLES"
 echo "  bundle_llvm_static = $BUNDLE_LLVM_STATIC"
 echo "  bundle_llvm_needed_static = $BUNDLE_LLVM_NEEDED_STATIC"
 echo "  static_libunwind = $STATIC_LIBUNWIND"
@@ -774,7 +767,6 @@ CMAKE_ARGS=(
   -DEASY_JIT_RUNTIME_TYPE="${RUNTIME_TYPE^^}"
   -DEASYJIT_DEFINE_GLOBAL_NEW_DELETE="$DEFINE_GLOBAL_NEW_DELETE"
   -DEASYJIT_USE_CUSTOM_NEW_DELETE="$USE_CUSTOM_NEW_DELETE"
-  -DEASYJIT_C_API_MALLOC_HANDLES="$C_API_MALLOC_HANDLES"
   -DCMAKE_BUILD_TYPE="$CMAKE_BUILD_TYPE"
   -DCMAKE_SYSTEM_NAME=Linux
   -DCMAKE_SYSTEM_PROCESSOR="${TARGET_TRIPLE%%-*}"

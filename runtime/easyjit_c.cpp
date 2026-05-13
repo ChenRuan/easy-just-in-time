@@ -13,17 +13,12 @@
 #include <easy/runtime/BitcodeTracker.h>
 
 #include <cstring>
-#include <cstdlib>
 #include <memory>
-#include <new>
 #include <unordered_map>
 #include <cstdio>
 
 #ifndef EASYJIT_RUNTIME_DEBUG
 #define EASYJIT_RUNTIME_DEBUG 0
-#endif
-#ifndef EASYJIT_C_API_MALLOC_HANDLES
-#define EASYJIT_C_API_MALLOC_HANDLES 0
 #endif
 
 #if EASYJIT_RUNTIME_DEBUG
@@ -83,35 +78,6 @@ static void clear_last_error() {
     g_last_error[0] = '\0';
 }
 
-template <class T>
-static T* easyjit_alloc_handle() {
-#if EASYJIT_C_API_MALLOC_HANDLES
-    void* mem = std::malloc(sizeof(T));
-    if (!mem) {
-        throw std::bad_alloc();
-    }
-    try {
-        return new (mem) T();
-    } catch (...) {
-        std::free(mem);
-        throw;
-    }
-#else
-    return new T();
-#endif
-}
-
-template <class T>
-static void easyjit_free_handle(T* p) noexcept {
-    if (!p) return;
-#if EASYJIT_C_API_MALLOC_HANDLES
-    p->~T();
-    std::free(p);
-#else
-    delete p;
-#endif
-}
-
 extern "C" const char* easyjit_get_last_error(void) {
     return g_last_error;
 }
@@ -132,7 +98,7 @@ easyjit_error_t easyjit_context_create(easyjit_context_t* out_ctx) {
         return EASYJIT_ERROR_INVALID_ARGUMENT;
     }
     try {
-        *out_ctx = easyjit_alloc_handle<easyjit_context_s>();
+        *out_ctx = new easyjit_context_s();
         return EASYJIT_OK;
     } catch (const std::exception& e) {
         set_last_error(e.what());
@@ -142,7 +108,7 @@ easyjit_error_t easyjit_context_create(easyjit_context_t* out_ctx) {
 
 extern "C"
 void easyjit_context_destroy(easyjit_context_t ctx) {
-    easyjit_free_handle(ctx);
+    delete ctx;
 }
 
 /* --- Parameter binding -------------------------------------------- */
@@ -546,7 +512,7 @@ easyjit_error_t easyjit_compile(void* func_ptr,
             set_last_error("easyjit_compile: compilation returned null");
             return EASYJIT_ERROR_COMPILE_FAILED;
         }
-        auto* handle = easyjit_alloc_handle<easyjit_function_s>();
+        auto* handle = new easyjit_function_s();
         handle->fun = std::move(compiled);
         *out_fn = handle;
         EASYJIT_RT_LOG("easyjit_compile: success handle=%p\n", (void*)handle);
@@ -580,7 +546,7 @@ easyjit_error_t easyjit_get_function_pointer(easyjit_function_t fn,
 
 extern "C"
 void easyjit_function_destroy(easyjit_function_t fn) {
-    easyjit_free_handle(fn);
+    delete fn;
 }
 
 /* ------------------------------------------------------------------ */
@@ -594,7 +560,7 @@ struct easyjit_cache_s {
 
 static void easyjit_cache_clear_entries(easyjit_cache_s* cache) {
     for (auto& kv : cache->entries) {
-        easyjit_free_handle(kv.second);
+        delete kv.second;
     }
     cache->entries.clear();
 }
@@ -607,7 +573,7 @@ easyjit_error_t easyjit_cache_create(easyjit_cache_t* out_cache) {
         return EASYJIT_ERROR_INVALID_ARGUMENT;
     }
     try {
-        *out_cache = easyjit_alloc_handle<easyjit_cache_s>();
+        *out_cache = new easyjit_cache_s();
         return EASYJIT_OK;
     } catch (const std::exception& e) {
         set_last_error(e.what());
@@ -619,7 +585,7 @@ extern "C"
 void easyjit_cache_destroy(easyjit_cache_t cache) {
     if (!cache) return;
     easyjit_cache_clear_entries(cache);
-    easyjit_free_handle(cache);
+    delete cache;
 }
 
 extern "C"
