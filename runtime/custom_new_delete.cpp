@@ -17,8 +17,8 @@
 #if EASYJIT_DEFINE_GLOBAL_NEW_DELETE
 
 #if EASYJIT_USE_CUSTOM_NEW_DELETE
-extern "C" void *XXX_MemAlloc(int ulSidPid, signed char ucptNo,
-                              std::size_t ulSize);
+extern "C" void *XXX_MemAlloc(unsigned int ulSidPid, unsigned char ucptNo,
+                              unsigned long ulSize);
 extern "C" unsigned int XXX_MemFree(unsigned int ulSidPid, void *pAddr);
 #endif
 
@@ -29,7 +29,7 @@ void *operator new(std::size_t size) {
 
   while (true) {
 #if EASYJIT_USE_CUSTOM_NEW_DELETE
-    if (void *p = XXX_MemAlloc(0, 0, size)) {
+    if (void *p = XXX_MemAlloc(0U, 0U, static_cast<unsigned long>(size))) {
 #else
     if (void *p = std::malloc(size)) {
 #endif
@@ -107,7 +107,7 @@ void *operator new(std::size_t size, std::align_val_t alignment) {
     // Replace this with the platform aligned allocation hook if the board
     // requires over-aligned C++ objects. The current custom API has no
     // alignment argument, so it is only safe when it guarantees align bytes.
-    p = XXX_MemAlloc(0, 0, size);
+    p = XXX_MemAlloc(0U, 0U, static_cast<unsigned long>(size));
     if (p && reinterpret_cast<std::uintptr_t>(p) % align == 0) {
 #else
     if (posix_memalign(&p, align, size) == 0) {
