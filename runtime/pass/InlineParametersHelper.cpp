@@ -1,5 +1,6 @@
 #include "InlineParametersHelper.h"
 #include <easy/runtime/BitcodeTracker.h>
+#include "../SreDebugLog.h"
 
 #include <llvm/Linker/Linker.h>
 #include <llvm/ADT/APInt.h>
@@ -14,21 +15,11 @@
 using namespace llvm;
 using namespace easy;
 
-#ifndef EASYJIT_RUNTIME_DEBUG
-#define EASYJIT_RUNTIME_DEBUG 0
-#endif
-
-#if EASYJIT_RUNTIME_DEBUG
-#define EASYJIT_RT_PASS_LOG(...)                                                 \
-  do {                                                                           \
-    std::fprintf(stderr, "[easyjit][pass] " __VA_ARGS__);                        \
-    std::fflush(stderr);                                                         \
-  } while (0)
-#else
-#define EASYJIT_RT_PASS_LOG(...) do { } while (0)
-#endif
+#define EASYJIT_RT_PASS_LOG(...) EASYJIT_SRE_LOG("[pass] " __VA_ARGS__)
 
 HighLevelLayout::HighLevelLayout(easy::Context const& C, llvm::Function &F) {
+  EASYJIT_RT_PASS_LOG("HighLevelLayout: begin fn=%s ctx_size=%zu args=%zu\n",
+                      F.getName().str().c_str(), C.size(), F.arg_size());
   StructReturn_ = nullptr;
 
   FunctionType* FTy = F.getFunctionType();
@@ -45,6 +36,8 @@ HighLevelLayout::HighLevelLayout(easy::Context const& C, llvm::Function &F) {
     ParamIdx++;
 
   for(easy::layout_id lid : C.getLayout()) {
+    EASYJIT_RT_PASS_LOG("HighLevelLayout: layout arg=%zu id=%p param_idx=%zu\n",
+                        ArgIdx, lid, ParamIdx);
     size_t N = BT.getLayoutInfo(lid).NumFields;
 
     Args_.emplace_back(ArgIdx, ParamIdx);
@@ -58,14 +51,22 @@ HighLevelLayout::HighLevelLayout(easy::Context const& C, llvm::Function &F) {
       Arg.Types_.push_back(ParamTy);
       Arg.StructByPointer_ = ParamTy->isPointerTy();
       Arg.StructByArray_ = ParamTy->isArrayTy();
+      EASYJIT_RT_PASS_LOG("HighLevelLayout: arg=%zu single type ptr=%d array=%d\n",
+                          ArgIdx, (int)Arg.StructByPointer_,
+                          (int)Arg.StructByArray_);
       ++ParamIdx;
       ++ArgIdx;
     } else {
       for(; ParamIdx != ArgEnd; ++ParamIdx)
         Arg.Types_.push_back(FTy->getParamType(ParamIdx));
+      EASYJIT_RT_PASS_LOG("HighLevelLayout: arg=%zu multi fields=%zu\n",
+                          ArgIdx, Arg.Types_.size());
       ++ArgIdx;
     }
   }
+  EASYJIT_RT_PASS_LOG("HighLevelLayout: end args=%zu return_void=%d sret=%d\n",
+                      Args_.size(), Return_->isVoidTy() ? 1 : 0,
+                      StructReturn_ ? 1 : 0);
 }
 
 llvm::SmallVector<llvm::Value*, 4>
@@ -85,11 +86,15 @@ easy::GetForwardArgs(easy::HighLevelLayout::HighLevelArg &ArgInF, easy::HighLeve
 
   for(size_t j = 0; j != ArgInF.Types_.size(); ++j) {
     Args.push_back(GetArg(ArgInWrapper.FirstParamIdx_ + j));
+    EASYJIT_RT_PASS_LOG("GetForwardArgs: position=%zu field=%zu wrapper_param=%zu\n",
+                        ArgPosition, j, ArgInWrapper.FirstParamIdx_ + j);
   }
   return Args;
 }
 
 Constant* easy::GetScalarArgument(ArgumentBase const& Arg, Type* T) {
+  EASYJIT_RT_PASS_LOG("GetScalarArgument: kind=%d type_ptr=%p\n",
+                      (int)Arg.kind(), (void*)T);
   switch(Arg.kind()) {
     case easy::ArgumentBase::AK_Int: {
       auto const *Int = Arg.as<easy::IntArgument>();
@@ -114,8 +119,11 @@ Constant* easy::GetScalarArgument(ArgumentBase const& Arg, Type* T) {
 llvm::Constant* easy::LinkPointerIfPossible(llvm::Module &M, easy::PtrArgument const &Ptr, Type* PtrTy) {
   auto &BT = easy::BitcodeTracker::GetTracker();
   void* PtrValue = const_cast<void*>(Ptr.get());
+  EASYJIT_RT_PASS_LOG("LinkPointerIfPossible: ptr=%p module=%p\n", PtrValue, (void*)&M);
   if(BT.hasGlobalMapping(PtrValue)) {
     const char* LName = std::get<0>(BT.getNameAndGlobalMapping(PtrValue));
+    EASYJIT_RT_PASS_LOG("LinkPointerIfPossible: has mapping name=%s\n",
+                        LName ? LName : "<null>");
     std::unique_ptr<Module> LM = BT.getModuleWithContext(PtrValue, M.getContext());
 
     if(!Linker::linkModules(M, std::move(LM), Linker::OverrideFromSrc,
@@ -125,17 +133,21 @@ llvm::Constant* easy::LinkPointerIfPossible(llvm::Module &M, easy::PtrArgument c
       if(GlobalVariable* G = dyn_cast<GlobalVariable>(GV)) {
         GV->setLinkage(llvm::Function::PrivateLinkage);
         if(GV->getType() != PtrTy) {
+          EASYJIT_RT_PASS_LOG("LinkPointerIfPossible: linked global cast name=%s\n", LName);
           return ConstantExpr::getPointerCast(GV, PtrTy);
         }
+        EASYJIT_RT_PASS_LOG("LinkPointerIfPossible: linked global name=%s\n", LName);
         return GV;
       }
       else if(llvm::Function* F = dyn_cast<llvm::Function>(GV)) {
         F->setLinkage(llvm::Function::PrivateLinkage);
+        EASYJIT_RT_PASS_LOG("LinkPointerIfPossible: linked function name=%s\n", LName);
         return F;
       }
       assert(false && "wtf");
     }
   }
+  EASYJIT_RT_PASS_LOG("LinkPointerIfPossible: no mapping ptr=%p\n", PtrValue);
   return nullptr;
 }
 
@@ -341,12 +353,16 @@ static llvm::Constant* BuildGlobalArrayPointer(Module &M,
 }
 
 bool easy::ApplyGlobalStructSnapshots(llvm::Module &M, llvm::StringRef TargetName, easy::Context const &C) {
+  EASYJIT_RT_PASS_LOG("ApplyGlobalStructSnapshots: target=%s bindings=%zu\n",
+                      TargetName.str().c_str(), C.getGlobalStructBindings().size());
   if (C.getGlobalStructBindings().empty())
     return false;
 
   auto &BT = easy::BitcodeTracker::GetTracker();
   void* HostFunction = BT.getAddress(TargetName.str());
   if (!HostFunction) {
+    EASYJIT_RT_PASS_LOG("ApplyGlobalStructSnapshots: no host function target=%s\n",
+                        TargetName.str().c_str());
     errs() << "WARNING: global snapshot could not resolve host function for "
            << TargetName << "\n";
     return false;
@@ -355,6 +371,8 @@ bool easy::ApplyGlobalStructSnapshots(llvm::Module &M, llvm::StringRef TargetNam
   GlobalMapping* Globals = nullptr;
   std::tie(std::ignore, Globals) = BT.getNameAndGlobalMapping(HostFunction);
   if (!Globals) {
+    EASYJIT_RT_PASS_LOG("ApplyGlobalStructSnapshots: no globals target=%s\n",
+                        TargetName.str().c_str());
     errs() << "WARNING: global snapshot has no global mapping table for "
            << TargetName << "\n";
     return false;
@@ -364,8 +382,14 @@ bool easy::ApplyGlobalStructSnapshots(llvm::Module &M, llvm::StringRef TargetNam
   llvm::DataLayout const &DL = M.getDataLayout();
 
   for (auto const &Binding : C.getGlobalStructBindings()) {
+    EASYJIT_RT_PASS_LOG("ApplyGlobalStructSnapshots: binding addr=%p whole=%d bytes=%zu fields=%zu arrays=%zu\n",
+                        Binding.Address_, (int)Binding.WholeSnapshot_,
+                        Binding.Data_.size(), Binding.FieldBindings_.size(),
+                        Binding.ArrayBindings_.size());
     const char* GlobalName = FindGlobalNameForAddress(Globals, Binding.Address_);
     if (!GlobalName) {
+      EASYJIT_RT_PASS_LOG("ApplyGlobalStructSnapshots: no symbol for addr=%p\n",
+                          Binding.Address_);
       errs() << "WARNING: global snapshot could not resolve symbol for host address "
              << Binding.Address_ << "\n";
       continue;
@@ -373,11 +397,15 @@ bool easy::ApplyGlobalStructSnapshots(llvm::Module &M, llvm::StringRef TargetNam
 
     GlobalVariable* GV = M.getNamedGlobal(GlobalName);
     if (!GV) {
+      EASYJIT_RT_PASS_LOG("ApplyGlobalStructSnapshots: no llvm global name=%s\n",
+                          GlobalName);
       errs() << "WARNING: global snapshot could not find llvm global " << GlobalName << "\n";
       continue;
     }
 
     if (Binding.WholeSnapshot_) {
+      EASYJIT_RT_PASS_LOG("ApplyGlobalStructSnapshots: whole snapshot global=%s bytes=%zu\n",
+                          GlobalName, Binding.Data_.size());
       auto InitValue =
           easy::GetAggregateConstantFromRaw(DL,
                                             GV->getValueType(),
@@ -397,6 +425,8 @@ bool easy::ApplyGlobalStructSnapshots(llvm::Module &M, llvm::StringRef TargetNam
     }
 
     for (auto const &FieldBinding : Binding.FieldBindings_) {
+      EASYJIT_RT_PASS_LOG("ApplyGlobalStructSnapshots: field global=%s offset=%zu bytes=%zu\n",
+                          GlobalName, FieldBinding.Offset_, FieldBinding.Data_.size());
       SmallVector<unsigned, 8> Indices;
       Type* FieldTy = nullptr;
       if (!FindLeafFieldPathByOffset(DL, GV->getValueType(), FieldBinding.Offset_, Indices, FieldTy)) {
@@ -419,6 +449,9 @@ bool easy::ApplyGlobalStructSnapshots(llvm::Module &M, llvm::StringRef TargetNam
     }
 
     for (auto const &ArrayBinding : Binding.ArrayBindings_) {
+      EASYJIT_RT_PASS_LOG("ApplyGlobalStructSnapshots: array global=%s offset=%zu count=%zu elem=%zu bytes=%zu\n",
+                          GlobalName, ArrayBinding.Offset_, ArrayBinding.Count_,
+                          ArrayBinding.ElementSize_, ArrayBinding.Data_.size());
       SmallVector<unsigned, 8> Indices;
       Type* FieldTy = nullptr;
       if (!FindLeafFieldPathByOffset(DL, GV->getValueType(), ArrayBinding.Offset_, Indices, FieldTy)) {
@@ -445,11 +478,15 @@ bool easy::ApplyGlobalStructSnapshots(llvm::Module &M, llvm::StringRef TargetNam
     Changed = true;
   }
 
+  EASYJIT_RT_PASS_LOG("ApplyGlobalStructSnapshots: end changed=%d\n", (int)Changed);
   return Changed;
 }
 
 static Constant* GetRawByteArrayPointer(Module &M,
                                         easy::StructArrayBinding const &Binding) {
+  EASYJIT_RT_PASS_LOG("GetRawByteArrayPointer: module=%p bytes=%zu elem=%zu count=%zu\n",
+                      (void*)&M, Binding.Data_.size(), Binding.ElementSize_,
+                      Binding.Count_);
   LLVMContext &Ctx = M.getContext();
   auto *I8 = Type::getInt8Ty(Ctx);
   SmallVector<uint8_t, 16> Bytes;
@@ -526,6 +563,9 @@ void easy::ApplyStructArrayBindings(llvm::IRBuilder<> &B,
                                     llvm::Type* StructTy,
                                     llvm::AllocaInst* Alloc) {
   for (auto const &Binding : Bindings) {
+    EASYJIT_RT_PASS_LOG("ApplyStructArrayBindings: offset=%zu count=%zu elem=%zu bytes=%zu\n",
+                        Binding.Offset_, Binding.Count_, Binding.ElementSize_,
+                        Binding.Data_.size());
     SmallVector<unsigned, 8> Indices;
     Type* FieldTy = nullptr;
     if (!FindLeafFieldPathByOffset(DL, StructTy, Binding.Offset_, Indices, FieldTy)) {
@@ -556,6 +596,8 @@ void easy::ApplyStructFieldBindings(llvm::IRBuilder<> &B,
                                     llvm::Type* StructTy,
                                     llvm::AllocaInst* Alloc) {
   for (auto const &Binding : Bindings) {
+    EASYJIT_RT_PASS_LOG("ApplyStructFieldBindings: offset=%zu bytes=%zu\n",
+                        Binding.Offset_, Binding.Data_.size());
     SmallVector<unsigned, 8> Indices;
     Type* FieldTy = nullptr;
     if (!FindLeafFieldPathByOffset(DL, StructTy, Binding.Offset_, Indices, FieldTy)) {
@@ -649,6 +691,7 @@ llvm::AllocaInst* easy::GetStructAlloc(llvm::IRBuilder<> &B,
 
   StoreStructField(B, DL, StructTy, (uint8_t const*)Data.data(), Alloc, GEP);
 
+  EASYJIT_RT_PASS_LOG("GetStructAlloc: done alloc=%p\n", (void*)Alloc);
   return Alloc;
 }
 
@@ -658,6 +701,10 @@ llvm::AllocaInst* easy::GetPartialStructAlloc(llvm::IRBuilder<> &B,
                                               llvm::Type* StructTy,
                                               llvm::Value* RuntimePtr) {
   AllocaInst* Alloc = B.CreateAlloca(StructTy);
+  EASYJIT_RT_PASS_LOG("GetPartialStructAlloc: struct_ty=%p runtime_ptr=%p alloc=%p fields=%zu arrays=%zu\n",
+                      (void*)StructTy, (void*)RuntimePtr, (void*)Alloc,
+                      Struct.getFieldBindings().size(),
+                      Struct.getArrayBindings().size());
   llvm::Align StructAlign = DL.getPrefTypeAlign(StructTy);
   uint64_t StructSize = DL.getTypeAllocSize(StructTy).getFixedValue();
 
@@ -674,6 +721,8 @@ llvm::AllocaInst* easy::GetPartialStructAlloc(llvm::IRBuilder<> &B,
 /// GEP / load / store instructions in the function body.
 /// Returns nullptr if no struct type can be found.
 llvm::Type* easy::FindPointeeStructType(llvm::Function &F, unsigned ArgIdx) {
+  EASYJIT_RT_PASS_LOG("FindPointeeStructType: fn=%s arg=%u\n",
+                      F.getName().str().c_str(), ArgIdx);
   Argument *Arg = F.getArg(ArgIdx);
 
   // First, check for byval attribute
@@ -697,13 +746,17 @@ llvm::Type* easy::FindPointeeStructType(llvm::Function &F, unsigned ArgIdx) {
     for (User *U : V->users()) {
       if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
         Type *SrcTy = GEP->getSourceElementType();
-        if (isa<StructType>(SrcTy))
+        if (isa<StructType>(SrcTy)) {
+          EASYJIT_RT_PASS_LOG("FindPointeeStructType: found via gep arg=%u\n", ArgIdx);
           return SrcTy;
+        }
       }
       if (auto *LI = dyn_cast<LoadInst>(U)) {
         Type *LoadedTy = LI->getType();
-        if (isa<StructType>(LoadedTy))
+        if (isa<StructType>(LoadedTy)) {
+          EASYJIT_RT_PASS_LOG("FindPointeeStructType: found via load arg=%u\n", ArgIdx);
           return LoadedTy;
+        }
       }
       // arg → store to alloca → load from alloca → GEP
       if (auto *SI = dyn_cast<StoreInst>(U)) {
@@ -727,6 +780,8 @@ llvm::Type* easy::FindPointeeStructType(llvm::Function &F, unsigned ArgIdx) {
 /// GEP / load instructions in the function body.
 /// Returns nullptr if no element type can be found.
 llvm::Type* easy::FindPointeeElementType(llvm::Function &F, unsigned ArgIdx) {
+  EASYJIT_RT_PASS_LOG("FindPointeeElementType: fn=%s arg=%u\n",
+                      F.getName().str().c_str(), ArgIdx);
   Argument *Arg = F.getArg(ArgIdx);
 
   // Collect all values that hold the pointer (including loads from allocas
@@ -742,12 +797,15 @@ llvm::Type* easy::FindPointeeElementType(llvm::Function &F, unsigned ArgIdx) {
 
     for (User *U : V->users()) {
       if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+        EASYJIT_RT_PASS_LOG("FindPointeeElementType: found via gep arg=%u\n", ArgIdx);
         return GEP->getSourceElementType();
       }
       if (auto *LI = dyn_cast<LoadInst>(U)) {
         // If the loaded type is not a pointer, it's the element type
-        if (!LI->getType()->isPointerTy())
+        if (!LI->getType()->isPointerTy()) {
+          EASYJIT_RT_PASS_LOG("FindPointeeElementType: found via load arg=%u\n", ArgIdx);
           return LI->getType();
+        }
       }
       // arg → store to alloca → load from alloca → GEP / load
       if (auto *SI = dyn_cast<StoreInst>(U)) {

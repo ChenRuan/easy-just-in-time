@@ -24,6 +24,7 @@
 ///
 
 #include <easy/runtime/RuntimePasses.h>
+#include "../SreDebugLog.h"
 
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Instructions.h>
@@ -42,19 +43,12 @@
 
 using namespace llvm;
 
-#ifndef EASYJIT_RUNTIME_DEBUG
-#define EASYJIT_RUNTIME_DEBUG 0
-#endif
-
-#if EASYJIT_RUNTIME_DEBUG
-#define CSP_LOG(...) do { std::fprintf(stderr, "[easyjit][csp] " __VA_ARGS__); std::fflush(stderr); } while(0)
-#else
-#define CSP_LOG(...) do {} while(0)
-#endif
+#define CSP_LOG(...) EASYJIT_SRE_LOG("[csp] " __VA_ARGS__)
 
 char easy::ConstStructPropagate::ID = 0;
 
 llvm::Pass* easy::createConstStructPropagatePass(llvm::StringRef Name) {
+  CSP_LOG("createConstStructPropagatePass: target=%s\n", Name.str().c_str());
   return new ConstStructPropagate(Name);
 }
 
@@ -65,6 +59,7 @@ namespace {
 static bool resolveGEPToAllocaOffset(Value *Ptr, const DataLayout &DL,
                                      AllocaInst *&OutAlloca,
                                      int64_t &OutOffset) {
+  CSP_LOG("resolveGEPToAllocaOffset: ptr=%p\n", (void*)Ptr);
   int64_t Offset = 0;
   Value *Base = Ptr;
 
@@ -72,8 +67,10 @@ static bool resolveGEPToAllocaOffset(Value *Ptr, const DataLayout &DL,
   while (true) {
     if (auto *GEP = dyn_cast<GetElementPtrInst>(Base)) {
       APInt GEPOffset(DL.getPointerSizeInBits(), 0);
-      if (!GEP->accumulateConstantOffset(DL, GEPOffset))
+      if (!GEP->accumulateConstantOffset(DL, GEPOffset)) {
+        CSP_LOG("resolveGEPToAllocaOffset: non-constant gep=%p\n", (void*)GEP);
         return false;
+      }
       Offset += GEPOffset.getSExtValue();
       Base = GEP->getPointerOperand();
     } else if (auto *BC = dyn_cast<BitCastInst>(Base)) {
@@ -84,11 +81,15 @@ static bool resolveGEPToAllocaOffset(Value *Ptr, const DataLayout &DL,
   }
 
   auto *AI = dyn_cast<AllocaInst>(Base);
-  if (!AI)
+  if (!AI) {
+    CSP_LOG("resolveGEPToAllocaOffset: base is not alloca base=%p\n", (void*)Base);
     return false;
+  }
 
   OutAlloca = AI;
   OutOffset = Offset;
+  CSP_LOG("resolveGEPToAllocaOffset: alloca=%p offset=%lld\n",
+          (void*)AI, (long long)Offset);
   return true;
 }
 

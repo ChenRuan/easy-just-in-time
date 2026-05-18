@@ -5,6 +5,7 @@
 // TryLightCompile() entry point defined here.
 
 #include "LightBackend.h"
+#include "SreDebugLog.h"
 
 #include <easy/runtime/BitcodeTracker.h>  // GlobalMapping
 #include <easy/runtime/Function.h>
@@ -35,19 +36,7 @@
 #include <string>
 #include <vector>
 
-#ifndef EASYJIT_RUNTIME_DEBUG
-#define EASYJIT_RUNTIME_DEBUG 0
-#endif
-
-#if EASYJIT_RUNTIME_DEBUG
-#define EASYJIT_RT_LOG(...)                                                      \
-  do {                                                                           \
-    std::fprintf(stderr, "[easyjit][runtime] " __VA_ARGS__);                     \
-    std::fflush(stderr);                                                         \
-  } while (0)
-#else
-#define EASYJIT_RT_LOG(...) do { } while (0)
-#endif
+#define EASYJIT_RT_LOG(...) EASYJIT_SRE_LOG("[runtime] " __VA_ARGS__)
 
 namespace easy {
 namespace light_backend {
@@ -56,6 +45,7 @@ namespace light_backend {
 
 Policy GetPolicyFromEnv() {
   const char *v = std::getenv("EASYJIT_LIGHT");
+  EASYJIT_RT_LOG("[light] GetPolicyFromEnv EASYJIT_LIGHT=%s\n", v ? v : "<null>");
   if (!v || !*v) return Policy::Off;
   if (std::strcmp(v, "off")   == 0 || std::strcmp(v, "0") == 0) return Policy::Off;
   if (std::strcmp(v, "try")   == 0 ||
@@ -172,6 +162,9 @@ static size_t MaterializePrivateGlobals(llvm::Module &M,
   size_t added = 0;
   const DataLayout &DL = M.getDataLayout();
   for (GlobalVariable &GV : M.globals()) {
+    EASYJIT_RT_LOG("[light] MaterializePrivateGlobals: inspect gv=%s linkage=%u has_init=%d\n",
+                   GV.getName().str().c_str(), (unsigned)GV.getLinkage(),
+                   (int)GV.hasInitializer());
     if (!GV.hasInitializer()) continue;
     if (!GV.hasPrivateLinkage() && !GV.hasInternalLinkage()) continue;
     Constant *Init = GV.getInitializer();
@@ -192,6 +185,8 @@ static size_t MaterializePrivateGlobals(llvm::Module &M,
     // know how to) reify those into a flat byte buffer here.
     Type *EltTy = GV.getValueType();
     uint64_t sz = DL.getTypeAllocSize(EltTy);
+    EASYJIT_RT_LOG("[light] MaterializePrivateGlobals: candidate gv=%s size=%llu\n",
+                   N.str().c_str(), (unsigned long long)sz);
     if (sz == 0) continue;
     if (sz > (1ull << 20)) continue; // 1 MiB cap; sanity guard
 
@@ -199,12 +194,18 @@ static size_t MaterializePrivateGlobals(llvm::Module &M,
 
     if (auto *CDS = dyn_cast<ConstantDataSequential>(Init)) {
       StringRef raw = CDS->getRawDataValues();
+      EASYJIT_RT_LOG("[light] MaterializePrivateGlobals: gv=%s ConstantDataSequential raw=%zu alloc=%llu\n",
+                     N.str().c_str(), raw.size(), (unsigned long long)sz);
       if (raw.size() > sz) continue;
       std::memcpy(buf.get(), raw.data(), raw.size());
       // Trailing alloc-size padding is already zero from value-init.
     } else if (isa<ConstantAggregateZero>(Init)) {
+      EASYJIT_RT_LOG("[light] MaterializePrivateGlobals: gv=%s zero aggregate\n",
+                     N.str().c_str());
       // buf is already zero-initialised.
     } else if (auto *CI = dyn_cast<ConstantInt>(Init)) {
+      EASYJIT_RT_LOG("[light] MaterializePrivateGlobals: gv=%s constant int width=%u\n",
+                     N.str().c_str(), CI->getBitWidth());
       // Write the integer in HOST byte order. The reader is JIT'd code
       // doing LDR with target data endian; in the light backend the JIT
       // process always runs the code it produces (same SCTLR_EL1.EE),
@@ -221,6 +222,8 @@ static size_t MaterializePrivateGlobals(llvm::Module &M,
       // array data uses ConstantDataSequential, which already stores
       // host-endian raw bytes — see the CDS branch above).
     } else {
+      EASYJIT_RT_LOG("[light] MaterializePrivateGlobals: skip gv=%s unsupported initializer\n",
+                     N.str().c_str());
       continue; // structurally interesting initialiser; skip.
     }
 
@@ -233,6 +236,8 @@ static size_t MaterializePrivateGlobals(llvm::Module &M,
     s.name    = nameCopy.get();
     s.address = (const void *)buf.get();
     syms.push_back(s);
+    EASYJIT_RT_LOG("[light] MaterializePrivateGlobals: add symbol %s -> %p\n",
+                   s.name, s.address);
 
     dataBufs.push_back(std::move(buf));
     nameBufs.push_back(std::move(nameCopy));
@@ -256,8 +261,10 @@ static size_t MaterializePrivateGlobals(llvm::Module &M,
 // built as executable AArch64 code (LE or BE).
 static bool HostIsAArch64() {
 #if defined(__aarch64__) || defined(__arm64__)
+  EASYJIT_RT_LOG("[light] HostIsAArch64: yes\n");
   return true;
 #else
+  EASYJIT_RT_LOG("[light] HostIsAArch64: no\n");
   return false;
 #endif
 }
@@ -383,14 +390,18 @@ static std::vector<::light::GlobalSymbol>
 BuildLightGlobals(GlobalMapping *Globals, size_t &countOut) {
   std::vector<::light::GlobalSymbol> out;
   countOut = 0;
+  EASYJIT_RT_LOG("[light] BuildLightGlobals: globals=%p\n", (void*)Globals);
   if (!Globals) return out;
   for (GlobalMapping *GM = Globals; GM && GM->Name; ++GM) {
     ::light::GlobalSymbol s;
     s.name = GM->Name;
     s.address = GM->Address;
     out.push_back(s);
+    EASYJIT_RT_LOG("[light] BuildLightGlobals: map %s -> %p\n",
+                   s.name ? s.name : "<null>", s.address);
   }
   countOut = out.size();
+  EASYJIT_RT_LOG("[light] BuildLightGlobals: count=%zu\n", countOut);
   return out;
 }
 
@@ -401,13 +412,19 @@ Report TryLightCompile(const char *Name,
                        std::unique_ptr<easy::Function> &out,
                        Policy policy) {
   Report rep;
+  EASYJIT_RT_LOG("[light] TryLightCompile: begin name=%s globals=%p ctx_ref=%p module_ref=%p out_ref=%p policy=%s\n",
+                 Name ? Name : "<null>", (void*)Globals, (void*)Ctx.get(),
+                 (void*)M.get(), (void*)&out, PolicyName(policy));
 
   if (policy == Policy::Off) {
+    EASYJIT_RT_LOG("[light] TryLightCompile: policy off\n");
     rep.outcome = Outcome::SkippedByPolicy;
     return rep;
   }
 
   if (!Name || !M || !Ctx) {
+    EASYJIT_RT_LOG("[light] TryLightCompile: null input name=%p module=%p ctx=%p\n",
+                   (const void*)Name, (void*)M.get(), (void*)Ctx.get());
     rep.outcome = Outcome::SkippedByPolicy;
     rep.reason  = "null name/module/context";
     return rep;
@@ -437,6 +454,7 @@ Report TryLightCompile(const char *Name,
   // Build a light-globals view from EasyJIT's own mapping table.
   size_t nsyms = 0;
   std::vector<::light::GlobalSymbol> syms = BuildLightGlobals(Globals, nsyms);
+  EASYJIT_RT_LOG("[light] TryLightCompile: after globals nsyms=%zu\n", nsyms);
 
   // Reify any PrivateLinkage GVs whose initializer is raw byte data
   // (e.g. the @__easy_snapshot_struct_array buffer that
@@ -460,6 +478,8 @@ Report TryLightCompile(const char *Name,
 
   ::light::Result r;
   void *code = ::light::compile(*F, r, symsP, nsyms);
+  EASYJIT_RT_LOG("[light] TryLightCompile: light::compile returned code=%p status=%d reason=%s bytes=%zu\n",
+                 code, (int)r.status, r.reason.c_str(), r.codeBytes);
 
   if (r.status != ::light::Status::Ok || !code) {
     EASYJIT_RT_LOG("[light] REJECTED fn=%s status=%d reason=%s\n",
@@ -500,11 +520,15 @@ Report TryLightCompile(const char *Name,
   // Transfer ownership of the code page + module into the holder.
   const size_t codeSize = (size_t)sysconf(_SC_PAGESIZE) * 4;
   auto *holderRaw = new LightCodeHolder(code, codeSize, std::move(Ctx), std::move(M));
+  EASYJIT_RT_LOG("[light] TryLightCompile: holder=%p codeSize=%zu dataBufs=%zu nameBufs=%zu\n",
+                 (void*)holderRaw, codeSize, dataBufs.size(), nameBufs.size());
   holderRaw->dataBuffers_ = std::move(dataBufs);
   holderRaw->nameBuffers_ = std::move(nameBufs);
   std::unique_ptr<LLVMHolder> Holder(holderRaw);
 
   out.reset(new Function(code, std::move(Holder)));
+  EASYJIT_RT_LOG("[light] TryLightCompile: success function=%p raw=%p\n",
+                 (void*)out.get(), code);
   rep.outcome = Outcome::Succeeded;
   return rep;
 }

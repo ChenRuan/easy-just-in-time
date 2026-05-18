@@ -13,15 +13,20 @@
 #include <llvm/Support/raw_ostream.h>
 #include <numeric>
 
+#include "../SreDebugLog.h"
+
 using namespace llvm;
 
 char easy::DevirtualizeConstant::ID = 0;
 
 llvm::Pass* easy::createDevirtualizeConstantPass(llvm::StringRef Name) {
+  EASYJIT_SRE_LOG("[pass] createDevirtualizeConstantPass: target=%s\n",
+                  Name.str().c_str());
   return new DevirtualizeConstant(Name);
 }
 
 static ConstantInt* getVTableHostAddress(Value& V) {
+    EASYJIT_SRE_LOG("[pass] Devirtualize: inspect vtable value=%p\n", (void*)&V);
     auto* VTable = dyn_cast<LoadInst>(&V);
     if(!VTable)
       return nullptr;
@@ -46,11 +51,16 @@ static ConstantInt* getVTableHostAddress(Value& V) {
 }
 
 static Function* findFunctionAndLinkModules(Module& M, void* HostValue) {
+    EASYJIT_SRE_LOG("[pass] Devirtualize: find/link host=%p module=%p\n",
+                    HostValue, (void*)&M);
     auto &BT = easy::BitcodeTracker::GetTracker();
     const char* FName = std::get<0>(BT.getNameAndGlobalMapping(HostValue));
 
-    if(!FName)
+    if(!FName) {
+      EASYJIT_SRE_LOG("[pass] Devirtualize: no function name for host=%p\n", HostValue);
       return nullptr;
+    }
+    EASYJIT_SRE_LOG("[pass] Devirtualize: host=%p name=%s\n", HostValue, FName);
 
     std::unique_ptr<Module> LM = BT.getModuleWithContext(HostValue, M.getContext());
 
@@ -60,6 +70,7 @@ static Function* findFunctionAndLinkModules(Module& M, void* HostValue) {
       GlobalValue *GV = M.getNamedValue(FName);
       if(Function* F = dyn_cast<Function>(GV)) {
         F->setLinkage(Function::PrivateLinkage);
+        EASYJIT_SRE_LOG("[pass] Devirtualize: linked function=%s\n", FName);
         return F;
       }
       else {
@@ -72,6 +83,7 @@ static Function* findFunctionAndLinkModules(Module& M, void* HostValue) {
 template<class IIter>
 bool Devirtualize(IIter it, IIter end) {
   bool Changed = false;
+  EASYJIT_SRE_LOG("[pass] Devirtualize: scan begin\n");
 
   // We are trying to match %1 from CallInsts like %3
   // Matching %1 means we are doing a virtualized call in %3.
@@ -106,14 +118,19 @@ bool Devirtualize(IIter it, IIter end) {
     void** RuntimeLoadedValue = *(void***)(uintptr_t)(VTable->getZExtValue());
 
     void* CalledPtrHostValue = *RuntimeLoadedValue;
+    EASYJIT_SRE_LOG("[pass] Devirtualize: runtime vtable=%p called=%p\n",
+                    (void*)RuntimeLoadedValue, CalledPtrHostValue);
     llvm::Function* F = findFunctionAndLinkModules(*LLI->getParent()->getParent()->getParent(), CalledPtrHostValue);
     if(!F)
       continue;
 
     LI->replaceAllUsesWith(F);
+    EASYJIT_SRE_LOG("[pass] Devirtualize: replaced indirect call target with %s\n",
+                    F->getName().str().c_str());
 
     Changed = true;
   }
+  EASYJIT_SRE_LOG("[pass] Devirtualize: scan end changed=%d\n", (int)Changed);
   return Changed;
 }
 
@@ -174,13 +191,19 @@ void RecastCalls(IIter it, IIter end) {
 }
 
 bool easy::DevirtualizeConstant::runOnFunction(llvm::Function &F) {
+  EASYJIT_SRE_LOG("[pass] DevirtualizeConstant::runOnFunction: fn=%s target=%s\n",
+                  F.getName().str().c_str(), TargetName_.str().c_str());
   if(F.getName() != TargetName_)
     return false;
 
   if(Devirtualize(inst_begin(F), inst_end(F))) {
     RecastCalls(inst_begin(F), inst_end(F));
+    EASYJIT_SRE_LOG("[pass] DevirtualizeConstant::runOnFunction: changed fn=%s\n",
+                    F.getName().str().c_str());
     return true;
   }
+  EASYJIT_SRE_LOG("[pass] DevirtualizeConstant::runOnFunction: no change fn=%s\n",
+                  F.getName().str().c_str());
   return false;
 }
 

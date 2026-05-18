@@ -13,6 +13,7 @@
 #include <numeric>
 
 #include "InlineParametersHelper.h"
+#include "../SreDebugLog.h"
 
 using namespace llvm;
 using easy::HighLevelLayout;
@@ -20,10 +21,14 @@ using easy::HighLevelLayout;
 char easy::InlineParameters::ID = 0;
 
 llvm::Pass* easy::createInlineParametersPass(llvm::StringRef Name) {
+  EASYJIT_SRE_LOG("[pass] createInlineParametersPass: target=%s\n",
+                  Name.str().c_str());
   return new InlineParameters(Name);
 }
 
 HighLevelLayout GetNewLayout(easy::Context const &C, HighLevelLayout &HLL) {
+  EASYJIT_SRE_LOG("[pass] InlineParameters:GetNewLayout begin ctx_size=%zu old_args=%zu\n",
+                  C.size(), HLL.Args_.size());
 
   assert(C.size() == HLL.Args_.size());
 
@@ -58,7 +63,12 @@ HighLevelLayout GetNewLayout(easy::Context const &C, HighLevelLayout &HLL) {
   for(size_t new_arg = 0, ParamIdx = 0; new_arg != NewHLL.Args_.size(); ++new_arg) {
     NewHLL.Args_[new_arg].FirstParamIdx_ = ParamIdx;
     ParamIdx += NewHLL.Args_[new_arg].Types_.size();
+    EASYJIT_SRE_LOG("[pass] InlineParameters:GetNewLayout arg=%zu first_param=%zu fields=%zu\n",
+                    new_arg, NewHLL.Args_[new_arg].FirstParamIdx_,
+                    NewHLL.Args_[new_arg].Types_.size());
   }
+  EASYJIT_SRE_LOG("[pass] InlineParameters:GetNewLayout end new_args=%zu\n",
+                  NewHLL.Args_.size());
   return NewHLL;
 }
 
@@ -68,6 +78,8 @@ FunctionType* GetWrapperTy(HighLevelLayout &HLL) {
     Args.push_back(HLL.StructReturn_);
   for(auto &HLArg : HLL.Args_)
     Args.insert(Args.end(), HLArg.Types_.begin(), HLArg.Types_.end());
+  EASYJIT_SRE_LOG("[pass] InlineParameters:GetWrapperTy args=%zu has_sret=%d\n",
+                  Args.size(), HLL.StructReturn_ ? 1 : 0);
   return FunctionType::get(HLL.Return_, Args, false);
 }
 
@@ -85,16 +97,22 @@ void GetInlineArgs(easy::Context const &C,
   for(size_t i = 0, n = C.size(); i != n; ++i) {
     auto const &Arg = C.getArgumentMapping(i);
     auto &ArgInF = FHLL.Args_[i];
+    EASYJIT_SRE_LOG("[pass] InlineParameters:GetInlineArgs arg=%zu kind=%d first_param=%zu types=%zu\n",
+                    i, (int)Arg.kind(), ArgInF.FirstParamIdx_,
+                    ArgInF.Types_.size());
 
     switch(Arg.kind()) {
 
       case easy::ArgumentBase::AK_Forward: {
         auto Forward = GetForwardArgs(ArgInF, FHLL, Wrapper, WrapperHLL);
         Args.insert(Args.end(), Forward.begin(), Forward.end());
+        EASYJIT_SRE_LOG("[pass] InlineParameters:GetInlineArgs arg=%zu forward values=%zu\n",
+                        i, Forward.size());
       } break;
       case easy::ArgumentBase::AK_Int:
       case easy::ArgumentBase::AK_Float: {
         Args.push_back(easy::GetScalarArgument(Arg, ArgInF.Types_[0]));
+        EASYJIT_SRE_LOG("[pass] InlineParameters:GetInlineArgs arg=%zu scalar constant\n", i);
       } break;
 
       case easy::ArgumentBase::AK_Ptr: {
@@ -102,10 +120,15 @@ void GetInlineArgs(easy::Context const &C,
         Type* PtrTy = FHLL.Args_[i].Types_[0];
 
         Constant* PtrVal = easy::GetScalarArgument(Arg, PtrTy);
-        if(Constant* LinkedPtr = easy::LinkPointerIfPossible(*Wrapper.getParent(), *Ptr, PtrTy))
+        bool Linked = false;
+        if(Constant* LinkedPtr = easy::LinkPointerIfPossible(*Wrapper.getParent(), *Ptr, PtrTy)) {
           PtrVal = LinkedPtr;
+          Linked = true;
+        }
 
         Args.push_back(PtrVal);
+        EASYJIT_SRE_LOG("[pass] InlineParameters:GetInlineArgs arg=%zu pointer ptr=%p linked=%d\n",
+                        i, Ptr->get(), (int)Linked);
       } break;
 
       case easy::ArgumentBase::AK_Array: {
@@ -123,6 +146,8 @@ void GetInlineArgs(easy::Context const &C,
         Constant* Indices[] = {Zero, Zero};
         Constant* PtrVal = ConstantExpr::getInBoundsGetElementPtr(ArrayConst->getType(), GV, Indices);
         Args.push_back(PtrVal);
+        EASYJIT_SRE_LOG("[pass] InlineParameters:GetInlineArgs arg=%zu array count=%zu elem=%zu\n",
+                        i, Array->getCount(), Array->getElementSize());
       } break;
 
       case easy::ArgumentBase::AK_Struct: {
@@ -138,6 +163,8 @@ void GetInlineArgs(easy::Context const &C,
           AllocaInst* ParamAlloc = easy::GetStructAlloc(B, DL, *Struct, StructType);
           easy::ApplyStructArrayBindings(B, DL, Struct->getArrayBindings(), StructType, ParamAlloc);
           Args.push_back(ParamAlloc);
+          EASYJIT_SRE_LOG("[pass] InlineParameters:GetInlineArgs arg=%zu struct by pointer alloc=%p\n",
+                          i, (void*)ParamAlloc);
         } else if (ArgInF.StructByArray_) {
           // struct is passed as an array
           Type* ArrayTy = ArgInF.Types_[0];
@@ -158,6 +185,8 @@ void GetInlineArgs(easy::Context const &C,
 
           Constant* ArrayConst = ConstantArray::get(cast<ArrayType>(ArrayTy), ArrayValues);
           Args.push_back(ArrayConst);
+          EASYJIT_SRE_LOG("[pass] InlineParameters:GetInlineArgs arg=%zu struct by array fields=%zu\n",
+                          i, N);
         } else {
           // struct is passed by value (may be many values)
           size_t N = ArgInF.Types_.size();
@@ -171,6 +200,8 @@ void GetInlineArgs(easy::Context const &C,
 
             Args.push_back(FieldValue);
             RawOffset += RawSize;
+            EASYJIT_SRE_LOG("[pass] InlineParameters:GetInlineArgs arg=%zu struct field=%zu raw_size=%zu\n",
+                            i, ParamIdx, RawSize);
           }
         }
       } break;
@@ -189,6 +220,8 @@ void GetInlineArgs(easy::Context const &C,
         assert(StructType && "Cannot discover struct type for partial-struct parameter");
         AllocaInst* ParamAlloc = easy::GetPartialStructAlloc(B, DL, *Struct, StructType, Forward[0]);
         Args.push_back(ParamAlloc);
+        EASYJIT_SRE_LOG("[pass] InlineParameters:GetInlineArgs arg=%zu partial struct alloc=%p\n",
+                        i, (void*)ParamAlloc);
       } break;
 
       case easy::ArgumentBase::AK_Module: {
@@ -217,6 +250,8 @@ void GetInlineArgs(easy::Context const &C,
         FunctionInM->setLinkage(Function::PrivateLinkage);
 
         Args.push_back(FunctionInM);
+        EASYJIT_SRE_LOG("[pass] InlineParameters:GetInlineArgs arg=%zu module function=%s\n",
+                        i, FunctionName.str().c_str());
 
       } break;
     }
@@ -248,12 +283,16 @@ void RemapAttributes(Function const &F, HighLevelLayout const& HLL, Function &Wr
 }
 
 Function* CreateWrapperFun(Module &M, Function &F, HighLevelLayout &HLL, easy::Context const &C) {
+  EASYJIT_SRE_LOG("[pass] InlineParameters:CreateWrapperFun begin fn=%s module=%p\n",
+                  F.getName().str().c_str(), (void*)&M);
   LLVMContext &CC = M.getContext();
 
   HighLevelLayout NewHLL(GetNewLayout(C, HLL));
   FunctionType *WrapperTy = GetWrapperTy(NewHLL);
 
   Function* Wrapper = Function::Create(WrapperTy, Function::ExternalLinkage, "", &M);
+  EASYJIT_SRE_LOG("[pass] InlineParameters:CreateWrapperFun wrapper=%p args=%zu\n",
+                  (void*)Wrapper, Wrapper->arg_size());
 
   BasicBlock* BB = BasicBlock::Create(CC, "", Wrapper);
   IRBuilder<> B(BB);
@@ -262,6 +301,8 @@ Function* CreateWrapperFun(Module &M, Function &F, HighLevelLayout &HLL, easy::C
   GetInlineArgs(C, F, HLL, *Wrapper, NewHLL, Args, B);
 
   Value* Call = B.CreateCall(&F, Args);
+  EASYJIT_SRE_LOG("[pass] InlineParameters:CreateWrapperFun call args=%zu ret_void=%d\n",
+                  Args.size(), Call->getType()->isVoidTy() ? 1 : 0);
 
   if(HLL.StructReturn_) {
     Wrapper->arg_begin()->addAttr(Attribute::StructRet);
@@ -281,10 +322,16 @@ Function* CreateWrapperFun(Module &M, Function &F, HighLevelLayout &HLL, easy::C
 bool easy::InlineParameters::runOnModule(llvm::Module &M) {
 
   easy::Context const &C = getAnalysis<ContextAnalysis>().getContext();
+  EASYJIT_SRE_LOG("[pass] InlineParameters::runOnModule begin target=%s module=%p ctx_size=%zu\n",
+                  TargetName_.str().c_str(), (void*)&M, C.size());
   llvm::Function* F = M.getFunction(TargetName_);
   assert(F);
+  EASYJIT_SRE_LOG("[pass] InlineParameters::runOnModule found fn=%p args=%zu\n",
+                  (void*)F, F->arg_size());
 
-  easy::ApplyGlobalStructSnapshots(M, TargetName_, C);
+  bool GlobalChanged = easy::ApplyGlobalStructSnapshots(M, TargetName_, C);
+  EASYJIT_SRE_LOG("[pass] InlineParameters::runOnModule global snapshots changed=%d\n",
+                  (int)GlobalChanged);
 
   HighLevelLayout HLL(C, *F);
   llvm::Function* WrapperFun = CreateWrapperFun(M, *F, HLL, C);
@@ -297,6 +344,8 @@ bool easy::InlineParameters::runOnModule(llvm::Module &M) {
   // add metadata to identify the entry function
   easy::MarkAsEntry(*WrapperFun);
 
+  EASYJIT_SRE_LOG("[pass] InlineParameters::runOnModule end wrapper=%p name=%s\n",
+                  (void*)WrapperFun, WrapperFun->getName().str().c_str());
 
   return true;
 }

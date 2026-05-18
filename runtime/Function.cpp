@@ -6,6 +6,7 @@
 #include <easy/runtime/Function.h>
 #include <easy/runtime/RuntimePasses.h>
 #include <easy/runtime/LLVMHolderImpl.h>
+#include "SreDebugLog.h"
 #if !EASYJIT_LIGHT_BACKEND_ONLY
 #include <easy/runtime/MinimalOrcJIT.h>
 #endif
@@ -49,19 +50,7 @@
 #include <llvm/IR/Verifier.h>
 #endif
 
-#ifndef EASYJIT_RUNTIME_DEBUG
-#define EASYJIT_RUNTIME_DEBUG 0
-#endif
-
-#if EASYJIT_RUNTIME_DEBUG
-#define EASYJIT_RT_LOG(...)                                                      \
-  do {                                                                           \
-    std::fprintf(stderr, "[easyjit][runtime] " __VA_ARGS__);                     \
-    std::fflush(stderr);                                                         \
-  } while (0)
-#else
-#define EASYJIT_RT_LOG(...) do { } while (0)
-#endif
+#define EASYJIT_RT_LOG(...) EASYJIT_SRE_LOG("[runtime] " __VA_ARGS__)
 
 
 using namespace easy;
@@ -103,22 +92,32 @@ private:
 static bool CanFallbackToOriginalFunction(easy::Context const& C,
                                           llvm::Module const& M,
                                           const char* Name) {
+  EASYJIT_RT_LOG("CanFallbackToOriginalFunction: begin name=%s ctx_size=%zu\n",
+                 Name ? Name : "<null>", C.size());
   if (!Name)
     return false;
 
   llvm::Function *F = M.getFunction(Name);
-  if (!F)
+  if (!F) {
+    EASYJIT_RT_LOG("CanFallbackToOriginalFunction: no function\n");
     return false;
+  }
 
-  if (C.size() != F->arg_size())
+  if (C.size() != F->arg_size()) {
+    EASYJIT_RT_LOG("CanFallbackToOriginalFunction: arg mismatch ctx=%zu fn=%u\n",
+                   C.size(), (unsigned)F->arg_size());
     return false;
+  }
 
   for (size_t I = 0; I < C.size(); ++I) {
     auto const *Forward = C.getArgumentMapping(I).as<easy::ForwardArgument>();
-    if (!Forward || Forward->get() != I)
+    if (!Forward || Forward->get() != I) {
+      EASYJIT_RT_LOG("CanFallbackToOriginalFunction: arg %zu not identity forward\n", I);
       return false;
+    }
   }
 
+  EASYJIT_RT_LOG("CanFallbackToOriginalFunction: yes\n");
   return true;
 }
 
@@ -252,6 +251,7 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
   // unchanged.
 
   llvm::legacy::PassManager MPM;
+  EASYJIT_RT_LOG("Optimize: add TargetTransformInfo pass\n");
 #if !EASYJIT_LIGHT_BACKEND_ONLY
   MPM.add(llvm::createTargetTransformInfoWrapperPass(TM->getTargetIRAnalysis()));
 #else
@@ -260,18 +260,26 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
   // on accurate cost modeling.
   MPM.add(llvm::createTargetTransformInfoWrapperPass(llvm::TargetIRAnalysis()));
 #endif
+  EASYJIT_RT_LOG("Optimize: add ContextAnalysis pass ctx_size=%zu\n", C.size());
   MPM.add(easy::createContextAnalysisPass(C));
+  EASYJIT_RT_LOG("Optimize: add InlineParameters pass target=%s\n", Name ? Name : "<null>");
   MPM.add(easy::createInlineParametersPass(Name));
+  EASYJIT_RT_LOG("Optimize: add DevirtualizeConstant pass target=%s\n", Name ? Name : "<null>");
   MPM.add(easy::createDevirtualizeConstantPass(Name));
+  EASYJIT_RT_LOG("Optimize: add FunctionInlining pass opt=%u size=%u\n", OptLevel, OptSize);
   // Inline the wrapper -> original-function call (critical).
   MPM.add(llvm::createFunctionInliningPass(OptLevel, OptSize, false));
   // Custom lightweight propagator: alloca/store/GEP/load -> const.
+  EASYJIT_RT_LOG("Optimize: add ConstStructPropagate pass #1 target=%s\n", Name ? Name : "<null>");
   MPM.add(easy::createConstStructPropagatePass(Name));
   // Promote remaining allocas to SSA.
+  EASYJIT_RT_LOG("Optimize: add mem2reg pass\n");
   MPM.add(llvm::createPromoteMemoryToRegisterPass());
   // Second round picks up constants exposed by mem2reg.
+  EASYJIT_RT_LOG("Optimize: add ConstStructPropagate pass #2 target=%s\n", Name ? Name : "<null>");
   MPM.add(easy::createConstStructPropagatePass(Name));
   // Canonicalize simple arithmetic and casts after constants are exposed.
+  EASYJIT_RT_LOG("Optimize: add InstCombine pass\n");
   MPM.add(llvm::createInstructionCombiningPass());
   // Scalar loop unroll (light backend friendly).
   //
@@ -290,6 +298,7 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
   //   -fno-vectorize -fno-slp-vectorize
   // see runtime/LightBackend_LIMITATIONS.md.
   if (OptLevel >= 2) {
+    EASYJIT_RT_LOG("Optimize: add loop canonicalization/unroll passes\n");
     MPM.add(llvm::createLoopSimplifyPass());
     MPM.add(llvm::createLCSSAPass());
     MPM.add(llvm::createLoopRotatePass());
@@ -303,6 +312,7 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
     // The downstream CFGSimplify + the light backend's per-instruction
     // emitter handle the loop-unroll output without a second pass.
   }
+  EASYJIT_RT_LOG("Optimize: add CFGSimplification/Internalize/GlobalDCE/StripDeadPrototypes\n");
   // Minimal cleanup.
   MPM.add(llvm::createCFGSimplificationPass());
   MPM.add(llvm::createInternalizePass([Name](const llvm::GlobalValue &GV) {
@@ -328,11 +338,14 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
 }
 
 static void DisableRecursiveJit(llvm::Module &M, const char *EntryName) {
+  EASYJIT_RT_LOG("DisableRecursiveJit: begin entry=%s module=%p\n",
+                 EntryName ? EntryName : "<null>", (void*)&M);
   if (!EntryName)
     return;
 
   for (const char *CtorDtorName : {"llvm.global_ctors", "llvm.global_dtors"}) {
     if (llvm::GlobalVariable *GV = M.getGlobalVariable(CtorDtorName)) {
+      EASYJIT_RT_LOG("DisableRecursiveJit: erase %s\n", CtorDtorName);
       GV->replaceAllUsesWith(llvm::UndefValue::get(GV->getType()));
       GV->eraseFromParent();
     }
@@ -346,6 +359,8 @@ static void DisableRecursiveJit(llvm::Module &M, const char *EntryName) {
     if (F.getName() == "register_layout")
       continue;
 
+    EASYJIT_RT_LOG("DisableRecursiveJit: externalize helper %s\n",
+                   F.getName().str().c_str());
     F.deleteBody();
     F.setComdat(nullptr);
     F.setSection("");
@@ -439,15 +454,21 @@ static void MapGlobals(easy::detail::MinimalOrcJIT& JIT, GlobalMapping* Globals)
 #endif // !EASYJIT_LIGHT_BACKEND_ONLY
 
 static void WriteOptimizedToFile(llvm::Module const &M, std::string const& File) {
+  EASYJIT_RT_LOG("WriteOptimizedToFile: file=%s module=%p\n",
+                 File.empty() ? "<empty>" : File.c_str(), (const void*)&M);
   if(File.empty())
     return;
   std::error_code Error;
   llvm::raw_fd_ostream Out(File, Error, llvm::sys::fs::OF_None);
 
-  if(Error)
+  if(Error) {
+    EASYJIT_RT_LOG("WriteOptimizedToFile: open failed file=%s error=%s\n",
+                   File.c_str(), Error.message().c_str());
     throw CouldNotOpenFile(Error.message());
+  }
 
   Out << M;
+  EASYJIT_RT_LOG("WriteOptimizedToFile: done file=%s\n", File.c_str());
 }
 
 static std::string GetDumpFileWithSuffix(std::string File, llvm::StringRef Suffix) {
@@ -555,6 +576,10 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
   std::unique_ptr<llvm::Module> M;
   std::unique_ptr<llvm::LLVMContext> Ctx;
   std::tie(M, Ctx) = BT.getModule(Addr);
+  if (!M || !Ctx) {
+    EASYJIT_RT_LOG("Function::Compile: null module/context after tracker lookup addr=%p module=%p ctx=%p\n",
+                   Addr, (void*)M.get(), (void*)Ctx.get());
+  }
   EASYJIT_RT_LOG("Function::Compile: module loaded module=%p ctx=%p module_triple=%s datalayout=%s\n",
                  (void*)M.get(),
                  (void*)Ctx.get(),
@@ -578,6 +603,8 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
   }
 
   Optimize(*M, Name, C, OptLevel, OptSize);
+  EASYJIT_RT_LOG("Function::Compile: Optimize complete module=%p ctx=%p\n",
+                 (void*)M.get(), (void*)Ctx.get());
 
   EASYJIT_RT_LOG("Function::Compile: write final-ir begin\n");
   WriteOptimizedToFile(*M, C.getDebugFile());
@@ -605,6 +632,8 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
       policy = easy::light_backend::Policy::Try;
 #endif
     if (policy != easy::light_backend::Policy::Off) {
+      EASYJIT_RT_LOG("Function::Compile: TryLightCompile begin policy=%s\n",
+                     easy::light_backend::PolicyName(policy));
       std::unique_ptr<Function> lightFn;
       auto rep = easy::light_backend::TryLightCompile(
           Name, Globals, Ctx, M, lightFn, policy);
@@ -683,7 +712,10 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
       " (light-only runtime, LightBackend not engaged)");
 #else
   EASYJIT_RT_LOG("Function::Compile: CompileAndWrap begin\n");
-  return CompileAndWrap(Name, Globals, std::move(Ctx), std::move(M));
+  auto Result = CompileAndWrap(Name, Globals, std::move(Ctx), std::move(M));
+  EASYJIT_RT_LOG("Function::Compile: CompileAndWrap returned function=%p raw=%p\n",
+                 (void*)Result.get(), Result ? Result->getRawPointer() : nullptr);
+  return Result;
 #endif
 }
 
