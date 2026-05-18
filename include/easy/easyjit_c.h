@@ -52,11 +52,13 @@ const char* easyjit_get_last_error(void);
 /**
  * Explicitly run EasyJIT bitcode registration for the current linked image.
  *
- * Standard ELF loaders normally execute EasyJIT's generated .init_array
- * constructor automatically.  Custom embedded loaders that only resolve and
- * call selected symbols may skip .init_array; call this once after loading the
- * image and before calling easyjit_compile() or any business entry that uses
- * EasyJIT.  The operation is idempotent.
+ * This symbol is generated into each image by EasyJITPass when that image
+ * contains at least one EASY_JIT_EXPOSE target.  Standard ELF loaders normally
+ * execute EasyJIT's generated .init_array constructor automatically.  Custom
+ * embedded loaders that only resolve and call selected symbols may skip
+ * .init_array; call this once after loading the image and before calling
+ * easyjit_compile() or any business entry that uses EasyJIT.  The operation is
+ * idempotent.
  */
 void easyjit_register_module(void);
 

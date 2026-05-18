@@ -76,11 +76,6 @@ BitcodeTracker::ModuleContextPair BitcodeTracker::getModule(void* FPtr) {
 extern "C" {
 using easyjit_register_module_fn_t = void (*)();
 
-extern easyjit_register_module_fn_t __start_easyjit_reg_fns[]
-    __attribute__((weak));
-extern easyjit_register_module_fn_t __stop_easyjit_reg_fns[]
-    __attribute__((weak));
-
 void easyjit_register_module_range(void *Start, void *Stop) {
   auto *Begin = static_cast<easyjit_register_module_fn_t *>(Start);
   auto *End = static_cast<easyjit_register_module_fn_t *>(Stop);
@@ -103,11 +98,6 @@ void easyjit_register_module_range(void *Start, void *Stop) {
   }
   EASYJIT_SRE_LOG("[tracker] easyjit_register_module_range: done entries=%zu\n",
                   Count);
-}
-
-void easyjit_register_module(void) {
-  easyjit_register_module_range((void *)__start_easyjit_reg_fns,
-                                (void *)__stop_easyjit_reg_fns);
 }
 
 void easy_register(void* FPtr, const char* Name, GlobalMapping* Globals, const char* Bitcode, size_t BitcodeLen) {
