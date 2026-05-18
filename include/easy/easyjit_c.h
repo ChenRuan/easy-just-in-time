@@ -49,6 +49,20 @@ typedef enum {
  */
 const char* easyjit_get_last_error(void);
 
+/**
+ * Explicitly run EasyJIT bitcode registration for the current linked image.
+ *
+ * Standard ELF loaders normally execute EasyJIT's generated .init_array
+ * constructor automatically.  Custom embedded loaders that only resolve and
+ * call selected symbols may skip .init_array; call this once after loading the
+ * image and before calling easyjit_compile() or any business entry that uses
+ * EasyJIT.  The operation is idempotent.
+ */
+void easyjit_register_module(void);
+
+/** Internal helper used by compiler-generated module registration stubs. */
+void easyjit_register_module_range(void* start, void* stop);
+
 /* ------------------------------------------------------------------ */
 /*  Context handle — describes which arguments are specialized         */
 /* ------------------------------------------------------------------ */

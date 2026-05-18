@@ -45,8 +45,11 @@ class BitcodeTracker {
 
   void registerFunction(void* FPtr, const char* Name, GlobalMapping* Globals, const char* Bitcode, size_t BitcodeLen) {
     // llvm::dbgs() << "[RUNTIME] " __FILE__ ":" << __LINE__<< " Register function " << Name << "\n";
+    Functions.erase(FPtr);
     Functions.emplace(FPtr, FunctionInfo{Name, Globals, Bitcode, BitcodeLen});
-    NameToAddress.emplace(Name, FPtr);
+    if (Name) {
+      NameToAddress[Name] = FPtr;
+    }
   }
 
   void registerLayout(layout_id Id, size_t N) {
