@@ -20,6 +20,7 @@
 #include <llvm/Transforms/IPO.h>
 #include <llvm/Transforms/Utils/CtorUtils.h>
 #include <llvm/Transforms/Utils/Cloning.h>
+#include <llvm/Transforms/Utils/ModuleUtils.h>
 
 #include <llvm/Bitcode/BitcodeWriter.h>
 
@@ -651,19 +652,92 @@ namespace easy {
       return Function::Create(FTy, Function::ExternalLinkage, Name, &M);
     }
 
+    static Function *declareRegisterModuleRange(Module &M) {
+      StringRef Name = "easyjit_register_module_range";
+      if (Function *F = M.getFunction(Name))
+        return F;
+
+      LLVMContext &C = M.getContext();
+      Type *Void = Type::getVoidTy(C);
+      Type *PtrTy = PointerType::get(C, 0);
+      FunctionType *FTy = FunctionType::get(Void, {PtrTy, PtrTy}, false);
+      return Function::Create(FTy, Function::ExternalLinkage, Name, &M);
+    }
+
+    static GlobalVariable *getOrDeclareSectionBoundary(Module &M,
+                                                       StringRef Name) {
+      if (GlobalVariable *GV = M.getGlobalVariable(Name))
+        return GV;
+      return new GlobalVariable(M, Type::getInt8Ty(M.getContext()), true,
+                                GlobalValue::ExternalLinkage, nullptr, Name);
+    }
+
+    static void emitManualRegisterEntryPoint(Module &M) {
+      StringRef Name = "easyjit_register_module";
+      Function *Manual = M.getFunction(Name);
+      if (Manual && !Manual->isDeclaration())
+        return;
+
+      LLVMContext &C = M.getContext();
+      Type *Void = Type::getVoidTy(C);
+      FunctionType *VoidFun = FunctionType::get(Void, false);
+      Function *RangeFun = declareRegisterModuleRange(M);
+
+      if (!Manual) {
+        Manual = Function::Create(VoidFun, GlobalValue::WeakODRLinkage, Name, &M);
+      } else {
+        Manual->setLinkage(GlobalValue::WeakODRLinkage);
+      }
+      Manual->setVisibility(GlobalValue::DefaultVisibility);
+
+      BasicBlock *Entry = BasicBlock::Create(C, "entry", Manual);
+      IRBuilder<> B(Entry);
+      GlobalVariable *Start = getOrDeclareSectionBoundary(M, "__start_easyjit_reg_fns");
+      GlobalVariable *Stop = getOrDeclareSectionBoundary(M, "__stop_easyjit_reg_fns");
+      B.CreateCall(RangeFun, {Start, Stop});
+      B.CreateRetVoid();
+
+      appendToCompilerUsed(M, {Manual});
+    }
+
     static void
     registerBitcode(Module &M, SmallVectorImpl<GlobalObject*> &Objs,
                     SmallVectorImpl<GlobalVariable*> &Bitcodes,
                     Value* GlobalMapping,
                     Function* RegisterBitcodeFun) {
-      // Create static initializer with low priority to register everything
+      // Create a guarded module registration function.  It is still attached
+      // to llvm.global_ctors for standard loaders, and is also published
+      // through the easyjit_reg_fns linker set so custom loaders can trigger
+      // registration explicitly via easyjit_register_module().
+      LLVMContext &C = M.getContext();
+      Type *Void = Type::getVoidTy(C);
+      Type *I1 = Type::getInt1Ty(C);
+      Type *PtrTy = PointerType::get(C, 0);
+      FunctionType *VoidFun = FunctionType::get(Void, false);
+
+      Function *RegisterModule =
+          Function::Create(VoidFun, Function::PrivateLinkage,
+                           "easyjit_register_bitcode", &M);
+      BasicBlock *Entry = BasicBlock::Create(C, "entry", RegisterModule);
+      BasicBlock *DoRegister =
+          BasicBlock::Create(C, "do_register", RegisterModule);
+      BasicBlock *Done = BasicBlock::Create(C, "done", RegisterModule);
+
+      auto *Registered = new GlobalVariable(
+          M, I1, false, GlobalVariable::PrivateLinkage,
+          ConstantInt::getFalse(C), "easyjit_register_bitcode_done");
+
+      IRBuilder<> EntryB(Entry);
+      Value *AlreadyRegistered = EntryB.CreateLoad(I1, Registered);
+      EntryB.CreateCondBr(AlreadyRegistered, Done, DoRegister);
+
+      IRBuilder<> B(DoRegister);
+      B.CreateStore(ConstantInt::getTrue(C), Registered);
+
       Type* FPtr = RegisterBitcodeFun->getFunctionType()->getParamType(0);
       Type* StrPtr = RegisterBitcodeFun->getFunctionType()->getParamType(1);
       Type* BitcodePtr = RegisterBitcodeFun->getFunctionType()->getParamType(3);
       Type* SizeTy = RegisterBitcodeFun->getFunctionType()->getParamType(4);
-
-      Function *Ctor = GetCtor(M, "register_bitcode");
-      IRBuilder<> B(Ctor->getEntryBlock().getTerminator());
 
       for(size_t i = 0, n = Objs.size(); i != n; ++i) {
         GlobalVariable* Name = getStringGlobal(M, Objs[i]->getName());
@@ -680,6 +754,19 @@ namespace easy {
                      {Fun, NameCast, GlobalMapping, Bitcode, BitcodeSize}, "");
         LLVM_DEBUG(dbgs() << "Call:::: " << *CI << "\n");
       }
+
+      B.CreateBr(Done);
+      ReturnInst::Create(C, Done);
+
+      llvm::appendToGlobalCtors(M, RegisterModule, 65535);
+
+      auto *RegisterEntry = new GlobalVariable(
+          M, PtrTy, true, GlobalVariable::PrivateLinkage,
+          ConstantExpr::getPointerCast(RegisterModule, PtrTy),
+          "easyjit_register_module_entry");
+      RegisterEntry->setSection("easyjit_reg_fns");
+      appendToCompilerUsed(M, {RegisterEntry});
+      emitManualRegisterEntryPoint(M);
     }
 
     static GlobalVariable* getStringGlobal(Module& M, StringRef Name) {
