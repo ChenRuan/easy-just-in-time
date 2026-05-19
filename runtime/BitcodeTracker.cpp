@@ -74,32 +74,6 @@ BitcodeTracker::ModuleContextPair BitcodeTracker::getModule(void* FPtr) {
 
 // function to interface with the generated code
 extern "C" {
-using easyjit_register_module_fn_t = void (*)();
-
-void easyjit_register_module_range(void *Start, void *Stop) {
-  auto *Begin = static_cast<easyjit_register_module_fn_t *>(Start);
-  auto *End = static_cast<easyjit_register_module_fn_t *>(Stop);
-  EASYJIT_SRE_LOG("[tracker] easyjit_register_module_range: begin start=%p stop=%p\n",
-                  Start, Stop);
-  if (!Begin || !End || Begin > End) {
-    EASYJIT_SRE_LOG("[tracker] easyjit_register_module_range: no linker-set entries\n");
-    return;
-  }
-
-  size_t Count = 0;
-  for (easyjit_register_module_fn_t *It = Begin; It != End; ++It) {
-    if (!*It) {
-      continue;
-    }
-    EASYJIT_SRE_LOG("[tracker] easyjit_register_module_range: call entry=%p\n",
-                    (void *)*It);
-    (*It)();
-    ++Count;
-  }
-  EASYJIT_SRE_LOG("[tracker] easyjit_register_module_range: done entries=%zu\n",
-                  Count);
-}
-
 void easy_register(void* FPtr, const char* Name, GlobalMapping* Globals, const char* Bitcode, size_t BitcodeLen) {
   BitcodeTracker::GetTracker().registerFunction(FPtr, Name, Globals, Bitcode, BitcodeLen);
 }

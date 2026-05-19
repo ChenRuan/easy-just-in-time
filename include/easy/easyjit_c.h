@@ -62,9 +62,6 @@ const char* easyjit_get_last_error(void);
  */
 void easyjit_register_module(void);
 
-/** Internal helper used by compiler-generated module registration stubs. */
-void easyjit_register_module_range(void* start, void* stop);
-
 /* ------------------------------------------------------------------ */
 /*  Context handle — describes which arguments are specialized         */
 /* ------------------------------------------------------------------ */
