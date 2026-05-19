@@ -7,6 +7,7 @@
 
 #include <easy/exceptions.h>
 
+#include <new>
 #include <string>
 
 using namespace easy;
@@ -131,8 +132,27 @@ std::unique_ptr<llvm::Module> BitcodeTracker::getModuleWithContext(void* FPtr, l
 BitcodeTracker::ModuleContextPair BitcodeTracker::getModule(void* FPtr) {
 
   EASYJIT_SRE_LOG("[tracker] getModule: fptr=%p\n", FPtr);
-  EASYJIT_SRE_LOG("[tracker] getModule: before new LLVMContext\n");
-  std::unique_ptr<llvm::LLVMContext> Context(new llvm::LLVMContext());
+  EASYJIT_SRE_LOG("[tracker] getModule: sizeof(LLVMContext)=%zu align=%zu\n",
+                  sizeof(llvm::LLVMContext), alignof(llvm::LLVMContext));
+  EASYJIT_SRE_LOG("[tracker] getModule: before raw operator new LLVMContext storage\n");
+  void *RawContextStorage = ::operator new(sizeof(llvm::LLVMContext));
+  EASYJIT_SRE_LOG("[tracker] getModule: after raw operator new storage=%p\n",
+                  RawContextStorage);
+  EASYJIT_SRE_LOG("[tracker] getModule: before placement LLVMContext ctor\n");
+  llvm::LLVMContext *RawContext = nullptr;
+  try {
+    RawContext = new (RawContextStorage) llvm::LLVMContext();
+  } catch (...) {
+    EASYJIT_SRE_LOG("[tracker] getModule: LLVMContext ctor threw storage=%p\n",
+                    RawContextStorage);
+    ::operator delete(RawContextStorage);
+    throw;
+  }
+  EASYJIT_SRE_LOG("[tracker] getModule: after placement LLVMContext ctor ctx=%p\n",
+                  (void*)RawContext);
+  EASYJIT_SRE_LOG("[tracker] getModule: before unique_ptr adoption ctx=%p\n",
+                  (void*)RawContext);
+  std::unique_ptr<llvm::LLVMContext> Context(RawContext);
   EASYJIT_SRE_LOG("[tracker] getModule: after new LLVMContext ctx=%p\n",
                   (void*)Context.get());
   EASYJIT_SRE_LOG("[tracker] getModule: before getModuleWithContext\n");
