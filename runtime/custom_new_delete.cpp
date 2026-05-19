@@ -20,6 +20,22 @@
 
 #define EASYJIT_ALLOC_LOG(...) EASYJIT_SRE_LOG("[alloc] " __VA_ARGS__)
 
+static void easyjit_debug_probe_allocation(void *p, std::size_t size,
+                                           const char *tag) {
+  EASYJIT_ALLOC_LOG("%s probe begin ptr=%p size=%zu\n", tag, p, size);
+  if (!p || size == 0) {
+    EASYJIT_ALLOC_LOG("%s probe skip ptr=%p size=%zu\n", tag, p, size);
+    return;
+  }
+  volatile unsigned char *bytes = static_cast<volatile unsigned char *>(p);
+  volatile unsigned char first = bytes[0];
+  volatile unsigned char last = bytes[size - 1];
+  bytes[0] = first;
+  bytes[size - 1] = last;
+  EASYJIT_ALLOC_LOG("%s probe ok ptr=%p size=%zu first=%02x last=%02x\n",
+                    tag, p, size, (unsigned)first, (unsigned)last);
+}
+
 #if EASYJIT_USE_CUSTOM_NEW_DELETE
 extern "C" void *XXX_MemAlloc(unsigned int ulSidPid, unsigned char ucptNo,
                               unsigned long ulSize);
@@ -41,6 +57,7 @@ void *operator new(std::size_t size) {
     if (void *p = std::malloc(size)) {
 #endif
       EASYJIT_ALLOC_LOG("operator new success size=%zu ptr=%p\n", size, p);
+      easyjit_debug_probe_allocation(p, size, "operator new");
       return p;
     }
 
@@ -150,6 +167,7 @@ void *operator new(std::size_t size, std::align_val_t alignment) {
       EASYJIT_ALLOC_LOG("operator new aligned success size=%zu align=%zu ptr=%p mod=%zu\n",
                         size, align, p,
                         p ? reinterpret_cast<std::uintptr_t>(p) % align : 0);
+      easyjit_debug_probe_allocation(p, size, "operator new aligned");
       return p;
     }
 
