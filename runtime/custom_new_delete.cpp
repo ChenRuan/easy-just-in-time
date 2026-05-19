@@ -1,6 +1,5 @@
 #include <cstdint>
 #include <cstdlib>
-#include <cstring>
 #include <new>
 
 #include "SreDebugLog.h"
@@ -41,117 +40,6 @@ static void easyjit_debug_probe_allocation(void *p, std::size_t size,
 extern "C" void *XXX_MemAlloc(unsigned int ulSidPid, unsigned char ucptNo,
                               unsigned long ulSize);
 extern "C" unsigned int XXX_MemFree(unsigned int ulSidPid, void *pAddr);
-#endif
-
-#if EASYJIT_USE_CUSTOM_NEW_DELETE
-namespace {
-struct EasyJitMallocHeader {
-  std::size_t Size;
-  std::uintptr_t Magic;
-};
-
-constexpr std::uintptr_t kEasyJitMallocMagic =
-    static_cast<std::uintptr_t>(0x454a49544d414c4cULL); // "EJITMALL"
-
-void *easyjit_malloc_impl(std::size_t size, const char *tag) {
-  if (size == 0) {
-    size = 1;
-  }
-  const std::size_t total = sizeof(EasyJitMallocHeader) + size;
-  EASYJIT_ALLOC_LOG("%s begin size=%zu total=%zu\n", tag, size, total);
-  void *raw = XXX_MemAlloc(0U, 0U, static_cast<unsigned long>(total));
-  EASYJIT_ALLOC_LOG("%s after XXX_MemAlloc raw=%p size=%zu total=%zu\n",
-                    tag, raw, size, total);
-  if (!raw) {
-    return nullptr;
-  }
-  auto *header = static_cast<EasyJitMallocHeader *>(raw);
-  header->Size = size;
-  header->Magic = kEasyJitMallocMagic;
-  void *user = header + 1;
-  EASYJIT_ALLOC_LOG("%s success user=%p raw=%p size=%zu\n",
-                    tag, user, raw, size);
-  easyjit_debug_probe_allocation(user, size, tag);
-  return user;
-}
-
-EasyJitMallocHeader *easyjit_header_from_user(void *ptr) {
-  if (!ptr) {
-    return nullptr;
-  }
-  auto *header = static_cast<EasyJitMallocHeader *>(ptr) - 1;
-  if (header->Magic != kEasyJitMallocMagic) {
-    EASYJIT_ALLOC_LOG("malloc header magic mismatch ptr=%p header=%p magic=%zx\n",
-                      ptr, (void *)header, static_cast<std::size_t>(header->Magic));
-    return nullptr;
-  }
-  return header;
-}
-} // namespace
-
-extern "C" void *malloc(std::size_t size) {
-  return easyjit_malloc_impl(size, "malloc");
-}
-
-extern "C" void *calloc(std::size_t count, std::size_t size) {
-  EASYJIT_ALLOC_LOG("calloc begin count=%zu size=%zu\n", count, size);
-  if (count && size > static_cast<std::size_t>(-1) / count) {
-    EASYJIT_ALLOC_LOG("calloc overflow count=%zu size=%zu\n", count, size);
-    return nullptr;
-  }
-  std::size_t total = count * size;
-  void *p = easyjit_malloc_impl(total, "calloc");
-  if (p) {
-    EASYJIT_ALLOC_LOG("calloc before memset ptr=%p total=%zu\n", p, total);
-    std::memset(p, 0, total);
-    EASYJIT_ALLOC_LOG("calloc after memset ptr=%p total=%zu\n", p, total);
-  }
-  return p;
-}
-
-extern "C" void free(void *ptr) {
-  EASYJIT_ALLOC_LOG("free begin ptr=%p\n", ptr);
-  if (!ptr) {
-    return;
-  }
-  EasyJitMallocHeader *header = easyjit_header_from_user(ptr);
-  if (!header) {
-    EASYJIT_ALLOC_LOG("free ignore unknown ptr=%p\n", ptr);
-    return;
-  }
-  header->Magic = 0;
-  EASYJIT_ALLOC_LOG("free before XXX_MemFree ptr=%p raw=%p size=%zu\n",
-                    ptr, (void *)header, header->Size);
-  (void)XXX_MemFree(0, header);
-  EASYJIT_ALLOC_LOG("free after XXX_MemFree ptr=%p\n", ptr);
-}
-
-extern "C" void *realloc(void *ptr, std::size_t size) {
-  EASYJIT_ALLOC_LOG("realloc begin ptr=%p size=%zu\n", ptr, size);
-  if (!ptr) {
-    return malloc(size);
-  }
-  if (size == 0) {
-    free(ptr);
-    return nullptr;
-  }
-
-  EasyJitMallocHeader *header = easyjit_header_from_user(ptr);
-  if (!header) {
-    EASYJIT_ALLOC_LOG("realloc unknown old ptr=%p\n", ptr);
-    return nullptr;
-  }
-  std::size_t oldSize = header->Size;
-  void *newPtr = malloc(size);
-  if (!newPtr) {
-    return nullptr;
-  }
-  std::memcpy(newPtr, ptr, oldSize < size ? oldSize : size);
-  free(ptr);
-  EASYJIT_ALLOC_LOG("realloc success old=%p new=%p old_size=%zu new_size=%zu\n",
-                    ptr, newPtr, oldSize, size);
-  return newPtr;
-}
 #endif
 
 void *operator new(std::size_t size) {
