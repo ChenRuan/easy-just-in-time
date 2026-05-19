@@ -7,6 +7,8 @@
 
 #include <easy/exceptions.h>
 
+#include <string>
+
 using namespace easy;
 using namespace llvm;
 
@@ -78,15 +80,44 @@ std::unique_ptr<llvm::Module> BitcodeTracker::getModuleWithContext(void* FPtr, l
   EASYJIT_SRE_LOG("[tracker] getModuleWithContext: name=%s bitcode=%p len=%zu\n",
                   Info.Name ? Info.Name : "<null>", (const void*)Info.Bitcode,
                   Info.BitcodeLen);
+  EASYJIT_SRE_LOG("[tracker] getModuleWithContext: before bitcode sanity name=%s\n",
+                  Info.Name ? Info.Name : "<null>");
+  if (!Info.Bitcode || Info.BitcodeLen < 4) {
+    EASYJIT_SRE_LOG("[tracker] getModuleWithContext: invalid bitcode pointer/len bitcode=%p len=%zu\n",
+                    (const void*)Info.Bitcode, Info.BitcodeLen);
+    throw easy::BitcodeParseError(Info.Name);
+  }
 
+  EASYJIT_SRE_LOG("[tracker] getModuleWithContext: before magic read bitcode=%p len=%zu\n",
+                  (const void*)Info.Bitcode, Info.BitcodeLen);
+  const unsigned char *Bytes =
+      reinterpret_cast<const unsigned char *>(Info.Bitcode);
+  volatile unsigned char B0 = Bytes[0];
+  volatile unsigned char B1 = Bytes[1];
+  volatile unsigned char B2 = Bytes[2];
+  volatile unsigned char B3 = Bytes[3];
+  EASYJIT_SRE_LOG("[tracker] getModuleWithContext: magic=%02x %02x %02x %02x\n",
+                  (unsigned)B0, (unsigned)B1, (unsigned)B2, (unsigned)B3);
+
+  EASYJIT_SRE_LOG("[tracker] getModuleWithContext: before MemoryBuffer\n");
   llvm::StringRef BytecodeStr(Info.Bitcode, Info.BitcodeLen);
   std::unique_ptr<llvm::MemoryBuffer> Buf(llvm::MemoryBuffer::getMemBuffer(BytecodeStr));
+  EASYJIT_SRE_LOG("[tracker] getModuleWithContext: after MemoryBuffer buf=%p size=%zu\n",
+                  (void*)Buf.get(), Buf ? Buf->getBufferSize() : 0);
+  EASYJIT_SRE_LOG("[tracker] getModuleWithContext: before parseBitcodeFile\n");
   auto ModuleOrErr =
       llvm::parseBitcodeFile(Buf->getMemBufferRef(), C);
+  EASYJIT_SRE_LOG("[tracker] getModuleWithContext: after parseBitcodeFile has_module=%d\n",
+                  (int)(bool)ModuleOrErr);
 
-  if (ModuleOrErr.takeError()) {
-    EASYJIT_SRE_LOG("[tracker] getModuleWithContext: parse failed name=%s\n",
-                    Info.Name ? Info.Name : "<null>");
+  if (!ModuleOrErr) {
+    std::string ErrMsg;
+    llvm::handleAllErrors(ModuleOrErr.takeError(),
+                          [&](const llvm::ErrorInfoBase &EIB) {
+                            ErrMsg = EIB.message();
+                          });
+    EASYJIT_SRE_LOG("[tracker] getModuleWithContext: parse failed name=%s err=%s\n",
+                    Info.Name ? Info.Name : "<null>", ErrMsg.c_str());
     throw easy::BitcodeParseError(Info.Name);
   }
 
@@ -100,8 +131,14 @@ std::unique_ptr<llvm::Module> BitcodeTracker::getModuleWithContext(void* FPtr, l
 BitcodeTracker::ModuleContextPair BitcodeTracker::getModule(void* FPtr) {
 
   EASYJIT_SRE_LOG("[tracker] getModule: fptr=%p\n", FPtr);
+  EASYJIT_SRE_LOG("[tracker] getModule: before new LLVMContext\n");
   std::unique_ptr<llvm::LLVMContext> Context(new llvm::LLVMContext());
+  EASYJIT_SRE_LOG("[tracker] getModule: after new LLVMContext ctx=%p\n",
+                  (void*)Context.get());
+  EASYJIT_SRE_LOG("[tracker] getModule: before getModuleWithContext\n");
   auto Module = getModuleWithContext(FPtr, *Context);
+  EASYJIT_SRE_LOG("[tracker] getModule: after getModuleWithContext module=%p\n",
+                  (void*)Module.get());
   EASYJIT_SRE_LOG("[tracker] getModule: module=%p ctx=%p\n",
                   (void*)Module.get(), (void*)Context.get());
   return ModuleContextPair(std::move(Module), std::move(Context));
