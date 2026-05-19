@@ -652,27 +652,8 @@ namespace easy {
       return Function::Create(FTy, Function::ExternalLinkage, Name, &M);
     }
 
-    static Function *declareRegisterModuleRange(Module &M) {
-      StringRef Name = "easyjit_register_module_range";
-      if (Function *F = M.getFunction(Name))
-        return F;
-
-      LLVMContext &C = M.getContext();
-      Type *Void = Type::getVoidTy(C);
-      Type *PtrTy = PointerType::get(C, 0);
-      FunctionType *FTy = FunctionType::get(Void, {PtrTy, PtrTy}, false);
-      return Function::Create(FTy, Function::ExternalLinkage, Name, &M);
-    }
-
-    static GlobalVariable *getOrDeclareSectionBoundary(Module &M,
-                                                       StringRef Name) {
-      if (GlobalVariable *GV = M.getGlobalVariable(Name))
-        return GV;
-      return new GlobalVariable(M, Type::getInt8Ty(M.getContext()), true,
-                                GlobalValue::ExternalLinkage, nullptr, Name);
-    }
-
-    static void emitManualRegisterEntryPoint(Module &M) {
+    static void emitManualRegisterEntryPoint(Module &M,
+                                             Function *RegisterModule) {
       StringRef Name = "easyjit_register_module";
       Function *Manual = M.getFunction(Name);
       if (Manual && !Manual->isDeclaration())
@@ -681,7 +662,6 @@ namespace easy {
       LLVMContext &C = M.getContext();
       Type *Void = Type::getVoidTy(C);
       FunctionType *VoidFun = FunctionType::get(Void, false);
-      Function *RangeFun = declareRegisterModuleRange(M);
 
       if (!Manual) {
         Manual = Function::Create(VoidFun, GlobalValue::WeakODRLinkage, Name, &M);
@@ -692,9 +672,7 @@ namespace easy {
 
       BasicBlock *Entry = BasicBlock::Create(C, "entry", Manual);
       IRBuilder<> B(Entry);
-      GlobalVariable *Start = getOrDeclareSectionBoundary(M, "__start_easyjit_reg_fns");
-      GlobalVariable *Stop = getOrDeclareSectionBoundary(M, "__stop_easyjit_reg_fns");
-      B.CreateCall(RangeFun, {Start, Stop});
+      B.CreateCall(RegisterModule);
       B.CreateRetVoid();
 
       appendToCompilerUsed(M, {Manual});
@@ -706,13 +684,12 @@ namespace easy {
                     Value* GlobalMapping,
                     Function* RegisterBitcodeFun) {
       // Create a guarded module registration function.  It is still attached
-      // to llvm.global_ctors for standard loaders, and is also published
-      // through the easyjit_reg_fns linker set so custom loaders can trigger
-      // registration explicitly via easyjit_register_module().
+      // to llvm.global_ctors for standard loaders, and is also called directly
+      // by easyjit_register_module() for custom loaders that do not execute
+      // .init_array.
       LLVMContext &C = M.getContext();
       Type *Void = Type::getVoidTy(C);
       Type *I1 = Type::getInt1Ty(C);
-      Type *PtrTy = PointerType::get(C, 0);
       FunctionType *VoidFun = FunctionType::get(Void, false);
 
       Function *RegisterModule =
@@ -759,14 +736,7 @@ namespace easy {
       ReturnInst::Create(C, Done);
 
       llvm::appendToGlobalCtors(M, RegisterModule, 65535);
-
-      auto *RegisterEntry = new GlobalVariable(
-          M, PtrTy, true, GlobalVariable::PrivateLinkage,
-          ConstantExpr::getPointerCast(RegisterModule, PtrTy),
-          "easyjit_register_module_entry");
-      RegisterEntry->setSection("easyjit_reg_fns");
-      appendToCompilerUsed(M, {RegisterEntry});
-      emitManualRegisterEntryPoint(M);
+      emitManualRegisterEntryPoint(M, RegisterModule);
     }
 
     static GlobalVariable* getStringGlobal(Module& M, StringRef Name) {
