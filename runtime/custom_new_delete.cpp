@@ -42,20 +42,22 @@ extern "C" void *XXX_MemAlloc(unsigned int ulSidPid, unsigned char ucptNo,
 extern "C" unsigned int XXX_MemFree(unsigned int ulSidPid, void *pAddr);
 #endif
 
-void *operator new(std::size_t size) {
-  EASYJIT_ALLOC_LOG("operator new begin size=%zu\n", size);
+static void *easyjit_allocate_or_null(std::size_t size) noexcept {
   if (size == 0) {
     size = 1;
   }
-
-  while (true) {
 #if EASYJIT_USE_CUSTOM_NEW_DELETE
-    EASYJIT_ALLOC_LOG("operator new before XXX_MemAlloc size=%zu\n", size);
-    if (void *p = XXX_MemAlloc(0U, 0U, static_cast<unsigned long>(size))) {
+  return XXX_MemAlloc(0U, 0U, static_cast<unsigned long>(size));
 #else
-    EASYJIT_ALLOC_LOG("operator new before malloc size=%zu\n", size);
-    if (void *p = std::malloc(size)) {
+  return std::malloc(size);
 #endif
+}
+
+void *operator new(std::size_t size) {
+  EASYJIT_ALLOC_LOG("operator new begin size=%zu\n", size);
+  while (true) {
+    EASYJIT_ALLOC_LOG("operator new before alloc size=%zu\n", size);
+    if (void *p = easyjit_allocate_or_null(size)) {
       EASYJIT_ALLOC_LOG("operator new success size=%zu ptr=%p\n", size, p);
       easyjit_debug_probe_allocation(p, size, "operator new");
       return p;
@@ -64,8 +66,8 @@ void *operator new(std::size_t size) {
     EASYJIT_ALLOC_LOG("operator new allocation failed size=%zu\n", size);
     std::new_handler handler = std::get_new_handler();
     if (!handler) {
-      EASYJIT_ALLOC_LOG("operator new throwing bad_alloc size=%zu\n", size);
-      throw std::bad_alloc();
+      EASYJIT_ALLOC_LOG("operator new aborting allocation failed size=%zu\n", size);
+      std::abort();
     }
     EASYJIT_ALLOC_LOG("operator new calling new_handler size=%zu handler=%p\n",
                       size, reinterpret_cast<void *>(handler));
@@ -80,26 +82,22 @@ void *operator new[](std::size_t size) {
 
 void *operator new(std::size_t size, const std::nothrow_t &) noexcept {
   EASYJIT_ALLOC_LOG("operator new nothrow begin size=%zu\n", size);
-  try {
-    void *p = ::operator new(size);
+  if (void *p = easyjit_allocate_or_null(size)) {
     EASYJIT_ALLOC_LOG("operator new nothrow success size=%zu ptr=%p\n", size, p);
     return p;
-  } catch (...) {
-    EASYJIT_ALLOC_LOG("operator new nothrow failed size=%zu\n", size);
-    return nullptr;
   }
+  EASYJIT_ALLOC_LOG("operator new nothrow failed size=%zu\n", size);
+  return nullptr;
 }
 
 void *operator new[](std::size_t size, const std::nothrow_t &) noexcept {
   EASYJIT_ALLOC_LOG("operator new[] nothrow begin size=%zu\n", size);
-  try {
-    void *p = ::operator new[](size);
+  if (void *p = easyjit_allocate_or_null(size)) {
     EASYJIT_ALLOC_LOG("operator new[] nothrow success size=%zu ptr=%p\n", size, p);
     return p;
-  } catch (...) {
-    EASYJIT_ALLOC_LOG("operator new[] nothrow failed size=%zu\n", size);
-    return nullptr;
   }
+  EASYJIT_ALLOC_LOG("operator new[] nothrow failed size=%zu\n", size);
+  return nullptr;
 }
 
 void operator delete(void *p) noexcept {
@@ -183,9 +181,9 @@ void *operator new(std::size_t size, std::align_val_t alignment) {
                       size, align);
     std::new_handler handler = std::get_new_handler();
     if (!handler) {
-      EASYJIT_ALLOC_LOG("operator new aligned throwing bad_alloc size=%zu align=%zu\n",
+      EASYJIT_ALLOC_LOG("operator new aligned aborting allocation failed size=%zu align=%zu\n",
                         size, align);
-      throw std::bad_alloc();
+      std::abort();
     }
     EASYJIT_ALLOC_LOG("operator new aligned calling new_handler size=%zu align=%zu handler=%p\n",
                       size, align, reinterpret_cast<void *>(handler));
@@ -203,32 +201,34 @@ void *operator new(std::size_t size, std::align_val_t alignment,
                    const std::nothrow_t &) noexcept {
   EASYJIT_ALLOC_LOG("operator new aligned nothrow begin size=%zu align=%zu\n",
                     size, static_cast<std::size_t>(alignment));
-  try {
-    void *p = ::operator new(size, alignment);
+  void *p = nullptr;
+#if EASYJIT_USE_CUSTOM_NEW_DELETE
+  p = easyjit_allocate_or_null(size);
+  if (p && reinterpret_cast<std::uintptr_t>(p) %
+               static_cast<std::size_t>(alignment) != 0) {
+    (void)XXX_MemFree(0, p);
+    p = nullptr;
+  }
+#else
+  if (posix_memalign(&p, static_cast<std::size_t>(alignment),
+                     size == 0 ? 1 : size) != 0)
+    p = nullptr;
+#endif
+  if (p) {
     EASYJIT_ALLOC_LOG("operator new aligned nothrow success size=%zu align=%zu ptr=%p\n",
                       size, static_cast<std::size_t>(alignment), p);
     return p;
-  } catch (...) {
-    EASYJIT_ALLOC_LOG("operator new aligned nothrow failed size=%zu align=%zu\n",
-                      size, static_cast<std::size_t>(alignment));
-    return nullptr;
   }
+  EASYJIT_ALLOC_LOG("operator new aligned nothrow failed size=%zu align=%zu\n",
+                    size, static_cast<std::size_t>(alignment));
+  return nullptr;
 }
 
 void *operator new[](std::size_t size, std::align_val_t alignment,
                      const std::nothrow_t &) noexcept {
   EASYJIT_ALLOC_LOG("operator new[] aligned nothrow begin size=%zu align=%zu\n",
                     size, static_cast<std::size_t>(alignment));
-  try {
-    void *p = ::operator new[](size, alignment);
-    EASYJIT_ALLOC_LOG("operator new[] aligned nothrow success size=%zu align=%zu ptr=%p\n",
-                      size, static_cast<std::size_t>(alignment), p);
-    return p;
-  } catch (...) {
-    EASYJIT_ALLOC_LOG("operator new[] aligned nothrow failed size=%zu align=%zu\n",
-                      size, static_cast<std::size_t>(alignment));
-    return nullptr;
-  }
+  return ::operator new(size, alignment, std::nothrow);
 }
 
 void operator delete(void *p, std::align_val_t) noexcept {

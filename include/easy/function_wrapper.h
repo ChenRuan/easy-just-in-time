@@ -3,7 +3,6 @@
 
 #include <iostream>
 #include <memory>
-#include <stdexcept>
 #include <easy/runtime/Function.h>
 #include <easy/meta.h>
 
@@ -48,11 +47,6 @@ class FunctionWrapperBase {
 
   static FunctionWrapperBase deserialize(std::istream& is) {
     std::unique_ptr<Function> Fun = Function::deserialize(is);
-    if (!Fun) {
-      throw std::runtime_error(
-          "easy::FunctionWrapper::deserialize: Function::deserialize returned null "
-          "(bitcode parse failed or backend rejected the module)");
-    }
     return FunctionWrapperBase{std::move(Fun)};
   }
 };
@@ -78,11 +72,6 @@ class FunctionWrapper<Ret(Params...)> :
 
   static FunctionWrapper<Ret(Params...)> deserialize(std::istream& is) {
     std::unique_ptr<Function> Fun = Function::deserialize(is);
-    if (!Fun) {
-      throw std::runtime_error(
-          "easy::FunctionWrapper::deserialize: Function::deserialize returned null "
-          "(bitcode parse failed or backend rejected the module)");
-    }
     return FunctionWrapper<Ret(Params...)>{std::move(Fun)};
   }
 };
@@ -106,11 +95,6 @@ class FunctionWrapper<void(Params...)> :
 
   static FunctionWrapper<void(Params...)> deserialize(std::istream& is) {
     std::unique_ptr<Function> Fun = Function::deserialize(is);
-    if (!Fun) {
-      throw std::runtime_error(
-          "easy::FunctionWrapper::deserialize: Function::deserialize returned null "
-          "(bitcode parse failed or backend rejected the module)");
-    }
     return FunctionWrapper<void(Params...)>{std::move(Fun)};
   }
 };

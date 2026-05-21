@@ -57,7 +57,7 @@ std::tuple<const char*, GlobalMapping*> BitcodeTracker::getNameAndGlobalMapping(
   auto InfoPtr = Functions.find(FPtr);
   if(InfoPtr == Functions.end()) {
     EASYJIT_SRE_LOG("[tracker] getNameAndGlobalMapping: missing fptr=%p\n", FPtr);
-    throw easy::BitcodeNotRegistered();
+    return std::make_tuple(nullptr, nullptr);
   }
 
   EASYJIT_SRE_LOG("[tracker] getNameAndGlobalMapping: fptr=%p name=%s globals=%p bitcode=%p len=%zu\n",
@@ -74,7 +74,7 @@ std::unique_ptr<llvm::Module> BitcodeTracker::getModuleWithContext(void* FPtr, l
   auto InfoPtr = Functions.find(FPtr);
   if(InfoPtr == Functions.end()) {
     EASYJIT_SRE_LOG("[tracker] getModuleWithContext: missing fptr=%p\n", FPtr);
-    throw easy::BitcodeNotRegistered();
+    return nullptr;
   }
 
   auto &Info = InfoPtr->second;
@@ -86,7 +86,7 @@ std::unique_ptr<llvm::Module> BitcodeTracker::getModuleWithContext(void* FPtr, l
   if (!Info.Bitcode || Info.BitcodeLen < 4) {
     EASYJIT_SRE_LOG("[tracker] getModuleWithContext: invalid bitcode pointer/len bitcode=%p len=%zu\n",
                     (const void*)Info.Bitcode, Info.BitcodeLen);
-    throw easy::BitcodeParseError(Info.Name);
+    return nullptr;
   }
 
   EASYJIT_SRE_LOG("[tracker] getModuleWithContext: before magic read bitcode=%p len=%zu\n",
@@ -119,7 +119,7 @@ std::unique_ptr<llvm::Module> BitcodeTracker::getModuleWithContext(void* FPtr, l
                           });
     EASYJIT_SRE_LOG("[tracker] getModuleWithContext: parse failed name=%s err=%s\n",
                     Info.Name ? Info.Name : "<null>", ErrMsg.c_str());
-    throw easy::BitcodeParseError(Info.Name);
+    return nullptr;
   }
 
   auto M = std::move(ModuleOrErr.get());
@@ -140,14 +140,7 @@ BitcodeTracker::ModuleContextPair BitcodeTracker::getModule(void* FPtr) {
                   RawContextStorage);
   EASYJIT_SRE_LOG("[tracker] getModule: before placement LLVMContext ctor\n");
   llvm::LLVMContext *RawContext = nullptr;
-  try {
-    RawContext = new (RawContextStorage) llvm::LLVMContext();
-  } catch (...) {
-    EASYJIT_SRE_LOG("[tracker] getModule: LLVMContext ctor threw storage=%p\n",
-                    RawContextStorage);
-    ::operator delete(RawContextStorage);
-    throw;
-  }
+  RawContext = new (RawContextStorage) llvm::LLVMContext();
   EASYJIT_SRE_LOG("[tracker] getModule: after placement LLVMContext ctor ctx=%p\n",
                   (void*)RawContext);
   EASYJIT_SRE_LOG("[tracker] getModule: before unique_ptr adoption ctx=%p\n",
@@ -159,6 +152,8 @@ BitcodeTracker::ModuleContextPair BitcodeTracker::getModule(void* FPtr) {
   auto Module = getModuleWithContext(FPtr, *Context);
   EASYJIT_SRE_LOG("[tracker] getModule: after getModuleWithContext module=%p\n",
                   (void*)Module.get());
+  if (!Module)
+    return ModuleContextPair(nullptr, nullptr);
   EASYJIT_SRE_LOG("[tracker] getModule: module=%p ctx=%p\n",
                   (void*)Module.get(), (void*)Context.get());
   return ModuleContextPair(std::move(Module), std::move(Context));
