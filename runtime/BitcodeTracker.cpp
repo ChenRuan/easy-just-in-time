@@ -39,7 +39,7 @@ void* BitcodeTracker::getAddress(std::string const &Name) {
 std::tuple<const char*, GlobalMapping*> BitcodeTracker::getNameAndGlobalMapping(void* FPtr) {
   auto InfoPtr = Functions.find(FPtr);
   if(InfoPtr == Functions.end()) {
-    throw easy::BitcodeNotRegistered();
+    return std::make_tuple(nullptr, nullptr);
   }
 
   return std::make_tuple(InfoPtr->second.Name, InfoPtr->second.Globals);
@@ -48,7 +48,7 @@ std::tuple<const char*, GlobalMapping*> BitcodeTracker::getNameAndGlobalMapping(
 std::unique_ptr<llvm::Module> BitcodeTracker::getModuleWithContext(void* FPtr, llvm::LLVMContext &C) {
   auto InfoPtr = Functions.find(FPtr);
   if(InfoPtr == Functions.end()) {
-    throw easy::BitcodeNotRegistered();
+    return nullptr;
   }
 
   auto &Info = InfoPtr->second;
@@ -59,7 +59,7 @@ std::unique_ptr<llvm::Module> BitcodeTracker::getModuleWithContext(void* FPtr, l
       llvm::parseBitcodeFile(Buf->getMemBufferRef(), C);
 
   if (ModuleOrErr.takeError()) {
-    throw easy::BitcodeParseError(Info.Name);
+    return nullptr;
   }
 
   return std::move(ModuleOrErr.get());
@@ -69,6 +69,8 @@ BitcodeTracker::ModuleContextPair BitcodeTracker::getModule(void* FPtr) {
 
   std::unique_ptr<llvm::LLVMContext> Context(new llvm::LLVMContext());
   auto Module = getModuleWithContext(FPtr, *Context);
+  if (!Module)
+    return ModuleContextPair(nullptr, nullptr);
   return ModuleContextPair(std::move(Module), std::move(Context));
 }
 
@@ -81,4 +83,3 @@ void easy_register_layout(layout_id Id, size_t N) {
   BitcodeTracker::GetTracker().registerLayout(Id, N);
 }
 }
-

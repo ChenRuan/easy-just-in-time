@@ -22,23 +22,26 @@ extern "C" void *XXX_MemAlloc(unsigned int ulSidPid, unsigned char ucptNo,
 extern "C" unsigned int XXX_MemFree(unsigned int ulSidPid, void *pAddr);
 #endif
 
-void *operator new(std::size_t size) {
+static void *easyjit_allocate_or_null(std::size_t size) noexcept {
   if (size == 0) {
     size = 1;
   }
-
-  while (true) {
 #if EASYJIT_USE_CUSTOM_NEW_DELETE
-    if (void *p = XXX_MemAlloc(0U, 0U, static_cast<unsigned long>(size))) {
+  return XXX_MemAlloc(0U, 0U, static_cast<unsigned long>(size));
 #else
-    if (void *p = std::malloc(size)) {
+  return std::malloc(size);
 #endif
+}
+
+void *operator new(std::size_t size) {
+  while (true) {
+    if (void *p = easyjit_allocate_or_null(size)) {
       return p;
     }
 
     std::new_handler handler = std::get_new_handler();
     if (!handler) {
-      throw std::bad_alloc();
+      std::abort();
     }
     handler();
   }
@@ -49,19 +52,11 @@ void *operator new[](std::size_t size) {
 }
 
 void *operator new(std::size_t size, const std::nothrow_t &) noexcept {
-  try {
-    return ::operator new(size);
-  } catch (...) {
-    return nullptr;
-  }
+  return easyjit_allocate_or_null(size);
 }
 
 void *operator new[](std::size_t size, const std::nothrow_t &) noexcept {
-  try {
-    return ::operator new[](size);
-  } catch (...) {
-    return nullptr;
-  }
+  return easyjit_allocate_or_null(size);
 }
 
 void operator delete(void *p) noexcept {
@@ -123,7 +118,7 @@ void *operator new(std::size_t size, std::align_val_t alignment) {
 
     std::new_handler handler = std::get_new_handler();
     if (!handler) {
-      throw std::bad_alloc();
+      std::abort();
     }
     handler();
   }
@@ -135,20 +130,25 @@ void *operator new[](std::size_t size, std::align_val_t alignment) {
 
 void *operator new(std::size_t size, std::align_val_t alignment,
                    const std::nothrow_t &) noexcept {
-  try {
-    return ::operator new(size, alignment);
-  } catch (...) {
-    return nullptr;
+  void *p = nullptr;
+#if EASYJIT_USE_CUSTOM_NEW_DELETE
+  p = easyjit_allocate_or_null(size);
+  const std::size_t align = static_cast<std::size_t>(alignment);
+  if (p && reinterpret_cast<std::uintptr_t>(p) % align != 0) {
+    (void)XXX_MemFree(0, p);
+    p = nullptr;
   }
+#else
+  if (posix_memalign(&p, static_cast<std::size_t>(alignment),
+                     size == 0 ? 1 : size) != 0)
+    p = nullptr;
+#endif
+  return p;
 }
 
 void *operator new[](std::size_t size, std::align_val_t alignment,
                      const std::nothrow_t &) noexcept {
-  try {
-    return ::operator new[](size, alignment);
-  } catch (...) {
-    return nullptr;
-  }
+  return ::operator new(size, alignment, std::nothrow);
 }
 
 void operator delete(void *p, std::align_val_t) noexcept {

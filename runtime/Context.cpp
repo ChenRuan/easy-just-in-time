@@ -1,5 +1,4 @@
 #include "easy/runtime/Context.h"
-#include <stdexcept>
 
 using namespace easy;
 
@@ -67,7 +66,7 @@ Context& Context::bindArrayToLastStruct(size_t Offset,
                                         size_t Count,
                                         size_t ElementSize) {
   if (ArgumentMapping_.empty())
-    throw std::invalid_argument("bindArrayToLastStruct requires a previous struct parameter");
+    return *this;
 
   if (auto *Struct = ArgumentMapping_.back()->as<StructArgument>()) {
     Struct->addArrayBinding(StructArrayBinding{
@@ -81,17 +80,17 @@ Context& Context::bindArrayToLastStruct(size_t Offset,
     return *this;
   }
 
-  throw std::invalid_argument("bindArrayToLastStruct must follow a snapshot or partial-struct parameter");
+  return *this;
 }
 
 Context& Context::bindFieldToLastPartialStruct(size_t Offset,
                                                std::vector<char> Data) {
   if (ArgumentMapping_.empty())
-    throw std::invalid_argument("bindFieldToLastPartialStruct requires a previous partial-struct parameter");
+    return *this;
 
   auto *Partial = ArgumentMapping_.back()->as<PartialStructArgument>();
   if (!Partial)
-    throw std::invalid_argument("bindFieldToLastPartialStruct must follow a partial-struct parameter");
+    return *this;
 
   Partial->addFieldBinding(StructFieldBinding{Offset, std::move(Data)});
   return *this;
@@ -100,11 +99,11 @@ Context& Context::bindFieldToLastPartialStruct(size_t Offset,
 Context& Context::bindFieldToLastGlobalPartialStruct(size_t Offset,
                                                      std::vector<char> Data) {
   if (GlobalStructBindings_.empty())
-    throw std::invalid_argument("bindFieldToLastGlobalPartialStruct requires a previous global partial-struct binding");
+    return *this;
 
   auto &Binding = GlobalStructBindings_.back();
   if (Binding.WholeSnapshot_)
-    throw std::invalid_argument("bindFieldToLastGlobalPartialStruct must follow a global partial-struct binding");
+    return *this;
 
   Binding.FieldBindings_.push_back(StructFieldBinding{Offset, std::move(Data)});
   return *this;
@@ -115,11 +114,11 @@ Context& Context::bindArrayToLastGlobalPartialStruct(size_t Offset,
                                                      size_t Count,
                                                      size_t ElementSize) {
   if (GlobalStructBindings_.empty())
-    throw std::invalid_argument("bindArrayToLastGlobalPartialStruct requires a previous global partial-struct binding");
+    return *this;
 
   auto &Binding = GlobalStructBindings_.back();
   if (Binding.WholeSnapshot_)
-    throw std::invalid_argument("bindArrayToLastGlobalPartialStruct must follow a global partial-struct binding");
+    return *this;
 
   Binding.ArrayBindings_.push_back(StructArrayBinding{
       Offset, std::move(Data), Count, ElementSize});

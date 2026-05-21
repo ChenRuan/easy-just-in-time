@@ -94,13 +94,8 @@ easyjit_error_t easyjit_context_create(easyjit_context_t* out_ctx) {
         set_last_error("easyjit_context_create: out_ctx is NULL");
         return EASYJIT_ERROR_INVALID_ARGUMENT;
     }
-    try {
         *out_ctx = new easyjit_context_s();
         return EASYJIT_OK;
-    } catch (const std::exception& e) {
-        set_last_error(e.what());
-        return EASYJIT_ERROR_INTERNAL;
-    }
 }
 
 extern "C"
@@ -118,14 +113,9 @@ easyjit_error_t easyjit_context_set_forward(easyjit_context_t ctx,
         set_last_error("easyjit_context_set_forward: ctx is NULL");
         return EASYJIT_ERROR_INVALID_ARGUMENT;
     }
-    try {
         set_scalar_layout(ctx->ctx);
         ctx->ctx.setParameterIndex(index);
         return EASYJIT_OK;
-    } catch (const std::exception& e) {
-        set_last_error(e.what());
-        return EASYJIT_ERROR_INTERNAL;
-    }
 }
 
 extern "C"
@@ -136,14 +126,9 @@ easyjit_error_t easyjit_context_set_int(easyjit_context_t ctx,
         set_last_error("easyjit_context_set_int: ctx is NULL");
         return EASYJIT_ERROR_INVALID_ARGUMENT;
     }
-    try {
         set_scalar_layout(ctx->ctx);
         ctx->ctx.setParameterInt(value);
         return EASYJIT_OK;
-    } catch (const std::exception& e) {
-        set_last_error(e.what());
-        return EASYJIT_ERROR_INTERNAL;
-    }
 }
 
 extern "C"
@@ -154,14 +139,9 @@ easyjit_error_t easyjit_context_set_float(easyjit_context_t ctx,
         set_last_error("easyjit_context_set_float: ctx is NULL");
         return EASYJIT_ERROR_INVALID_ARGUMENT;
     }
-    try {
         set_scalar_layout(ctx->ctx);
         ctx->ctx.setParameterFloat(value);
         return EASYJIT_OK;
-    } catch (const std::exception& e) {
-        set_last_error(e.what());
-        return EASYJIT_ERROR_INTERNAL;
-    }
 }
 
 extern "C"
@@ -172,14 +152,9 @@ easyjit_error_t easyjit_context_set_pointer(easyjit_context_t ctx,
         set_last_error("easyjit_context_set_pointer: ctx is NULL");
         return EASYJIT_ERROR_INVALID_ARGUMENT;
     }
-    try {
         set_scalar_layout(ctx->ctx);
         ctx->ctx.setParameterPointer(ptr);
         return EASYJIT_OK;
-    } catch (const std::exception& e) {
-        set_last_error(e.what());
-        return EASYJIT_ERROR_INTERNAL;
-    }
 }
 
 extern "C"
@@ -195,7 +170,6 @@ easyjit_error_t easyjit_context_set_struct(easyjit_context_t ctx,
         set_last_error("easyjit_context_set_struct: data is NULL with non-zero size");
         return EASYJIT_ERROR_INVALID_ARGUMENT;
     }
-    try {
         /* For structs passed via the C API we assume 1 LLVM-IR argument
          * (either passed by pointer or coerced to a single integer/register).
          * This matches the common case on aarch64/x86-64 for small structs. */
@@ -203,10 +177,6 @@ easyjit_error_t easyjit_context_set_struct(easyjit_context_t ctx,
         easy::serialized_arg arg(data, size);
         ctx->ctx.setParameterStruct(std::move(arg));
         return EASYJIT_OK;
-    } catch (const std::exception& e) {
-        set_last_error(e.what());
-        return EASYJIT_ERROR_INTERNAL;
-    }
 }
 
 extern "C"
@@ -237,14 +207,9 @@ easyjit_error_t easyjit_context_set_global_snapshot(easyjit_context_t ctx,
         set_last_error("easyjit_context_set_global_snapshot: data is NULL with non-zero size");
         return EASYJIT_ERROR_INVALID_ARGUMENT;
     }
-    try {
         easy::serialized_arg arg(data, size);
         ctx->ctx.setGlobalStruct(global_addr, std::move(arg));
         return EASYJIT_OK;
-    } catch (const std::exception& e) {
-        set_last_error(e.what());
-        return EASYJIT_ERROR_INTERNAL;
-    }
 }
 
 extern "C"
@@ -259,13 +224,8 @@ easyjit_error_t easyjit_context_set_global_partial_struct(easyjit_context_t ctx,
         set_last_error("easyjit_context_set_global_partial_struct: global_addr is NULL");
         return EASYJIT_ERROR_INVALID_ARGUMENT;
     }
-    try {
         ctx->ctx.setGlobalPartialStruct(global_addr);
         return EASYJIT_OK;
-    } catch (const std::exception& e) {
-        set_last_error(e.what());
-        return EASYJIT_ERROR_INTERNAL;
-    }
 }
 
 extern "C"
@@ -282,16 +242,11 @@ easyjit_error_t easyjit_context_bind_global_field(easyjit_context_t ctx,
         set_last_error("easyjit_context_bind_global_field: data is NULL with non-zero size");
         return EASYJIT_ERROR_INVALID_ARGUMENT;
     }
-    try {
         std::vector<char> bytes(size);
         if (!bytes.empty())
             std::memcpy(bytes.data(), data, size);
         ctx->ctx.bindFieldToLastGlobalPartialStruct(field_offset, std::move(bytes));
         return EASYJIT_OK;
-    } catch (const std::exception& e) {
-        set_last_error(e.what());
-        return EASYJIT_ERROR_INTERNAL;
-    }
 }
 
 extern "C"
@@ -313,16 +268,11 @@ easyjit_error_t easyjit_context_bind_global_array(easyjit_context_t ctx,
         set_last_error("easyjit_context_bind_global_array: element_size is zero with non-zero count");
         return EASYJIT_ERROR_INVALID_ARGUMENT;
     }
-    try {
         std::vector<char> bytes(count * element_size);
         if (!bytes.empty())
             std::memcpy(bytes.data(), data, bytes.size());
         ctx->ctx.bindArrayToLastGlobalPartialStruct(field_offset, std::move(bytes), count, element_size);
         return EASYJIT_OK;
-    } catch (const std::exception& e) {
-        set_last_error(e.what());
-        return EASYJIT_ERROR_INTERNAL;
-    }
 }
 
 extern "C"
@@ -333,14 +283,9 @@ easyjit_error_t easyjit_context_set_partial_struct(easyjit_context_t ctx,
         set_last_error("easyjit_context_set_partial_struct: ctx is NULL");
         return EASYJIT_ERROR_INVALID_ARGUMENT;
     }
-    try {
         set_scalar_layout(ctx->ctx);
         ctx->ctx.setPartialStruct(index);
         return EASYJIT_OK;
-    } catch (const std::exception& e) {
-        set_last_error(e.what());
-        return EASYJIT_ERROR_INTERNAL;
-    }
 }
 
 extern "C"
@@ -357,16 +302,11 @@ easyjit_error_t easyjit_context_bind_field(easyjit_context_t ctx,
         set_last_error("easyjit_context_bind_field: data is NULL with non-zero size");
         return EASYJIT_ERROR_INVALID_ARGUMENT;
     }
-    try {
         std::vector<char> bytes(size);
         if (!bytes.empty())
             std::memcpy(bytes.data(), data, size);
         ctx->ctx.bindFieldToLastPartialStruct(field_offset, std::move(bytes));
         return EASYJIT_OK;
-    } catch (const std::exception& e) {
-        set_last_error(e.what());
-        return EASYJIT_ERROR_INTERNAL;
-    }
 }
 
 extern "C"
@@ -388,16 +328,11 @@ easyjit_error_t easyjit_context_bind_array(easyjit_context_t ctx,
         set_last_error("easyjit_context_bind_array: element_size is zero with non-zero count");
         return EASYJIT_ERROR_INVALID_ARGUMENT;
     }
-    try {
         std::vector<char> bytes(count * element_size);
         if (!bytes.empty())
             std::memcpy(bytes.data(), data, bytes.size());
         ctx->ctx.bindArrayToLastStruct(field_offset, std::move(bytes), count, element_size);
         return EASYJIT_OK;
-    } catch (const std::exception& e) {
-        set_last_error(e.what());
-        return EASYJIT_ERROR_INTERNAL;
-    }
 }
 
 extern "C"
@@ -418,17 +353,12 @@ easyjit_error_t easyjit_context_set_array(easyjit_context_t ctx,
         set_last_error("easyjit_context_set_array: element_size is zero with non-zero count");
         return EASYJIT_ERROR_INVALID_ARGUMENT;
     }
-    try {
         set_scalar_layout(ctx->ctx);
         std::vector<char> bytes(count * element_size);
         if (!bytes.empty())
             std::memcpy(bytes.data(), data, bytes.size());
         ctx->ctx.setParameterArray(std::move(bytes), count, element_size);
         return EASYJIT_OK;
-    } catch (const std::exception& e) {
-        set_last_error(e.what());
-        return EASYJIT_ERROR_INTERNAL;
-    }
 }
 
 extern "C"
@@ -448,13 +378,8 @@ easyjit_error_t easyjit_context_set_opt_level(easyjit_context_t ctx,
         set_last_error("easyjit_context_set_opt_level: opt_size must be 0-2");
         return EASYJIT_ERROR_INVALID_ARGUMENT;
     }
-    try {
         ctx->ctx.setOptLevel(opt_level, opt_size);
         return EASYJIT_OK;
-    } catch (const std::exception& e) {
-        set_last_error(e.what());
-        return EASYJIT_ERROR_INTERNAL;
-    }
 }
 
 extern "C"
@@ -465,13 +390,8 @@ easyjit_error_t easyjit_context_set_dump_ir(easyjit_context_t ctx,
         set_last_error("easyjit_context_set_dump_ir: ctx is NULL");
         return EASYJIT_ERROR_INVALID_ARGUMENT;
     }
-    try {
         ctx->ctx.setDebugFile(file ? file : "");
         return EASYJIT_OK;
-    } catch (const std::exception& e) {
-        set_last_error(e.what());
-        return EASYJIT_ERROR_INTERNAL;
-    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -501,24 +421,22 @@ easyjit_error_t easyjit_compile(void* func_ptr,
         set_last_error("easyjit_compile: out_fn is NULL");
         return EASYJIT_ERROR_INVALID_ARGUMENT;
     }
-    try {
-        EASYJIT_RT_LOG("easyjit_compile: calling easy::Function::Compile\n");
-        auto compiled = easy::Function::Compile(func_ptr, ctx->ctx);
-        if (!compiled) {
-            EASYJIT_RT_LOG("easyjit_compile: easy::Function::Compile returned null\n");
-            set_last_error("easyjit_compile: compilation returned null");
-            return EASYJIT_ERROR_COMPILE_FAILED;
-        }
-        auto* handle = new easyjit_function_s();
-        handle->fun = std::move(compiled);
-        *out_fn = handle;
-        EASYJIT_RT_LOG("easyjit_compile: success handle=%p\n", (void*)handle);
-        return EASYJIT_OK;
-    } catch (const std::exception& e) {
-        EASYJIT_RT_LOG("easyjit_compile: exception=%s\n", e.what());
-        set_last_error(e.what());
+    EASYJIT_RT_LOG("easyjit_compile: calling easy::Function::Compile\n");
+    auto compiled = easy::Function::Compile(func_ptr, ctx->ctx);
+    if (!compiled) {
+        EASYJIT_RT_LOG("easyjit_compile: easy::Function::Compile returned null\n");
+        set_last_error("easyjit_compile: compilation returned null");
         return EASYJIT_ERROR_COMPILE_FAILED;
     }
+    auto* handle = new easyjit_function_s();
+    if (!handle) {
+        set_last_error("easyjit_compile: handle allocation failed");
+        return EASYJIT_ERROR_INTERNAL;
+    }
+    handle->fun = std::move(compiled);
+    *out_fn = handle;
+    EASYJIT_RT_LOG("easyjit_compile: success handle=%p\n", (void*)handle);
+    return EASYJIT_OK;
 }
 
 extern "C"
@@ -569,13 +487,12 @@ easyjit_error_t easyjit_cache_create(easyjit_cache_t* out_cache) {
         set_last_error("easyjit_cache_create: out_cache is NULL");
         return EASYJIT_ERROR_INVALID_ARGUMENT;
     }
-    try {
-        *out_cache = new easyjit_cache_s();
-        return EASYJIT_OK;
-    } catch (const std::exception& e) {
-        set_last_error(e.what());
+    *out_cache = new easyjit_cache_s();
+    if (!*out_cache) {
+        set_last_error("easyjit_cache_create: allocation failed");
         return EASYJIT_ERROR_INTERNAL;
     }
+    return EASYJIT_OK;
 }
 
 extern "C"

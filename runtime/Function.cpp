@@ -43,7 +43,6 @@
 #include <llvm/Support/Path.h>
 #include <cstdio>
 #include <cstdlib>
-#include <stdexcept>
 
 #ifdef NDEBUG
 #include <llvm/IR/Verifier.h>
@@ -156,7 +155,7 @@ static std::unique_ptr<llvm::TargetMachine> GetTargetMachineForModule(llvm::Modu
 
   if (!Target) {
     EASYJIT_RT_LOG("GetTargetMachineForModule: lookup failed error=%s\n", Error.c_str());
-    throw easy::TargetLookupError(TripleStr.c_str());
+    return nullptr;
   }
 
   llvm::TargetOptions Options;
@@ -192,7 +191,7 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
   std::unique_ptr<llvm::TargetMachine> TM = GetTargetMachineForModule(M);
   if (!TM) {
     EASYJIT_RT_LOG("Optimize: target machine creation failed for %s\n", Name ? Name : "<null>");
-    throw easy::TargetMachineCreateError(Name);
+    return;
   }
   M.setTargetTriple(TripleStr);
   M.setDataLayout(TM->createDataLayout());
@@ -392,7 +391,7 @@ CreateJIT(llvm::Module const& M, const char *Name) {
     auto Err = TakeError(JITOrErr.takeError());
     EASYJIT_RT_LOG("CreateJIT: failed name=%s error=%s\n",
                    Name ? Name : "<null>", Err.c_str());
-    throw easy::JITCreateError(Name);
+    return nullptr;
   }
 
   EASYJIT_RT_LOG("CreateJIT: success name=%s jit=%p\n",
@@ -400,7 +399,7 @@ CreateJIT(llvm::Module const& M, const char *Name) {
   return std::move(*JITOrErr);
 }
 
-static void MapGlobals(easy::detail::MinimalOrcJIT& JIT, GlobalMapping* Globals) {
+static bool MapGlobals(easy::detail::MinimalOrcJIT& JIT, GlobalMapping* Globals) {
   EASYJIT_RT_LOG("MapGlobals: begin jit=%p globals=%p\n", (void*)&JIT, (void*)Globals);
 
   llvm::orc::MangleAndInterner Mangle(JIT.getExecutionSession(), JIT.getDataLayout());
@@ -421,7 +420,7 @@ static void MapGlobals(easy::detail::MinimalOrcJIT& JIT, GlobalMapping* Globals)
   if (auto Err = JIT.getMainJITDylib().define(absoluteSymbols(std::move(Symbols)))) {
     auto ErrStr = TakeError(std::move(Err));
     EASYJIT_RT_LOG("MapGlobals: define failed error=%s\n", ErrStr.c_str());
-    throw easy::JITCreateError("global mapping");
+    return false;
   }
 
   auto GeneratorOrErr =
@@ -430,11 +429,12 @@ static void MapGlobals(easy::detail::MinimalOrcJIT& JIT, GlobalMapping* Globals)
   if (!GeneratorOrErr) {
     auto ErrStr = TakeError(GeneratorOrErr.takeError());
     EASYJIT_RT_LOG("MapGlobals: current-process generator failed error=%s\n", ErrStr.c_str());
-    throw easy::JITCreateError("current process symbols");
+    return false;
   }
 
   JIT.getMainJITDylib().addGenerator(std::move(*GeneratorOrErr));
   EASYJIT_RT_LOG("MapGlobals: end\n");
+  return true;
 }
 #endif // !EASYJIT_LIGHT_BACKEND_ONLY
 
@@ -445,7 +445,7 @@ static void WriteOptimizedToFile(llvm::Module const &M, std::string const& File)
   llvm::raw_fd_ostream Out(File, Error, llvm::sys::fs::OF_None);
 
   if(Error)
-    throw CouldNotOpenFile(Error.message());
+    return;
 
   Out << M;
 }
@@ -483,13 +483,16 @@ CompileAndWrap(const char*Name, GlobalMapping* Globals,
   if (!StoredModule) {
     EASYJIT_RT_LOG("CompileAndWrap: failed to clone optimized module name=%s\n",
                    Name ? Name : "<null>");
-    throw easy::JITCreateError(Name);
+    return nullptr;
   }
 
   auto JIT = CreateJIT(*M, Name);
+  if (!JIT)
+    return nullptr;
 
   if(Globals) {
-    MapGlobals(*JIT, Globals);
+    if (!MapGlobals(*JIT, Globals))
+      return nullptr;
   }
 
   EASYJIT_RT_LOG("CompileAndWrap: addIRModule begin name=%s\n", Name ? Name : "<null>");
@@ -498,14 +501,14 @@ CompileAndWrap(const char*Name, GlobalMapping* Globals,
   if (!JITModule) {
     EASYJIT_RT_LOG("CompileAndWrap: failed to clone jit module name=%s\n",
                    Name ? Name : "<null>");
-    throw easy::JITCreateError(Name);
+    return nullptr;
   }
 
   if (auto Err = JIT->addIRModule(std::move(JITModule), std::move(TSCtx))) {
     auto ErrStr = TakeError(std::move(Err));
     EASYJIT_RT_LOG("CompileAndWrap: addIRModule failed name=%s error=%s\n",
                    Name ? Name : "<null>", ErrStr.c_str());
-    throw easy::JITCreateError(Name);
+    return nullptr;
   }
   EASYJIT_RT_LOG("CompileAndWrap: addIRModule end name=%s\n", Name ? Name : "<null>");
 
@@ -515,7 +518,7 @@ CompileAndWrap(const char*Name, GlobalMapping* Globals,
     auto ErrStr = TakeError(AddressOrErr.takeError());
     EASYJIT_RT_LOG("CompileAndWrap: lookup failed name=%s error=%s\n",
                    Name ? Name : "<null>", ErrStr.c_str());
-    throw easy::SymbolLookupError(Name);
+    return nullptr;
   }
 
   void *Address = llvm::jitTargetAddressToPointer<void *>(AddressOrErr->getAddress());
@@ -532,10 +535,10 @@ CompileAndWrap(const char*Name, GlobalMapping* Globals,
 
 llvm::Module const& Function::getLLVMModule() const {
   llvm::Module *M = this->Holder->getModule();
-  if (!M)
-    throw std::runtime_error(
-        "easy::Function::getLLVMModule: function has no LLVM module "
-        "(compiled function fell back to the original function pointer)");
+  if (!M) {
+    EASYJIT_RT_LOG("Function::getLLVMModule: no module, aborting\n");
+    std::abort();
+  }
   return *M;
 }
 
@@ -549,12 +552,21 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
   const char* Name;
   GlobalMapping* Globals;
   std::tie(Name, Globals) = BT.getNameAndGlobalMapping(Addr);
+  if (!Name) {
+    EASYJIT_RT_LOG("Function::Compile: tracker lookup failed addr=%p\n", Addr);
+    return nullptr;
+  }
   EASYJIT_RT_LOG("Function::Compile: tracker name=%s globals=%p\n",
                  Name ? Name : "<null>", (void*)Globals);
 
   std::unique_ptr<llvm::Module> M;
   std::unique_ptr<llvm::LLVMContext> Ctx;
   std::tie(M, Ctx) = BT.getModule(Addr);
+  if (!M || !Ctx) {
+    EASYJIT_RT_LOG("Function::Compile: null module/context after tracker lookup addr=%p module=%p ctx=%p\n",
+                   Addr, (void*)M.get(), (void*)Ctx.get());
+    return nullptr;
+  }
   EASYJIT_RT_LOG("Function::Compile: module loaded module=%p ctx=%p module_triple=%s datalayout=%s\n",
                  (void*)M.get(),
                  (void*)Ctx.get(),
@@ -609,7 +621,7 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
       auto rep = easy::light_backend::TryLightCompile(
           Name, Globals, Ctx, M, lightFn, policy);
 
-      // Helper: when we are about to throw out of Function::Compile, the
+      // Helper: when we are about to fail out of Function::Compile, the
       // module must be torn down BEFORE the LLVMContext (M's destructor
       // calls LLVMContext::removeModule). Reset M here so the implicit
       // reverse-declaration order of locals (Ctx destroyed before M) does
@@ -627,9 +639,7 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
           EASYJIT_RT_LOG("Function::Compile: EASYJIT_LIGHT=force rejected: %s\n",
                          rep.reason.c_str());
           failCleanup();
-          throw easy::LightBackendCompileError(
-              std::string(Name ? Name : "<null>") +
-              " (EASYJIT_LIGHT=force, reason: " + rep.reason + ")");
+          return nullptr;
         case easy::light_backend::Outcome::Unsupported:
 #if EASYJIT_LIGHT_BACKEND_ONLY
           EASYJIT_RT_LOG("Function::Compile: light unsupported in light-only build: %s\n",
@@ -643,11 +653,7 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
             return MakeOriginalFunctionFallback(Addr, std::move(reason));
           }
           failCleanup();
-          throw easy::LightBackendCompileError(
-              std::string(Name ? Name : "<null>") +
-              " (unsupported IR, reason: " + rep.reason +
-              "; light-only runtime has no ORC fallback and original function "
-              "fallback is unsafe because the context changes the call signature)");
+          return nullptr;
 #else
           EASYJIT_RT_LOG("Function::Compile: light unsupported (%s), ORC fallback\n",
                          rep.reason.c_str());
@@ -658,10 +664,7 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
           EASYJIT_RT_LOG("Function::Compile: light skipped in light-only build: %s\n",
                          rep.reason.c_str());
           failCleanup();
-          throw easy::LightBackendCompileError(
-              std::string(Name ? Name : "<null>") +
-              " (skipped by policy: " + rep.reason +
-              "; light-only runtime has no ORC fallback)");
+          return nullptr;
 #else
           EASYJIT_RT_LOG("Function::Compile: light skipped (%s)\n",
                          rep.reason.c_str());
@@ -678,9 +681,7 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
   // a live LLVMContext).
   M.reset();
   EASYJIT_RT_LOG("Function::Compile: light-only build cannot fall back\n");
-  throw easy::LightBackendCompileError(
-      std::string(Name ? Name : "<null>") +
-      " (light-only runtime, LightBackend not engaged)");
+  return nullptr;
 #else
   EASYJIT_RT_LOG("Function::Compile: CompileAndWrap begin\n");
   return CompileAndWrap(Name, Globals, std::move(Ctx), std::move(M));
@@ -742,8 +743,7 @@ std::unique_ptr<easy::Function> easy::Function::deserialize(std::istream& is) {
                  FunName.c_str(), rep.reason.c_str());
   // Tear down M before its parent LLVMContext goes out of scope.
   M.reset();
-  throw easy::LightBackendCompileError(
-      FunName + " (deserialize, light-only runtime, reason: " + rep.reason + ")");
+  return nullptr;
 #else
   return CompileAndWrap(FunName.c_str(), Globals, std::move(Ctx), std::move(M));
 #endif // EASYJIT_LIGHT_BACKEND_ONLY
