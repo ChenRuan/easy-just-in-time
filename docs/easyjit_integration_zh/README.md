@@ -4,6 +4,7 @@
 
 - [01_easyjit_cpp_usage.md](01_easyjit_cpp_usage.md)：EasyJIT C++ 接口怎么用，按仓库现有用例讲 `easy::jit`、参数绑定、snapshot、cache、dump IR、轻量后端。
 - [02_cmake_use_cpp_and_link_easyjit.md](02_cmake_use_cpp_and_link_easyjit.md)：CMake 项目怎么启用 C++、怎么让 C 代码整体或局部按 C++ 编译、怎么 include EasyJIT 并链接静态库。
+- [03_light_backend_design.md](03_light_backend_design.md)：轻量 AArch64 后端完整设计说明，覆盖架构、IR 子集、大小端模型、可复刻测试、优缺点和技术评审问题清单。
 
 配套交付物（仓库根目录下）：
 
