@@ -250,15 +250,14 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
   // unchanged.
 
   llvm::legacy::PassManager MPM;
-  EASYJIT_RT_LOG("Optimize: add TargetTransformInfo pass\n");
-#if !EASYJIT_LIGHT_BACKEND_ONLY
-  MPM.add(llvm::createTargetTransformInfoWrapperPass(TM->getTargetIRAnalysis()));
-#else
-  // Light-only: use a default (no-target) TargetIRAnalysis. The custom
-  // ConstStructPropagate pass and InstCombine-free pipeline do not rely
-  // on accurate cost modeling.
-  MPM.add(llvm::createTargetTransformInfoWrapperPass(llvm::TargetIRAnalysis()));
-#endif
+  EASYJIT_RT_LOG("Optimize: skip TargetTransformInfo pass\n");
+  // Do not install TargetTransformInfo here.  The target SDK used by the
+  // embedded light-runtime path has an unstable libc++ std::function
+  // implementation, and createTargetTransformInfoWrapperPass constructs a
+  // TargetIRAnalysis callback through std::function.  The EasyJIT pipeline
+  // below is driven by binding/snapshot propagation and simple scalar cleanup;
+  // it does not require a target cost model.  Skipping TTI avoids the
+  // std::function::swap crash while preserving the light backend's IR shape.
   EASYJIT_RT_LOG("Optimize: add ContextAnalysis pass ctx_size=%zu\n", C.size());
   MPM.add(easy::createContextAnalysisPass(C));
   EASYJIT_RT_LOG("Optimize: add InlineParameters pass target=%s\n", Name ? Name : "<null>");
