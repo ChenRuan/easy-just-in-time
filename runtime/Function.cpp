@@ -258,27 +258,42 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
   // below is driven by binding/snapshot propagation and simple scalar cleanup;
   // it does not require a target cost model.  Skipping TTI avoids the
   // std::function::swap crash while preserving the light backend's IR shape.
-  EASYJIT_RT_LOG("Optimize: add ContextAnalysis pass ctx_size=%zu\n", C.size());
-  MPM.add(easy::createContextAnalysisPass(C));
-  EASYJIT_RT_LOG("Optimize: add InlineParameters pass target=%s\n", Name ? Name : "<null>");
-  MPM.add(easy::createInlineParametersPass(Name));
-  EASYJIT_RT_LOG("Optimize: add DevirtualizeConstant pass target=%s\n", Name ? Name : "<null>");
-  MPM.add(easy::createDevirtualizeConstantPass(Name));
-  EASYJIT_RT_LOG("Optimize: add FunctionInlining pass opt=%u size=%u\n", OptLevel, OptSize);
+
+#define EASYJIT_ADD_OPT_PASS(Label, CreateExpr)                               \
+  do {                                                                        \
+    EASYJIT_RT_LOG("Optimize: before create %s\n", Label);                   \
+    llvm::Pass *EasyJitOptPass = (CreateExpr);                                \
+    EASYJIT_RT_LOG("Optimize: after create %s pass=%p\n", Label,             \
+                   (void *)EasyJitOptPass);                                   \
+    EASYJIT_RT_LOG("Optimize: before add %s pass=%p\n", Label,               \
+                   (void *)EasyJitOptPass);                                   \
+    MPM.add(EasyJitOptPass);                                                  \
+    EASYJIT_RT_LOG("Optimize: after add %s pass=%p\n", Label,                \
+                   (void *)EasyJitOptPass);                                   \
+  } while (false)
+
+  EASYJIT_ADD_OPT_PASS("ContextAnalysis",
+                       easy::createContextAnalysisPass(C));
+  EASYJIT_ADD_OPT_PASS("InlineParameters",
+                       easy::createInlineParametersPass(Name));
+  EASYJIT_ADD_OPT_PASS("DevirtualizeConstant",
+                       easy::createDevirtualizeConstantPass(Name));
   // Inline the wrapper -> original-function call (critical).
-  MPM.add(llvm::createFunctionInliningPass(OptLevel, OptSize, false));
+  EASYJIT_ADD_OPT_PASS("FunctionInlining",
+                       llvm::createFunctionInliningPass(OptLevel, OptSize,
+                                                        false));
   // Custom lightweight propagator: alloca/store/GEP/load -> const.
-  EASYJIT_RT_LOG("Optimize: add ConstStructPropagate pass #1 target=%s\n", Name ? Name : "<null>");
-  MPM.add(easy::createConstStructPropagatePass(Name));
+  EASYJIT_ADD_OPT_PASS("ConstStructPropagate#1",
+                       easy::createConstStructPropagatePass(Name));
   // Promote remaining allocas to SSA.
-  EASYJIT_RT_LOG("Optimize: add mem2reg pass\n");
-  MPM.add(llvm::createPromoteMemoryToRegisterPass());
+  EASYJIT_ADD_OPT_PASS("PromoteMemoryToRegister",
+                       llvm::createPromoteMemoryToRegisterPass());
   // Second round picks up constants exposed by mem2reg.
-  EASYJIT_RT_LOG("Optimize: add ConstStructPropagate pass #2 target=%s\n", Name ? Name : "<null>");
-  MPM.add(easy::createConstStructPropagatePass(Name));
+  EASYJIT_ADD_OPT_PASS("ConstStructPropagate#2",
+                       easy::createConstStructPropagatePass(Name));
   // Canonicalize simple arithmetic and casts after constants are exposed.
-  EASYJIT_RT_LOG("Optimize: add InstCombine pass\n");
-  MPM.add(llvm::createInstructionCombiningPass());
+  EASYJIT_ADD_OPT_PASS("InstCombine",
+                       llvm::createInstructionCombiningPass());
   // Scalar loop unroll (light backend friendly).
   //
   // EasyJIT specialization typically turns runtime-fixed loop bounds
@@ -296,11 +311,10 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
   //   -fno-vectorize -fno-slp-vectorize
   // see runtime/LightBackend_LIMITATIONS.md.
   if (OptLevel >= 2) {
-    EASYJIT_RT_LOG("Optimize: add loop canonicalization/unroll passes\n");
-    MPM.add(llvm::createLoopSimplifyPass());
-    MPM.add(llvm::createLCSSAPass());
-    MPM.add(llvm::createLoopRotatePass());
-    MPM.add(llvm::createLoopUnrollPass(
+    EASYJIT_ADD_OPT_PASS("LoopSimplify", llvm::createLoopSimplifyPass());
+    EASYJIT_ADD_OPT_PASS("LCSSA", llvm::createLCSSAPass());
+    EASYJIT_ADD_OPT_PASS("LoopRotate", llvm::createLoopRotatePass());
+    EASYJIT_ADD_OPT_PASS("LoopUnroll", llvm::createLoopUnrollPass(
         /*OptLevel=*/(int)OptLevel,
         /*OnlyWhenForced=*/false,
         /*ForgetAllSCEV=*/false));
@@ -310,18 +324,22 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
     // The downstream CFGSimplify + the light backend's per-instruction
     // emitter handle the loop-unroll output without a second pass.
   }
-  EASYJIT_RT_LOG("Optimize: add CFGSimplification/Internalize/GlobalDCE/StripDeadPrototypes\n");
   // Minimal cleanup.
-  MPM.add(llvm::createCFGSimplificationPass());
-  MPM.add(llvm::createInternalizePass([Name](const llvm::GlobalValue &GV) {
+  EASYJIT_ADD_OPT_PASS("CFGSimplification",
+                       llvm::createCFGSimplificationPass());
+  EASYJIT_ADD_OPT_PASS("Internalize", llvm::createInternalizePass(
+      [Name](const llvm::GlobalValue &GV) {
     return GV.getName() == Name || GV.getName() == "__dso_handle";
   }));
-  MPM.add(llvm::createGlobalDCEPass());
-  MPM.add(llvm::createStripDeadPrototypesPass());
+  EASYJIT_ADD_OPT_PASS("GlobalDCE", llvm::createGlobalDCEPass());
+  EASYJIT_ADD_OPT_PASS("StripDeadPrototypes",
+                       llvm::createStripDeadPrototypesPass());
 
 #ifdef NDEBUG
-  MPM.add(llvm::createVerifierPass());
+  EASYJIT_ADD_OPT_PASS("Verifier", llvm::createVerifierPass());
 #endif
+
+#undef EASYJIT_ADD_OPT_PASS
 
   EASYJIT_RT_LOG("Optimize: running pass manager for %s\n", Name ? Name : "<null>");
   MPM.run(M);
