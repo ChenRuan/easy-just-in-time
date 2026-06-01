@@ -38,6 +38,7 @@
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/Host.h>
 #include <llvm/Support/Error.h>
+#include <llvm/Support/raw_ostream.h>
 #if !EASYJIT_LIGHT_BACKEND_ONLY
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/MC/TargetRegistry.h>
@@ -46,6 +47,7 @@
 #include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/Path.h>
+#include <llvm/ADT/SmallString.h>
 #include <cstdio>
 #include <cstdlib>
 
@@ -152,6 +154,55 @@ static void LogValueBrief(const char *Label, llvm::Value *V) {
 static bool IsInterestingGlobalName(llvm::StringRef N) {
   return N == "llvm.global_ctors" || N == "llvm.global_dtors" ||
          N.startswith("llvm.") || N == "stderr" || N == "__dso_handle";
+}
+
+class SreRawOStream : public llvm::raw_ostream {
+public:
+  SreRawOStream() = default;
+
+private:
+  uint64_t Pos = 0;
+
+  void write_impl(const char *Ptr, size_t Size) override {
+    Pos += Size;
+
+    // Keep each SRE_printf bounded; some board-side loggers dislike very long
+    // printf payloads, and this avoids raw_string_ostream entirely.
+    while (Size != 0) {
+      size_t Chunk = Size < 180 ? Size : 180;
+      EASYJIT_RT_LOG("IRDUMP: %.*s", (int)Chunk, Ptr);
+      Ptr += Chunk;
+      Size -= Chunk;
+    }
+  }
+
+  uint64_t current_pos() const override { return Pos; }
+};
+
+static void DumpFunctionIRToSre(llvm::Module &M, const char *Name,
+                                const char *Reason) {
+  EASYJIT_RT_LOG("IRDUMP: begin reason=%s module=%p target=%s\n",
+                 Reason ? Reason : "<null>", (void *)&M,
+                 Name ? Name : "<null>");
+
+  SreRawOStream OS;
+  if (Name) {
+    if (llvm::Function *F = M.getFunction(Name)) {
+      EASYJIT_RT_LOG("IRDUMP: function-print begin fn=%p\n", (void *)F);
+      F->print(OS);
+      OS.flush();
+      EASYJIT_RT_LOG("IRDUMP: function-print end\n");
+      EASYJIT_RT_LOG("IRDUMP: end\n");
+      return;
+    }
+    EASYJIT_RT_LOG("IRDUMP: target function missing, fallback to module print\n");
+  }
+
+  EASYJIT_RT_LOG("IRDUMP: module-print begin\n");
+  M.print(OS, nullptr);
+  OS.flush();
+  EASYJIT_RT_LOG("IRDUMP: module-print end\n");
+  EASYJIT_RT_LOG("IRDUMP: end\n");
 }
 
 static void LogBasicIRShape(llvm::Module &M) {
@@ -591,6 +642,7 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
     BrokenDebugInfoBeforeInstCombine = BrokenDebugInfoAfterStrip;
   }
   if (BrokenBeforeInstCombine) {
+    DumpFunctionIRToSre(M, Name, "broken-before-instcombine");
     LogBasicIRShape(M);
     EASYJIT_RT_LOG("Optimize: module broken before InstCombine, stop optimize\n");
     return;
@@ -1038,16 +1090,15 @@ std::unique_ptr<Function> Function::Compile(void *Addr, easy::Context const& C) 
 }
 
 void easy::Function::serialize(std::ostream& os) const {
-  std::string buf;
-  llvm::raw_string_ostream stream(buf);
+  llvm::SmallString<0> buf;
+  llvm::raw_svector_ostream stream(buf);
 
   llvm::Module *M = Holder->getModule();
   if (M) {
     llvm::WriteBitcodeToFile(*M, stream);
-    stream.flush();
   }
 
-  os << buf;
+  os.write(buf.data(), buf.size());
 }
 
 std::unique_ptr<easy::Function> easy::Function::deserialize(std::istream& is) {
