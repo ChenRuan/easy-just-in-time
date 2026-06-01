@@ -156,53 +156,168 @@ static bool IsInterestingGlobalName(llvm::StringRef N) {
          N.startswith("llvm.") || N == "stderr" || N == "__dso_handle";
 }
 
-class SreRawOStream : public llvm::raw_ostream {
-public:
-  SreRawOStream() = default;
+static const char *ValueClassName(llvm::Value *V) {
+  if (!V)
+    return "null";
+  if (llvm::isa<llvm::Argument>(V))
+    return "arg";
+  if (llvm::isa<llvm::BasicBlock>(V))
+    return "bb";
+  if (llvm::isa<llvm::Function>(V))
+    return "func";
+  if (llvm::isa<llvm::GlobalVariable>(V))
+    return "global";
+  if (llvm::isa<llvm::Instruction>(V))
+    return "inst";
+  if (llvm::isa<llvm::ConstantInt>(V))
+    return "const-int";
+  if (llvm::isa<llvm::ConstantFP>(V))
+    return "const-fp";
+  if (llvm::isa<llvm::ConstantPointerNull>(V))
+    return "const-null";
+  if (llvm::isa<llvm::UndefValue>(V))
+    return "undef";
+  if (llvm::isa<llvm::ConstantExpr>(V))
+    return "const-expr";
+  if (llvm::isa<llvm::Constant>(V))
+    return "const";
+  return "value";
+}
 
-private:
-  uint64_t Pos = 0;
-
-  void write_impl(const char *Ptr, size_t Size) override {
-    Pos += Size;
-
-    // Keep each SRE_printf bounded; some board-side loggers dislike very long
-    // printf payloads, and this avoids raw_string_ostream entirely.
-    while (Size != 0) {
-      size_t Chunk = Size < 180 ? Size : 180;
-      EASYJIT_RT_LOG("IRDUMP: %.*s", (int)Chunk, Ptr);
-      Ptr += Chunk;
-      Size -= Chunk;
-    }
+static void LogPseudoValue(const char *Prefix, llvm::Value *V) {
+  if (!V) {
+    EASYJIT_RT_LOG("%s value=<null>\n", Prefix);
+    return;
   }
 
-  uint64_t current_pos() const override { return Pos; }
-};
+  llvm::StringRef N;
+  if (V->hasName())
+    N = V->getName();
 
-static void DumpFunctionIRToSre(llvm::Module &M, const char *Name,
-                                const char *Reason) {
-  EASYJIT_RT_LOG("IRDUMP: begin reason=%s module=%p target=%s\n",
+  EASYJIT_RT_LOG("%s value=%p class=%s type_kind=%s type_hint=%u name=%.*s\n",
+                 Prefix, (void *)V, ValueClassName(V),
+                 TypeKindName(V->getType()), TypeBitHint(V->getType()),
+                 (int)N.size(), N.data());
+
+  if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(V)) {
+    unsigned Bits = CI->getBitWidth();
+    if (Bits <= 64)
+      EASYJIT_RT_LOG("%s const_int bits=%u zext=%llu sext=%lld\n", Prefix,
+                     Bits, (unsigned long long)CI->getZExtValue(),
+                     (long long)CI->getSExtValue());
+    else
+      EASYJIT_RT_LOG("%s const_int bits=%u wide=1\n", Prefix, Bits);
+  } else if (auto *CE = llvm::dyn_cast<llvm::ConstantExpr>(V)) {
+    EASYJIT_RT_LOG("%s const_expr opcode=%u ops=%u\n", Prefix,
+                   CE->getOpcode(), CE->getNumOperands());
+  } else if (auto *BB = llvm::dyn_cast<llvm::BasicBlock>(V)) {
+    llvm::StringRef BBN = BB->hasName() ? BB->getName() : llvm::StringRef();
+    EASYJIT_RT_LOG("%s bb=%p bb_name=%.*s insts=%zu\n", Prefix, (void *)BB,
+                   (int)BBN.size(), BBN.data(), (size_t)BB->size());
+  }
+}
+
+static void DumpFunctionPseudoIRToSre(llvm::Module &M, const char *Name,
+                                      const char *Reason) {
+  EASYJIT_RT_LOG("PSEUDOIR: begin reason=%s module=%p target=%s\n",
                  Reason ? Reason : "<null>", (void *)&M,
                  Name ? Name : "<null>");
 
-  SreRawOStream OS;
-  if (Name) {
-    if (llvm::Function *F = M.getFunction(Name)) {
-      EASYJIT_RT_LOG("IRDUMP: function-print begin fn=%p\n", (void *)F);
-      F->print(OS);
-      OS.flush();
-      EASYJIT_RT_LOG("IRDUMP: function-print end\n");
-      EASYJIT_RT_LOG("IRDUMP: end\n");
-      return;
+  llvm::Function *F = Name ? M.getFunction(Name) : nullptr;
+  if (!F) {
+    EASYJIT_RT_LOG("PSEUDOIR: target missing, listing functions only\n");
+    for (llvm::Function &MF : M) {
+      llvm::StringRef FN = MF.getName();
+      EASYJIT_RT_LOG("PSEUDOIR_FUNC_LIST: name=%.*s fn=%p decl=%d broken=%d args=%u\n",
+                     (int)FN.size(), FN.data(), (void *)&MF,
+                     (int)MF.isDeclaration(),
+                     (int)llvm::verifyFunction(MF, nullptr),
+                     (unsigned)MF.arg_size());
     }
-    EASYJIT_RT_LOG("IRDUMP: target function missing, fallback to module print\n");
+    EASYJIT_RT_LOG("PSEUDOIR: end\n");
+    return;
   }
 
-  EASYJIT_RT_LOG("IRDUMP: module-print begin\n");
-  M.print(OS, nullptr);
-  OS.flush();
-  EASYJIT_RT_LOG("IRDUMP: module-print end\n");
-  EASYJIT_RT_LOG("IRDUMP: end\n");
+  llvm::StringRef FN = F->getName();
+  EASYJIT_RT_LOG("PSEUDOIR_FUNC: name=%.*s fn=%p decl=%d broken=%d ret_kind=%s ret_hint=%u args=%u bbs=%zu attrs_sets=%u cc=%u linkage=%u\n",
+                 (int)FN.size(), FN.data(), (void *)F, (int)F->isDeclaration(),
+                 (int)llvm::verifyFunction(*F, nullptr),
+                 TypeKindName(F->getReturnType()), TypeBitHint(F->getReturnType()),
+                 (unsigned)F->arg_size(), (size_t)F->size(),
+                 F->getAttributes().getNumAttrSets(),
+                 (unsigned)F->getCallingConv(), (unsigned)F->getLinkage());
+
+  unsigned ArgIndex = 0;
+  for (llvm::Argument &Arg : F->args()) {
+    llvm::StringRef AN = Arg.hasName() ? Arg.getName() : llvm::StringRef();
+    EASYJIT_RT_LOG("PSEUDOIR_ARG: idx=%u arg=%p type_kind=%s type_hint=%u name=%.*s\n",
+                   ArgIndex, (void *)&Arg, TypeKindName(Arg.getType()),
+                   TypeBitHint(Arg.getType()), (int)AN.size(), AN.data());
+    ++ArgIndex;
+  }
+
+  unsigned BBIndex = 0;
+  for (llvm::BasicBlock &BB : *F) {
+    llvm::StringRef BBN = BB.hasName() ? BB.getName() : llvm::StringRef();
+    unsigned PredCount = 0;
+    for (llvm::BasicBlock *Pred : llvm::predecessors(&BB)) {
+      (void)Pred;
+      ++PredCount;
+    }
+    EASYJIT_RT_LOG("PSEUDOIR_BB: index=%u bb=%p name=%.*s preds=%u insts=%zu term=%p\n",
+                   BBIndex, (void *)&BB, (int)BBN.size(), BBN.data(),
+                   PredCount, (size_t)BB.size(), (void *)BB.getTerminator());
+
+    unsigned InstIndex = 0;
+    for (llvm::Instruction &I : BB) {
+      llvm::StringRef IN = I.hasName() ? I.getName() : llvm::StringRef();
+      EASYJIT_RT_LOG("PSEUDOIR_INST: bb=%u inst=%u ptr=%p opcode=%u opcode_name=%s result_name=%.*s type_kind=%s type_hint=%u ops=%u parent=%p\n",
+                     BBIndex, InstIndex, (void *)&I, I.getOpcode(),
+                     I.getOpcodeName(), (int)IN.size(), IN.data(),
+                     TypeKindName(I.getType()), TypeBitHint(I.getType()),
+                     I.getNumOperands(), (void *)I.getParent());
+
+      if (auto *CB = llvm::dyn_cast<llvm::CallBase>(&I)) {
+        llvm::Value *Called = CB->getCalledOperand();
+        llvm::Function *CalledFn = CB->getCalledFunction();
+        llvm::StringRef CN =
+            CalledFn ? CalledFn->getName() : llvm::StringRef();
+        EASYJIT_RT_LOG("PSEUDOIR_CALL: inst=%p called=%p called_fn=%p called_name=%.*s args=%u fty=%p\n",
+                       (void *)CB, (void *)Called, (void *)CalledFn,
+                       (int)CN.size(), CN.data(), (unsigned)CB->arg_size(),
+                       (void *)CB->getFunctionType());
+      }
+
+      if (auto *BR = llvm::dyn_cast<llvm::BranchInst>(&I)) {
+        EASYJIT_RT_LOG("PSEUDOIR_BR: inst=%p conditional=%d successors=%u\n",
+                       (void *)BR, (int)BR->isConditional(),
+                       BR->getNumSuccessors());
+      } else if (auto *RI = llvm::dyn_cast<llvm::ReturnInst>(&I)) {
+        EASYJIT_RT_LOG("PSEUDOIR_RET: inst=%p retv=%p\n", (void *)RI,
+                       (void *)RI->getReturnValue());
+      } else if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I)) {
+        EASYJIT_RT_LOG("PSEUDOIR_LOAD: inst=%p ptr=%p volatile=%d align=%u\n",
+                       (void *)LI, (void *)LI->getPointerOperand(),
+                       (int)LI->isVolatile(), (unsigned)LI->getAlign().value());
+      } else if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+        EASYJIT_RT_LOG("PSEUDOIR_STORE: inst=%p val=%p ptr=%p volatile=%d align=%u\n",
+                       (void *)SI, (void *)SI->getValueOperand(),
+                       (void *)SI->getPointerOperand(), (int)SI->isVolatile(),
+                       (unsigned)SI->getAlign().value());
+      }
+
+      for (unsigned Op = 0, E = I.getNumOperands(); Op != E; ++Op) {
+        llvm::Value *V = I.getOperand(Op);
+        EASYJIT_RT_LOG("PSEUDOIR_OP: bb=%u inst=%u op=%u owner=%p\n",
+                       BBIndex, InstIndex, Op, (void *)&I);
+        LogPseudoValue("PSEUDOIR_OP_VALUE:", V);
+      }
+      ++InstIndex;
+    }
+    ++BBIndex;
+  }
+
+  EASYJIT_RT_LOG("PSEUDOIR: end\n");
 }
 
 static void LogBasicIRShape(llvm::Module &M) {
@@ -642,7 +757,7 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
     BrokenDebugInfoBeforeInstCombine = BrokenDebugInfoAfterStrip;
   }
   if (BrokenBeforeInstCombine) {
-    DumpFunctionIRToSre(M, Name, "broken-before-instcombine");
+    DumpFunctionPseudoIRToSre(M, Name, "broken-before-instcombine");
     LogBasicIRShape(M);
     EASYJIT_RT_LOG("Optimize: module broken before InstCombine, stop optimize\n");
     return;
