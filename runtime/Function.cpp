@@ -33,6 +33,7 @@
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/CFG.h>
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/DebugInfo.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/Host.h>
@@ -532,9 +533,17 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
   EASYJIT_ADD_OPT_PASS("ConstStructPropagate#2",
                        easy::createConstStructPropagatePass(Name));
   EASYJIT_RT_LOG("Optimize: before InstCombine verifyModule begin\n");
-  bool BrokenBeforeInstCombine = llvm::verifyModule(M, nullptr);
-  EASYJIT_RT_LOG("Optimize: before InstCombine verifyModule end broken=%d\n",
-                 (int)BrokenBeforeInstCombine);
+  bool BrokenDebugInfoBeforeInstCombine = false;
+  bool BrokenBeforeInstCombine =
+      llvm::verifyModule(M, nullptr, &BrokenDebugInfoBeforeInstCombine);
+  EASYJIT_RT_LOG("Optimize: before InstCombine verifyModule end ir_broken=%d debug_broken=%d\n",
+                 (int)BrokenBeforeInstCombine,
+                 (int)BrokenDebugInfoBeforeInstCombine);
+  if (BrokenDebugInfoBeforeInstCombine && !BrokenBeforeInstCombine) {
+    EASYJIT_RT_LOG("Optimize: stripping broken debug info before InstCombine\n");
+    bool Stripped = llvm::StripDebugInfo(M);
+    EASYJIT_RT_LOG("Optimize: StripDebugInfo changed=%d\n", (int)Stripped);
+  }
   if (BrokenBeforeInstCombine) {
     LogBasicIRShape(M);
     EASYJIT_RT_LOG("Optimize: module broken before InstCombine, stop optimize\n");
