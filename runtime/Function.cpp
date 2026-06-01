@@ -149,37 +149,61 @@ static void LogValueBrief(const char *Label, llvm::Value *V) {
                  (void *)T, TypeKindName(T), TypeBitHint(T));
 }
 
+static bool IsInterestingGlobalName(llvm::StringRef N) {
+  return N == "llvm.global_ctors" || N == "llvm.global_dtors" ||
+         N.startswith("llvm.") || N == "stderr" || N == "__dso_handle";
+}
+
 static void LogBasicIRShape(llvm::Module &M) {
-  EASYJIT_RT_LOG("IRCHK: begin module=%p funcs=%zu\n", (void *)&M,
-                 (size_t)M.size());
+  EASYJIT_RT_LOG("IRCHK: begin module=%p funcs=%zu globals=%zu named_md=%zu triple=%s dl_empty=%d\n",
+                 (void *)&M, (size_t)M.size(), (size_t)M.global_size(),
+                 (size_t)M.named_metadata_size(), M.getTargetTriple().c_str(),
+                 (int)M.getDataLayoutStr().empty());
+
+  for (llvm::NamedMDNode &NMD : M.named_metadata()) {
+    llvm::StringRef NN = NMD.getName();
+    EASYJIT_RT_LOG("IRCHK: named_md %.*s operands=%u\n", (int)NN.size(),
+                   NN.data(), NMD.getNumOperands());
+  }
+
   for (llvm::GlobalVariable &GV : M.globals()) {
     llvm::StringRef GN = GV.getName();
-    EASYJIT_RT_LOG("IRCHK: global %.*s gv=%p value_ty=%p kind=%s has_init=%d linkage=%u constant=%d\n",
+    bool InitMismatch =
+        GV.hasInitializer() && GV.getInitializer()->getType() != GV.getValueType();
+    bool Interesting = IsInterestingGlobalName(GN) || InitMismatch ||
+                       GV.hasAppendingLinkage() || GV.hasCommonLinkage();
+    if (!Interesting)
+      continue;
+    EASYJIT_RT_LOG("IRCHK_GLOBAL: %.*s gv=%p value_ty=%p kind=%s has_init=%d linkage=%u constant=%d init_mismatch=%d\n",
                    (int)GN.size(), GN.data(), (void *)&GV,
                    (void *)GV.getValueType(), TypeKindName(GV.getValueType()),
                    (int)GV.hasInitializer(), (unsigned)GV.getLinkage(),
-                   (int)GV.isConstant());
-    if (GV.hasInitializer())
-      LogValueBrief("IRCHK: global initializer", GV.getInitializer());
+                   (int)GV.isConstant(), (int)InitMismatch);
+    if (InitMismatch)
+      LogValueBrief("IRCHK_GLOBAL: bad initializer", GV.getInitializer());
   }
 
   for (llvm::Function &F : M) {
     llvm::StringRef FN = F.getName();
-    EASYJIT_RT_LOG("IRCHK: function-decl %.*s fn=%p decl=%d ret_kind=%s ret_hint=%u args=%u cc=%u\n",
+    bool FunctionBroken = llvm::verifyFunction(F, nullptr);
+    EASYJIT_RT_LOG("IRCHK_FUNC: %.*s fn=%p decl=%d broken=%d ret_kind=%s ret_hint=%u args=%u cc=%u\n",
                    (int)FN.size(), FN.data(), (void *)&F,
-                   (int)F.isDeclaration(), TypeKindName(F.getReturnType()),
+                   (int)F.isDeclaration(), (int)FunctionBroken,
+                   TypeKindName(F.getReturnType()),
                    TypeBitHint(F.getReturnType()), (unsigned)F.arg_size(),
                    (unsigned)F.getCallingConv());
+
+    if (F.isDeclaration() || !FunctionBroken)
+      continue;
+
     unsigned ArgIndex = 0;
     for (llvm::Argument &Arg : F.args()) {
-      EASYJIT_RT_LOG("IRCHK: arg fn=%p idx=%u arg=%p kind=%s hint=%u\n",
+      EASYJIT_RT_LOG("IRCHK_ARG: fn=%p idx=%u arg=%p kind=%s hint=%u\n",
                      (void *)&F, ArgIndex, (void *)&Arg,
                      TypeKindName(Arg.getType()), TypeBitHint(Arg.getType()));
       ++ArgIndex;
     }
 
-    if (F.isDeclaration())
-      continue;
     LogNameRef("IRCHK: function ", FN);
 
     unsigned BBIndex = 0;
@@ -543,6 +567,13 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
     EASYJIT_RT_LOG("Optimize: stripping broken debug info before InstCombine\n");
     bool Stripped = llvm::StripDebugInfo(M);
     EASYJIT_RT_LOG("Optimize: StripDebugInfo changed=%d\n", (int)Stripped);
+    bool BrokenDebugInfoAfterStrip = false;
+    bool BrokenAfterStrip =
+        llvm::verifyModule(M, nullptr, &BrokenDebugInfoAfterStrip);
+    EASYJIT_RT_LOG("Optimize: after StripDebugInfo verify ir_broken=%d debug_broken=%d\n",
+                   (int)BrokenAfterStrip, (int)BrokenDebugInfoAfterStrip);
+    BrokenBeforeInstCombine = BrokenAfterStrip;
+    BrokenDebugInfoBeforeInstCombine = BrokenDebugInfoAfterStrip;
   }
   if (BrokenBeforeInstCombine) {
     LogBasicIRShape(M);
