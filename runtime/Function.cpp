@@ -291,6 +291,14 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
   // Second round picks up constants exposed by mem2reg.
   EASYJIT_ADD_OPT_PASS("ConstStructPropagate#2",
                        easy::createConstStructPropagatePass(Name));
+  EASYJIT_RT_LOG("Optimize: before InstCombine verifyModule begin\n");
+  bool BrokenBeforeInstCombine = llvm::verifyModule(M, nullptr);
+  EASYJIT_RT_LOG("Optimize: before InstCombine verifyModule end broken=%d\n",
+                 (int)BrokenBeforeInstCombine);
+  if (BrokenBeforeInstCombine) {
+    EASYJIT_RT_LOG("Optimize: module broken before InstCombine, stop optimize\n");
+    return;
+  }
   // Canonicalize simple arithmetic and casts after constants are exposed.
   EASYJIT_ADD_OPT_PASS("InstCombine",
                        llvm::createInstructionCombiningPass());
