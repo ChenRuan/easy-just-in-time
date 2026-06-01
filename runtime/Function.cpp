@@ -31,11 +31,12 @@
 #include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
 #endif
 #include <llvm/IR/LegacyPassManager.h>
+#include <llvm/IR/CFG.h>
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/Instructions.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/Host.h>
 #include <llvm/Support/Error.h>
-#include <llvm/Support/raw_ostream.h>
 #if !EASYJIT_LIGHT_BACKEND_ONLY
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/MC/TargetRegistry.h>
@@ -86,24 +87,88 @@ private:
   std::string Reason_;
 };
 
-class SreVerifierOStream : public llvm::raw_ostream {
-public:
-  ~SreVerifierOStream() override { flush(); }
+static void LogNameRef(const char *Label, llvm::StringRef Name) {
+  EASYJIT_RT_LOG("%s%.*s\n", Label, (int)Name.size(), Name.data());
+}
 
-private:
-  void write_impl(const char *Ptr, size_t Size) override {
-    // Keep individual prints short; some SRE printf paths are not happy with
-    // very large raw_ostream chunks.
-    while (Size) {
-      size_t N = Size < 180 ? Size : 180;
-      EASYJIT_RT_LOG("verifier: %.*s", (int)N, Ptr);
-      Ptr += N;
-      Size -= N;
+static void LogBasicIRShape(llvm::Module &M) {
+  EASYJIT_RT_LOG("IRCHK: begin module=%p funcs=%zu\n", (void *)&M,
+                 (size_t)M.size());
+  for (llvm::Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    LogNameRef("IRCHK: function ", F.getName());
+
+    unsigned BBIndex = 0;
+    for (llvm::BasicBlock &BB : F) {
+      unsigned PredCount = 0;
+      for (llvm::BasicBlock *Pred : llvm::predecessors(&BB)) {
+        (void)Pred;
+        ++PredCount;
+      }
+
+      llvm::Instruction *Term = BB.getTerminator();
+      EASYJIT_RT_LOG("IRCHK: bb=%p index=%u preds=%u term=%p insts=%zu\n",
+                     (void *)&BB, BBIndex, PredCount, (void *)Term,
+                     (size_t)BB.size());
+      if (!Term)
+        EASYJIT_RT_LOG("IRCHK_ERR: bb=%p has no terminator\n", (void *)&BB);
+
+      bool SeenNonPhi = false;
+      unsigned InstIndex = 0;
+      for (llvm::Instruction &I : BB) {
+        if (I.getParent() != &BB)
+          EASYJIT_RT_LOG("IRCHK_ERR: inst=%p opcode=%s parent=%p expected=%p\n",
+                         (void *)&I, I.getOpcodeName(), (void *)I.getParent(),
+                         (void *)&BB);
+
+        if (llvm::isa<llvm::PHINode>(&I)) {
+          if (SeenNonPhi)
+            EASYJIT_RT_LOG("IRCHK_ERR: phi after non-phi inst=%p bb=%p\n",
+                           (void *)&I, (void *)&BB);
+        } else {
+          SeenNonPhi = true;
+        }
+
+        if (auto *PN = llvm::dyn_cast<llvm::PHINode>(&I)) {
+          unsigned Incoming = PN->getNumIncomingValues();
+          EASYJIT_RT_LOG("IRCHK: phi=%p incoming=%u preds=%u\n", (void *)PN,
+                         Incoming, PredCount);
+          if (Incoming != PredCount)
+            EASYJIT_RT_LOG("IRCHK_ERR: phi incoming/pred mismatch phi=%p incoming=%u preds=%u bb=%p\n",
+                           (void *)PN, Incoming, PredCount, (void *)&BB);
+
+          for (unsigned IIdx = 0; IIdx < Incoming; ++IIdx) {
+            llvm::BasicBlock *IncBB = PN->getIncomingBlock(IIdx);
+            bool FoundPred = false;
+            for (llvm::BasicBlock *Pred : llvm::predecessors(&BB)) {
+              if (Pred == IncBB) {
+                FoundPred = true;
+                break;
+              }
+            }
+            if (!FoundPred)
+              EASYJIT_RT_LOG("IRCHK_ERR: phi=%p incoming block not predecessor idx=%u incbb=%p bb=%p\n",
+                             (void *)PN, IIdx, (void *)IncBB, (void *)&BB);
+          }
+        }
+
+        for (unsigned Op = 0, E = I.getNumOperands(); Op != E; ++Op) {
+          llvm::Value *V = I.getOperand(Op);
+          if (!V)
+            EASYJIT_RT_LOG("IRCHK_ERR: null operand inst=%p opcode=%s op=%u\n",
+                           (void *)&I, I.getOpcodeName(), Op);
+        }
+
+        ++InstIndex;
+      }
+      EASYJIT_RT_LOG("IRCHK: bb done index=%u insts_seen=%u\n", BBIndex,
+                     InstIndex);
+      ++BBIndex;
     }
   }
-
-  uint64_t current_pos() const override { return 0; }
-};
+  EASYJIT_RT_LOG("IRCHK: end\n");
+}
 
 static bool CanFallbackToOriginalFunction(easy::Context const& C,
                                           llvm::Module const& M,
@@ -309,12 +374,11 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
   EASYJIT_ADD_OPT_PASS("ConstStructPropagate#2",
                        easy::createConstStructPropagatePass(Name));
   EASYJIT_RT_LOG("Optimize: before InstCombine verifyModule begin\n");
-  SreVerifierOStream VerifierOS;
-  bool BrokenBeforeInstCombine = llvm::verifyModule(M, &VerifierOS);
-  VerifierOS.flush();
+  bool BrokenBeforeInstCombine = llvm::verifyModule(M, nullptr);
   EASYJIT_RT_LOG("Optimize: before InstCombine verifyModule end broken=%d\n",
                  (int)BrokenBeforeInstCombine);
   if (BrokenBeforeInstCombine) {
+    LogBasicIRShape(M);
     EASYJIT_RT_LOG("Optimize: module broken before InstCombine, stop optimize\n");
     return;
   }
