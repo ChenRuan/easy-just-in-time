@@ -91,13 +91,95 @@ static void LogNameRef(const char *Label, llvm::StringRef Name) {
   EASYJIT_RT_LOG("%s%.*s\n", Label, (int)Name.size(), Name.data());
 }
 
+static const char *TypeKindName(llvm::Type *T) {
+  if (!T)
+    return "null";
+  if (T->isVoidTy())
+    return "void";
+  if (T->isIntegerTy())
+    return "int";
+  if (T->isPointerTy())
+    return "ptr";
+  if (T->isFloatTy())
+    return "float";
+  if (T->isDoubleTy())
+    return "double";
+  if (T->isFunctionTy())
+    return "func";
+  if (T->isStructTy())
+    return "struct";
+  if (T->isArrayTy())
+    return "array";
+  if (T->isVectorTy())
+    return "vector";
+  if (T->isLabelTy())
+    return "label";
+  if (T->isMetadataTy())
+    return "metadata";
+  return "other";
+}
+
+static unsigned TypeBitHint(llvm::Type *T) {
+  if (!T)
+    return 0;
+  if (auto *IT = llvm::dyn_cast<llvm::IntegerType>(T))
+    return IT->getBitWidth();
+  if (T->isFloatTy())
+    return 32;
+  if (T->isDoubleTy())
+    return 64;
+  if (auto *PT = llvm::dyn_cast<llvm::PointerType>(T))
+    return PT->getAddressSpace();
+  return 0;
+}
+
+static void LogTypeBrief(const char *Label, llvm::Type *T) {
+  EASYJIT_RT_LOG("%s type=%p kind=%s hint=%u\n", Label, (void *)T,
+                 TypeKindName(T), TypeBitHint(T));
+}
+
+static void LogValueBrief(const char *Label, llvm::Value *V) {
+  if (!V) {
+    EASYJIT_RT_LOG("%s value=<null>\n", Label);
+    return;
+  }
+  llvm::Type *T = V->getType();
+  EASYJIT_RT_LOG("%s value=%p type=%p kind=%s hint=%u\n", Label, (void *)V,
+                 (void *)T, TypeKindName(T), TypeBitHint(T));
+}
+
 static void LogBasicIRShape(llvm::Module &M) {
   EASYJIT_RT_LOG("IRCHK: begin module=%p funcs=%zu\n", (void *)&M,
                  (size_t)M.size());
+  for (llvm::GlobalVariable &GV : M.globals()) {
+    llvm::StringRef GN = GV.getName();
+    EASYJIT_RT_LOG("IRCHK: global %.*s gv=%p value_ty=%p kind=%s has_init=%d linkage=%u constant=%d\n",
+                   (int)GN.size(), GN.data(), (void *)&GV,
+                   (void *)GV.getValueType(), TypeKindName(GV.getValueType()),
+                   (int)GV.hasInitializer(), (unsigned)GV.getLinkage(),
+                   (int)GV.isConstant());
+    if (GV.hasInitializer())
+      LogValueBrief("IRCHK: global initializer", GV.getInitializer());
+  }
+
   for (llvm::Function &F : M) {
+    llvm::StringRef FN = F.getName();
+    EASYJIT_RT_LOG("IRCHK: function-decl %.*s fn=%p decl=%d ret_kind=%s ret_hint=%u args=%u cc=%u\n",
+                   (int)FN.size(), FN.data(), (void *)&F,
+                   (int)F.isDeclaration(), TypeKindName(F.getReturnType()),
+                   TypeBitHint(F.getReturnType()), (unsigned)F.arg_size(),
+                   (unsigned)F.getCallingConv());
+    unsigned ArgIndex = 0;
+    for (llvm::Argument &Arg : F.args()) {
+      EASYJIT_RT_LOG("IRCHK: arg fn=%p idx=%u arg=%p kind=%s hint=%u\n",
+                     (void *)&F, ArgIndex, (void *)&Arg,
+                     TypeKindName(Arg.getType()), TypeBitHint(Arg.getType()));
+      ++ArgIndex;
+    }
+
     if (F.isDeclaration())
       continue;
-    LogNameRef("IRCHK: function ", F.getName());
+    LogNameRef("IRCHK: function ", FN);
 
     unsigned BBIndex = 0;
     for (llvm::BasicBlock &BB : F) {
@@ -117,6 +199,11 @@ static void LogBasicIRShape(llvm::Module &M) {
       bool SeenNonPhi = false;
       unsigned InstIndex = 0;
       for (llvm::Instruction &I : BB) {
+        EASYJIT_RT_LOG("IRCHK_INST: bb=%u inst=%u ptr=%p opcode=%s ty=%p kind=%s hint=%u ops=%u\n",
+                       BBIndex, InstIndex, (void *)&I, I.getOpcodeName(),
+                       (void *)I.getType(), TypeKindName(I.getType()),
+                       TypeBitHint(I.getType()), I.getNumOperands());
+
         if (I.getParent() != &BB)
           EASYJIT_RT_LOG("IRCHK_ERR: inst=%p opcode=%s parent=%p expected=%p\n",
                          (void *)&I, I.getOpcodeName(), (void *)I.getParent(),
@@ -158,6 +245,77 @@ static void LogBasicIRShape(llvm::Module &M) {
           if (!V)
             EASYJIT_RT_LOG("IRCHK_ERR: null operand inst=%p opcode=%s op=%u\n",
                            (void *)&I, I.getOpcodeName(), Op);
+          else
+            EASYJIT_RT_LOG("IRCHK_OP: inst=%u op=%u value=%p kind=%s hint=%u\n",
+                           InstIndex, Op, (void *)V, TypeKindName(V->getType()),
+                           TypeBitHint(V->getType()));
+        }
+
+        if (auto *RI = llvm::dyn_cast<llvm::ReturnInst>(&I)) {
+          llvm::Value *RV = RI->getReturnValue();
+          EASYJIT_RT_LOG("IRCHK_RET: inst=%p retv=%p fn_ret_kind=%s val_kind=%s\n",
+                         (void *)RI, (void *)RV, TypeKindName(F.getReturnType()),
+                         RV ? TypeKindName(RV->getType()) : "void");
+          if ((RV == nullptr) != F.getReturnType()->isVoidTy())
+            EASYJIT_RT_LOG("IRCHK_ERR: ret void/value mismatch inst=%p fn=%p\n",
+                           (void *)RI, (void *)&F);
+          if (RV && RV->getType() != F.getReturnType())
+            EASYJIT_RT_LOG("IRCHK_ERR: ret type mismatch inst=%p val_ty=%p fn_ret_ty=%p\n",
+                           (void *)RI, (void *)RV->getType(),
+                           (void *)F.getReturnType());
+        }
+
+        if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I)) {
+          llvm::Value *Ptr = LI->getPointerOperand();
+          EASYJIT_RT_LOG("IRCHK_LOAD: inst=%p ptr=%p ptr_kind=%s result_kind=%s\n",
+                         (void *)LI, (void *)Ptr,
+                         Ptr ? TypeKindName(Ptr->getType()) : "null",
+                         TypeKindName(LI->getType()));
+          if (!Ptr || !Ptr->getType()->isPointerTy())
+            EASYJIT_RT_LOG("IRCHK_ERR: load ptr operand not pointer inst=%p\n",
+                           (void *)LI);
+        }
+
+        if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+          llvm::Value *Val = SI->getValueOperand();
+          llvm::Value *Ptr = SI->getPointerOperand();
+          EASYJIT_RT_LOG("IRCHK_STORE: inst=%p val=%p val_kind=%s ptr=%p ptr_kind=%s\n",
+                         (void *)SI, (void *)Val,
+                         Val ? TypeKindName(Val->getType()) : "null",
+                         (void *)Ptr, Ptr ? TypeKindName(Ptr->getType()) : "null");
+          if (!Ptr || !Ptr->getType()->isPointerTy())
+            EASYJIT_RT_LOG("IRCHK_ERR: store ptr operand not pointer inst=%p\n",
+                           (void *)SI);
+        }
+
+        if (auto *CB = llvm::dyn_cast<llvm::CallBase>(&I)) {
+          llvm::FunctionType *FTy = CB->getFunctionType();
+          llvm::Value *Called = CB->getCalledOperand();
+          EASYJIT_RT_LOG("IRCHK_CALL: inst=%p called=%p called_kind=%s fty=%p ret_kind=%s params=%u args=%u\n",
+                         (void *)CB, (void *)Called,
+                         Called ? TypeKindName(Called->getType()) : "null",
+                         (void *)FTy, FTy ? TypeKindName(FTy->getReturnType()) : "null",
+                         FTy ? FTy->getNumParams() : 0, (unsigned)CB->arg_size());
+          if (FTy && !FTy->isVarArg() && FTy->getNumParams() != CB->arg_size())
+            EASYJIT_RT_LOG("IRCHK_ERR: call arg count mismatch inst=%p params=%u args=%u\n",
+                           (void *)CB, FTy->getNumParams(),
+                           (unsigned)CB->arg_size());
+          if (FTy) {
+            unsigned N = FTy->getNumParams();
+            if (N > CB->arg_size())
+              N = CB->arg_size();
+            for (unsigned A = 0; A != N; ++A) {
+              llvm::Type *PT = FTy->getParamType(A);
+              llvm::Value *AV = CB->getArgOperand(A);
+              EASYJIT_RT_LOG("IRCHK_CALL_ARG: inst=%p arg=%u param_kind=%s val_kind=%s\n",
+                             (void *)CB, A, TypeKindName(PT),
+                             AV ? TypeKindName(AV->getType()) : "null");
+              if (!AV || AV->getType() != PT)
+                EASYJIT_RT_LOG("IRCHK_ERR: call arg type mismatch inst=%p arg=%u param_ty=%p val_ty=%p\n",
+                               (void *)CB, A, (void *)PT,
+                               AV ? (void *)AV->getType() : nullptr);
+            }
+          }
         }
 
         ++InstIndex;
