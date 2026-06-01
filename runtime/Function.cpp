@@ -32,8 +32,10 @@
 #endif
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Constants.h>
+#include <llvm/IR/Verifier.h>
 #include <llvm/Support/Host.h>
 #include <llvm/Support/Error.h>
+#include <llvm/Support/raw_ostream.h>
 #if !EASYJIT_LIGHT_BACKEND_ONLY
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/MC/TargetRegistry.h>
@@ -44,10 +46,6 @@
 #include <llvm/Support/Path.h>
 #include <cstdio>
 #include <cstdlib>
-
-#ifdef NDEBUG
-#include <llvm/IR/Verifier.h>
-#endif
 
 #define EASYJIT_RT_LOG(...) EASYJIT_SRE_LOG("[runtime] " __VA_ARGS__)
 
@@ -86,6 +84,25 @@ public:
 
 private:
   std::string Reason_;
+};
+
+class SreVerifierOStream : public llvm::raw_ostream {
+public:
+  ~SreVerifierOStream() override { flush(); }
+
+private:
+  void write_impl(const char *Ptr, size_t Size) override {
+    // Keep individual prints short; some SRE printf paths are not happy with
+    // very large raw_ostream chunks.
+    while (Size) {
+      size_t N = Size < 180 ? Size : 180;
+      EASYJIT_RT_LOG("verifier: %.*s", (int)N, Ptr);
+      Ptr += N;
+      Size -= N;
+    }
+  }
+
+  uint64_t current_pos() const override { return 0; }
 };
 
 static bool CanFallbackToOriginalFunction(easy::Context const& C,
@@ -292,7 +309,9 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
   EASYJIT_ADD_OPT_PASS("ConstStructPropagate#2",
                        easy::createConstStructPropagatePass(Name));
   EASYJIT_RT_LOG("Optimize: before InstCombine verifyModule begin\n");
-  bool BrokenBeforeInstCombine = llvm::verifyModule(M, nullptr);
+  SreVerifierOStream VerifierOS;
+  bool BrokenBeforeInstCombine = llvm::verifyModule(M, &VerifierOS);
+  VerifierOS.flush();
   EASYJIT_RT_LOG("Optimize: before InstCombine verifyModule end broken=%d\n",
                  (int)BrokenBeforeInstCombine);
   if (BrokenBeforeInstCombine) {
