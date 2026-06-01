@@ -186,12 +186,27 @@ static void LogBasicIRShape(llvm::Module &M) {
   for (llvm::Function &F : M) {
     llvm::StringRef FN = F.getName();
     bool FunctionBroken = llvm::verifyFunction(F, nullptr);
-    EASYJIT_RT_LOG("IRCHK_FUNC: %.*s fn=%p decl=%d broken=%d ret_kind=%s ret_hint=%u args=%u cc=%u\n",
+    llvm::FunctionType *FT = F.getFunctionType();
+    llvm::AttributeList Attrs = F.getAttributes();
+    bool CtxOk = &F.getContext() == &M.getContext();
+    bool ParamCountOk = FT && FT->getNumParams() == F.arg_size();
+    bool AttrCtxOk = Attrs.hasParentContext(M.getContext());
+    bool AttrCountOk = Attrs.getNumAttrSets() <= F.arg_size() + 2;
+    EASYJIT_RT_LOG("IRCHK_FUNC: %.*s fn=%p decl=%d broken=%d ctx_ok=%d ft=%p ft_params=%u args=%u param_count_ok=%d attrs=%p attrs_empty=%d attrs_ctx_ok=%d attrs_sets=%u attrs_count_ok=%d ret_kind=%s ret_hint=%u cc=%u linkage=%u intrinsic=%d\n",
                    (int)FN.size(), FN.data(), (void *)&F,
-                   (int)F.isDeclaration(), (int)FunctionBroken,
+                   (int)F.isDeclaration(), (int)FunctionBroken, (int)CtxOk,
+                   (void *)FT, FT ? FT->getNumParams() : 0,
+                   (unsigned)F.arg_size(), (int)ParamCountOk,
+                   Attrs.getRawPointer(), (int)Attrs.isEmpty(),
+                   (int)AttrCtxOk, Attrs.getNumAttrSets(), (int)AttrCountOk,
                    TypeKindName(F.getReturnType()),
-                   TypeBitHint(F.getReturnType()), (unsigned)F.arg_size(),
-                   (unsigned)F.getCallingConv());
+                   TypeBitHint(F.getReturnType()),
+                   (unsigned)F.getCallingConv(), (unsigned)F.getLinkage(),
+                   (int)F.isIntrinsic());
+    if (!CtxOk || !ParamCountOk || !AttrCtxOk || !AttrCountOk)
+      EASYJIT_RT_LOG("IRCHK_FUNC_ERR: %.*s ctx_ok=%d param_count_ok=%d attrs_ctx_ok=%d attrs_count_ok=%d\n",
+                     (int)FN.size(), FN.data(), (int)CtxOk,
+                     (int)ParamCountOk, (int)AttrCtxOk, (int)AttrCountOk);
 
     if (F.isDeclaration() || !FunctionBroken)
       continue;
