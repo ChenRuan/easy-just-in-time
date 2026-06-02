@@ -50,7 +50,6 @@
 #include <llvm/ADT/SmallString.h>
 #include <cstdio>
 #include <cstdlib>
-#include <string>
 
 #define EASYJIT_RT_LOG(...) EASYJIT_SRE_LOG("[runtime] " __VA_ARGS__)
 
@@ -218,194 +217,118 @@ static void LogPseudoValue(const char *Prefix, llvm::Value *V) {
   }
 }
 
-static std::string PtrToken(const char *Prefix, const void *P) {
-  char Buf[64];
-  std::snprintf(Buf, sizeof(Buf), "%s%p", Prefix, P);
-  return std::string(Buf);
-}
-
-static std::string SafeNameOrPtr(llvm::StringRef Name, const char *Prefix,
-                                 const void *P) {
-  if (Name.empty())
-    return PtrToken(Prefix, P);
-
-  std::string Out;
-  Out.reserve(Name.size() + 1);
-  for (char C : Name) {
-    bool Safe = (C >= 'a' && C <= 'z') || (C >= 'A' && C <= 'Z') ||
-                (C >= '0' && C <= '9') || C == '_' || C == '.' ||
-                C == '$' || C == '-';
-    if (!Safe)
-      return PtrToken(Prefix, P);
-    Out.push_back(C);
+static void LogPseudoLlValue(const char *Tag, llvm::Value *V) {
+  if (!V) {
+    EASYJIT_RT_LOG("PSEUDO_LL_%s: value=<null>\n", Tag);
+    return;
   }
-  return Out;
-}
 
-static std::string LlTypeLike(llvm::Type *T, unsigned Depth = 0) {
-  if (!T)
-    return "<nullty>";
-  if (Depth > 2)
-    return "<deep>";
-  if (T->isVoidTy())
-    return "void";
-  if (auto *IT = llvm::dyn_cast<llvm::IntegerType>(T))
-    return "i" + std::to_string(IT->getBitWidth());
-  if (T->isPointerTy())
-    return "ptr";
-  if (T->isFloatTy())
-    return "float";
-  if (T->isDoubleTy())
-    return "double";
-  if (auto *AT = llvm::dyn_cast<llvm::ArrayType>(T))
-    return "[" + std::to_string(AT->getNumElements()) + " x " +
-           LlTypeLike(AT->getElementType(), Depth + 1) + "]";
-  if (auto *ST = llvm::dyn_cast<llvm::StructType>(T)) {
-    if (ST->hasName())
-      return "%" + SafeNameOrPtr(ST->getName(), "struct", ST);
-    return "struct";
-  }
-  if (T->isFunctionTy())
-    return "fn";
-  if (T->isVectorTy())
-    return "vector";
-  if (T->isLabelTy())
-    return "label";
-  if (T->isMetadataTy())
-    return "metadata";
-  return "type";
-}
-
-static std::string LlValueLike(llvm::Value *V) {
-  if (!V)
-    return "<null>";
+  llvm::StringRef N = V->hasName() ? V->getName() : llvm::StringRef();
+  EASYJIT_RT_LOG("PSEUDO_LL_%s: ref=%p class=%s type=%s hint=%u name=%.*s\n",
+                 Tag, (void *)V, ValueClassName(V),
+                 TypeKindName(V->getType()), TypeBitHint(V->getType()),
+                 (int)N.size(), N.data());
   if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(V)) {
-    if (CI->getBitWidth() == 1)
-      return CI->isOne() ? "true" : "false";
-    if (CI->getBitWidth() <= 64) {
-      if (CI->getValue().isNegative())
-        return std::to_string((long long)CI->getSExtValue());
-      return std::to_string((unsigned long long)CI->getZExtValue());
-    }
-    return PtrToken("constint", CI);
+    unsigned Bits = CI->getBitWidth();
+    if (Bits <= 64)
+      EASYJIT_RT_LOG("PSEUDO_LL_%s: const_int bits=%u zext=%llu sext=%lld\n",
+                     Tag, Bits, (unsigned long long)CI->getZExtValue(),
+                     (long long)CI->getSExtValue());
+    else
+      EASYJIT_RT_LOG("PSEUDO_LL_%s: const_int bits=%u wide=1\n", Tag, Bits);
   }
-  if (llvm::isa<llvm::ConstantPointerNull>(V))
-    return "null";
-  if (llvm::isa<llvm::UndefValue>(V))
-    return "undef";
-  if (auto *BB = llvm::dyn_cast<llvm::BasicBlock>(V))
-    return "%" + SafeNameOrPtr(BB->hasName() ? BB->getName() : llvm::StringRef(),
-                               "bb", BB);
-  if (auto *F = llvm::dyn_cast<llvm::Function>(V))
-    return "@" + SafeNameOrPtr(F->hasName() ? F->getName() : llvm::StringRef(),
-                               "fn", F);
-  if (auto *GV = llvm::dyn_cast<llvm::GlobalValue>(V))
-    return "@" + SafeNameOrPtr(GV->hasName() ? GV->getName() : llvm::StringRef(),
-                               "g", GV);
-  if (llvm::isa<llvm::Argument>(V) || llvm::isa<llvm::Instruction>(V))
-    return "%" + PtrToken("v", V);
-  if (llvm::isa<llvm::ConstantFP>(V))
-    return PtrToken("constfp", V);
-  if (llvm::isa<llvm::ConstantExpr>(V))
-    return PtrToken("constexpr", V);
-  if (llvm::isa<llvm::Constant>(V))
-    return PtrToken("const", V);
-  return PtrToken("value", V);
 }
 
-static std::string LlTypedValueLike(llvm::Value *V) {
-  if (!V)
-    return "<nullty> <null>";
-  return LlTypeLike(V->getType()) + " " + LlValueLike(V);
-}
-
-static std::string LlOperandListLike(llvm::User &U, bool WithTypes) {
-  std::string Out;
-  for (unsigned I = 0, E = U.getNumOperands(); I != E; ++I) {
-    if (I)
-      Out += ", ";
-    llvm::Value *V = U.getOperand(I);
-    Out += WithTypes ? LlTypedValueLike(V) : LlValueLike(V);
-  }
-  return Out;
-}
-
-static std::string LlInstructionLike(llvm::Instruction &I) {
-  std::string Out;
-  if (!I.getType()->isVoidTy())
-    Out += LlValueLike(&I) + " = ";
+static void LogPseudoLlInst(llvm::Instruction &I, unsigned BBIndex,
+                            unsigned InstIndex) {
+  llvm::StringRef IN = I.hasName() ? I.getName() : llvm::StringRef();
+  EASYJIT_RT_LOG("PSEUDO_LL_INST: bb=%u inst=%u result=%p result_name=%.*s opcode=%s result_type=%s result_hint=%u ops=%u\n",
+                 BBIndex, InstIndex, (void *)&I, (int)IN.size(), IN.data(),
+                 I.getOpcodeName(), TypeKindName(I.getType()),
+                 TypeBitHint(I.getType()), I.getNumOperands());
 
   if (auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(&I)) {
-    Out += std::string(BO->getOpcodeName()) + " " + LlTypeLike(BO->getType()) +
-           " " + LlValueLike(BO->getOperand(0)) + ", " +
-           LlValueLike(BO->getOperand(1));
+    EASYJIT_RT_LOG("PSEUDO_LL_BINOP: result=%p op=%s lhs=%p rhs=%p ty=%s hint=%u\n",
+                   (void *)BO, BO->getOpcodeName(), (void *)BO->getOperand(0),
+                   (void *)BO->getOperand(1), TypeKindName(BO->getType()),
+                   TypeBitHint(BO->getType()));
   } else if (auto *CI = llvm::dyn_cast<llvm::CmpInst>(&I)) {
-    Out += std::string(CI->getOpcodeName()) + " " +
-           CI->getPredicateName(CI->getPredicate()).str() + " " +
-           LlTypeLike(CI->getOperand(0)->getType()) + " " +
-           LlValueLike(CI->getOperand(0)) + ", " +
-           LlValueLike(CI->getOperand(1));
+    EASYJIT_RT_LOG("PSEUDO_LL_CMP: result=%p op=%s pred=%s lhs=%p rhs=%p operand_ty=%s operand_hint=%u\n",
+                   (void *)CI, CI->getOpcodeName(),
+                   CI->getPredicateName(CI->getPredicate()).data(),
+                   (void *)CI->getOperand(0), (void *)CI->getOperand(1),
+                   TypeKindName(CI->getOperand(0)->getType()),
+                   TypeBitHint(CI->getOperand(0)->getType()));
   } else if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I)) {
-    Out += "load " + LlTypeLike(LI->getType()) + ", " +
-           LlTypedValueLike(LI->getPointerOperand());
+    EASYJIT_RT_LOG("PSEUDO_LL_LOAD: result=%p value_ty=%s value_hint=%u ptr=%p ptr_ty=%s ptr_hint=%u volatile=%d align=%u\n",
+                   (void *)LI, TypeKindName(LI->getType()),
+                   TypeBitHint(LI->getType()),
+                   (void *)LI->getPointerOperand(),
+                   TypeKindName(LI->getPointerOperand()->getType()),
+                   TypeBitHint(LI->getPointerOperand()->getType()),
+                   (int)LI->isVolatile(), (unsigned)LI->getAlign().value());
   } else if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
-    Out += "store " + LlTypedValueLike(SI->getValueOperand()) + ", " +
-           LlTypedValueLike(SI->getPointerOperand());
+    EASYJIT_RT_LOG("PSEUDO_LL_STORE: val=%p val_ty=%s val_hint=%u ptr=%p ptr_ty=%s ptr_hint=%u volatile=%d align=%u\n",
+                   (void *)SI->getValueOperand(),
+                   TypeKindName(SI->getValueOperand()->getType()),
+                   TypeBitHint(SI->getValueOperand()->getType()),
+                   (void *)SI->getPointerOperand(),
+                   TypeKindName(SI->getPointerOperand()->getType()),
+                   TypeBitHint(SI->getPointerOperand()->getType()),
+                   (int)SI->isVolatile(), (unsigned)SI->getAlign().value());
   } else if (auto *RI = llvm::dyn_cast<llvm::ReturnInst>(&I)) {
-    if (llvm::Value *RV = RI->getReturnValue())
-      Out += "ret " + LlTypedValueLike(RV);
-    else
-      Out += "ret void";
+    EASYJIT_RT_LOG("PSEUDO_LL_RET: ret=%p\n", (void *)RI->getReturnValue());
   } else if (auto *BR = llvm::dyn_cast<llvm::BranchInst>(&I)) {
-    if (BR->isConditional())
-      Out += "br " + LlTypedValueLike(BR->getCondition()) + ", label " +
-             LlValueLike(BR->getSuccessor(0)) + ", label " +
-             LlValueLike(BR->getSuccessor(1));
-    else
-      Out += "br label " + LlValueLike(BR->getSuccessor(0));
+    EASYJIT_RT_LOG("PSEUDO_LL_BR: conditional=%d cond=%p succ0=%p succ1=%p\n",
+                   (int)BR->isConditional(),
+                   BR->isConditional() ? (void *)BR->getCondition() : nullptr,
+                   BR->getNumSuccessors() > 0 ? (void *)BR->getSuccessor(0) : nullptr,
+                   BR->getNumSuccessors() > 1 ? (void *)BR->getSuccessor(1) : nullptr);
   } else if (auto *PN = llvm::dyn_cast<llvm::PHINode>(&I)) {
-    Out += "phi " + LlTypeLike(PN->getType());
-    for (unsigned IIdx = 0, E = PN->getNumIncomingValues(); IIdx != E; ++IIdx)
-      Out += (IIdx ? ", " : " ") + std::string("[ ") +
-             LlValueLike(PN->getIncomingValue(IIdx)) + ", " +
-             LlValueLike(PN->getIncomingBlock(IIdx)) + " ]";
+    EASYJIT_RT_LOG("PSEUDO_LL_PHI: result=%p ty=%s hint=%u incoming=%u\n",
+                   (void *)PN, TypeKindName(PN->getType()),
+                   TypeBitHint(PN->getType()), PN->getNumIncomingValues());
+    for (unsigned P = 0, E = PN->getNumIncomingValues(); P != E; ++P)
+      EASYJIT_RT_LOG("PSEUDO_LL_PHI_IN: result=%p idx=%u value=%p block=%p\n",
+                     (void *)PN, P, (void *)PN->getIncomingValue(P),
+                     (void *)PN->getIncomingBlock(P));
   } else if (auto *CB = llvm::dyn_cast<llvm::CallBase>(&I)) {
-    Out += "call " + LlTypeLike(CB->getType()) + " ";
-    if (llvm::Function *CF = CB->getCalledFunction())
-      Out += LlValueLike(CF);
-    else
-      Out += LlValueLike(CB->getCalledOperand());
-    Out += "(";
-    for (unsigned A = 0, E = CB->arg_size(); A != E; ++A) {
-      if (A)
-        Out += ", ";
-      Out += LlTypedValueLike(CB->getArgOperand(A));
-    }
-    Out += ")";
+    llvm::Function *CalledFn = CB->getCalledFunction();
+    llvm::StringRef CN =
+        CalledFn ? CalledFn->getName() : llvm::StringRef();
+    EASYJIT_RT_LOG("PSEUDO_LL_CALL: result=%p ret_ty=%s ret_hint=%u called=%p called_fn=%p called_name=%.*s args=%u\n",
+                   (void *)CB, TypeKindName(CB->getType()),
+                   TypeBitHint(CB->getType()), (void *)CB->getCalledOperand(),
+                   (void *)CalledFn, (int)CN.size(), CN.data(),
+                   (unsigned)CB->arg_size());
   } else if (auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(&I)) {
-    Out += "getelementptr " + LlTypeLike(GEP->getSourceElementType()) + ", " +
-           LlTypedValueLike(GEP->getPointerOperand());
-    for (auto Idx = GEP->idx_begin(), End = GEP->idx_end(); Idx != End; ++Idx)
-      Out += ", " + LlTypedValueLike(*Idx);
+    EASYJIT_RT_LOG("PSEUDO_LL_GEP: result=%p source_ty=%s ptr=%p indices=%u inbounds=%d\n",
+                   (void *)GEP, TypeKindName(GEP->getSourceElementType()),
+                   (void *)GEP->getPointerOperand(), GEP->getNumIndices(),
+                   (int)GEP->isInBounds());
   } else if (auto *AI = llvm::dyn_cast<llvm::AllocaInst>(&I)) {
-    Out += "alloca " + LlTypeLike(AI->getAllocatedType());
-    if (AI->isArrayAllocation())
-      Out += ", " + LlTypedValueLike(AI->getArraySize());
-  } else if (auto *SI = llvm::dyn_cast<llvm::SelectInst>(&I)) {
-    Out += "select " + LlTypedValueLike(SI->getCondition()) + ", " +
-           LlTypedValueLike(SI->getTrueValue()) + ", " +
-           LlTypedValueLike(SI->getFalseValue());
-  } else if (auto *CI = llvm::dyn_cast<llvm::CastInst>(&I)) {
-    Out += std::string(CI->getOpcodeName()) + " " +
-           LlTypedValueLike(CI->getOperand(0)) + " to " +
-           LlTypeLike(CI->getType());
-  } else {
-    Out += std::string(I.getOpcodeName()) + " " + LlTypeLike(I.getType());
-    if (I.getNumOperands() != 0)
-      Out += " " + LlOperandListLike(I, true);
+    EASYJIT_RT_LOG("PSEUDO_LL_ALLOCA: result=%p alloc_ty=%s alloc_hint=%u array_size=%p align=%u\n",
+                   (void *)AI, TypeKindName(AI->getAllocatedType()),
+                   TypeBitHint(AI->getAllocatedType()),
+                   (void *)AI->getArraySize(), (unsigned)AI->getAlign().value());
+  } else if (auto *Sel = llvm::dyn_cast<llvm::SelectInst>(&I)) {
+    EASYJIT_RT_LOG("PSEUDO_LL_SELECT: result=%p cond=%p true=%p false=%p ty=%s hint=%u\n",
+                   (void *)Sel, (void *)Sel->getCondition(),
+                   (void *)Sel->getTrueValue(), (void *)Sel->getFalseValue(),
+                   TypeKindName(Sel->getType()), TypeBitHint(Sel->getType()));
+  } else if (auto *Cast = llvm::dyn_cast<llvm::CastInst>(&I)) {
+    EASYJIT_RT_LOG("PSEUDO_LL_CAST: result=%p op=%s src=%p src_ty=%s src_hint=%u dst_ty=%s dst_hint=%u\n",
+                   (void *)Cast, Cast->getOpcodeName(),
+                   (void *)Cast->getOperand(0),
+                   TypeKindName(Cast->getOperand(0)->getType()),
+                   TypeBitHint(Cast->getOperand(0)->getType()),
+                   TypeKindName(Cast->getType()), TypeBitHint(Cast->getType()));
   }
 
-  return Out;
+  for (unsigned Op = 0, E = I.getNumOperands(); Op != E; ++Op) {
+    EASYJIT_RT_LOG("PSEUDO_LL_OP: owner=%p op=%u\n", (void *)&I, Op);
+    LogPseudoLlValue("OP", I.getOperand(Op));
+  }
 }
 
 static void DumpFunctionPseudoIRToSre(llvm::Module &M, const char *Name,
@@ -430,18 +353,10 @@ static void DumpFunctionPseudoIRToSre(llvm::Module &M, const char *Name,
   }
 
   llvm::StringRef FN = F->getName();
-  std::string Header = "define " + LlTypeLike(F->getReturnType()) + " @" +
-                       SafeNameOrPtr(FN, "fn", F) + "(";
-  unsigned HeaderArgIndex = 0;
-  for (llvm::Argument &Arg : F->args()) {
-    if (HeaderArgIndex)
-      Header += ", ";
-    Header += LlTypeLike(Arg.getType()) + " " + LlValueLike(&Arg);
-    ++HeaderArgIndex;
-  }
-  Header += ")";
-  EASYJIT_RT_LOG("PSEUDO_LL: %s {\n", Header.c_str());
-
+  EASYJIT_RT_LOG("PSEUDO_LL_FUNC: define ret_ty=%s ret_hint=%u name=%.*s fn=%p args=%u\n",
+                 TypeKindName(F->getReturnType()), TypeBitHint(F->getReturnType()),
+                 (int)FN.size(), FN.data(), (void *)F,
+                 (unsigned)F->arg_size());
   EASYJIT_RT_LOG("PSEUDOIR_FUNC: name=%.*s fn=%p decl=%d broken=%d ret_kind=%s ret_hint=%u args=%u bbs=%zu attrs_sets=%u cc=%u linkage=%u\n",
                  (int)FN.size(), FN.data(), (void *)F, (int)F->isDeclaration(),
                  (int)llvm::verifyFunction(*F, nullptr),
@@ -470,7 +385,9 @@ static void DumpFunctionPseudoIRToSre(llvm::Module &M, const char *Name,
     EASYJIT_RT_LOG("PSEUDOIR_BB: index=%u bb=%p name=%.*s preds=%u insts=%zu term=%p\n",
                    BBIndex, (void *)&BB, (int)BBN.size(), BBN.data(),
                    PredCount, (size_t)BB.size(), (void *)BB.getTerminator());
-    EASYJIT_RT_LOG("PSEUDO_LL: %s:\n", LlValueLike(&BB).c_str());
+    EASYJIT_RT_LOG("PSEUDO_LL_BB: bb=%p index=%u name=%.*s preds=%u insts=%zu\n",
+                   (void *)&BB, BBIndex, (int)BBN.size(), BBN.data(),
+                   PredCount, (size_t)BB.size());
 
     unsigned InstIndex = 0;
     for (llvm::Instruction &I : BB) {
@@ -480,8 +397,7 @@ static void DumpFunctionPseudoIRToSre(llvm::Module &M, const char *Name,
                      I.getOpcodeName(), (int)IN.size(), IN.data(),
                      TypeKindName(I.getType()), TypeBitHint(I.getType()),
                      I.getNumOperands(), (void *)I.getParent());
-      std::string Line = LlInstructionLike(I);
-      EASYJIT_RT_LOG("PSEUDO_LL:   %s\n", Line.c_str());
+      LogPseudoLlInst(I, BBIndex, InstIndex);
 
       if (auto *CB = llvm::dyn_cast<llvm::CallBase>(&I)) {
         llvm::Value *Called = CB->getCalledOperand();
@@ -523,7 +439,7 @@ static void DumpFunctionPseudoIRToSre(llvm::Module &M, const char *Name,
     ++BBIndex;
   }
 
-  EASYJIT_RT_LOG("PSEUDO_LL: }\n");
+  EASYJIT_RT_LOG("PSEUDO_LL_FUNC_END: fn=%p\n", (void *)F);
   EASYJIT_RT_LOG("PSEUDOIR: end\n");
 }
 
