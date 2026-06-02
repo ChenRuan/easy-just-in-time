@@ -1221,15 +1221,12 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
   EASYJIT_RT_LOG("Optimize: finished for %s\n", Name ? Name : "<null>");
   EASYJIT_RT_LOG("Optimize: leaving MPM leaked MPM=%p\n", (void *)MPM);
 
-  // Optional IR dump for benchmarking / debugging the pass pipeline.
-  if (const char *DumpPath = std::getenv("EASYJIT_DUMP_IR")) {
-    EASYJIT_RT_LOG("Optimize: EASYJIT_DUMP_IR path=%s begin\n", DumpPath);
-    std::error_code EC;
-    llvm::raw_fd_ostream OS(DumpPath, EC);
-    if (!EC) M.print(OS, nullptr);
-    EASYJIT_RT_LOG("Optimize: EASYJIT_DUMP_IR path=%s end ec=%d\n",
-                   DumpPath, (int)EC.value());
-  }
+  EASYJIT_RT_LOG("Optimize: skip EASYJIT_DUMP_IR block on debug/SRE path\n");
+  // Debug branch only: do not call getenv/raw_fd_ostream/Module::print here.
+  // The board environment has already shown crashes in raw_ostream and libc
+  // runtime paths.  Keep the exit path narrow so we can distinguish dump I/O
+  // from ordinary local-object destruction after Optimize returns.
+  EASYJIT_RT_LOG("Optimize: before return name=%s\n", Name ? Name : "<null>");
   EASYJIT_RT_LOG("Optimize: return name=%s\n", Name ? Name : "<null>");
 }
 
