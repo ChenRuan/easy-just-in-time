@@ -41,10 +41,6 @@ extern "C" void *SRE_MemAlloc(unsigned int ulSidPid, unsigned char ucptNo,
                               unsigned long ulSize) __attribute__((weak));
 extern "C" unsigned int SRE_MemFree(unsigned int ulSidPid,
                                     void *pAddr) __attribute__((weak));
-extern "C" void *XXX_MemAlloc(unsigned int ulSidPid, unsigned char ucptNo,
-                              unsigned long ulSize) __attribute__((weak));
-extern "C" unsigned int XXX_MemFree(unsigned int ulSidPid,
-                                    void *pAddr) __attribute__((weak));
 #endif
 
 static void *easyjit_allocate_or_null(std::size_t size) noexcept {
@@ -54,8 +50,6 @@ static void *easyjit_allocate_or_null(std::size_t size) noexcept {
 #if EASYJIT_USE_CUSTOM_NEW_DELETE
   if (SRE_MemAlloc)
     return SRE_MemAlloc(0U, 0U, static_cast<unsigned long>(size));
-  if (XXX_MemAlloc)
-    return XXX_MemAlloc(0U, 0U, static_cast<unsigned long>(size));
   return nullptr;
 #else
   return std::malloc(size);
@@ -70,10 +64,6 @@ static void easyjit_platform_free(void *p, const char *tag) noexcept {
     EASYJIT_ALLOC_LOG("%s before SRE_MemFree ptr=%p\n", tag, p);
     (void)SRE_MemFree(0, p);
     EASYJIT_ALLOC_LOG("%s after SRE_MemFree ptr=%p\n", tag, p);
-  } else if (XXX_MemFree) {
-    EASYJIT_ALLOC_LOG("%s fallback before XXX_MemFree ptr=%p\n", tag, p);
-    (void)XXX_MemFree(0, p);
-    EASYJIT_ALLOC_LOG("%s fallback after XXX_MemFree ptr=%p\n", tag, p);
   } else {
     EASYJIT_ALLOC_LOG("%s no platform free hook ptr=%p\n", tag, p);
   }

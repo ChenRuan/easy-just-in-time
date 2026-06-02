@@ -39,7 +39,6 @@
 #define EASYJIT_RT_LOG(...) EASYJIT_SRE_LOG("[runtime] " __VA_ARGS__)
 
 extern "C" __attribute__((weak)) unsigned int SRE_MemFree(unsigned int, void *);
-extern "C" __attribute__((weak)) unsigned int XXX_MemFree(unsigned int, void *);
 
 namespace easy {
 namespace light_backend {
@@ -130,7 +129,7 @@ public:
                    page, pageSize);
     // Debug/SRE path: light::compile may use SRE_MmuMap, and we do not have a
     // matching unmap API in the current platform notes.  Do not call munmap or
-    // XXX_MemFree here; leaking a tiny code page is safer while validating.
+    // SRE_MemFree here; leaking a tiny code page is safer while validating.
   }
 };
 } // anonymous namespace
