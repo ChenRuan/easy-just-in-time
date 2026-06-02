@@ -37,9 +37,14 @@ static void easyjit_debug_probe_allocation(void *p, std::size_t size,
 }
 
 #if EASYJIT_USE_CUSTOM_NEW_DELETE
+extern "C" void *SRE_MemAlloc(unsigned int ulSidPid, unsigned char ucptNo,
+                              unsigned long ulSize) __attribute__((weak));
+extern "C" unsigned int SRE_MemFree(unsigned int ulSidPid,
+                                    void *pAddr) __attribute__((weak));
 extern "C" void *XXX_MemAlloc(unsigned int ulSidPid, unsigned char ucptNo,
-                              unsigned long ulSize);
-extern "C" unsigned int XXX_MemFree(unsigned int ulSidPid, void *pAddr);
+                              unsigned long ulSize) __attribute__((weak));
+extern "C" unsigned int XXX_MemFree(unsigned int ulSidPid,
+                                    void *pAddr) __attribute__((weak));
 #endif
 
 static void *easyjit_allocate_or_null(std::size_t size) noexcept {
@@ -47,11 +52,33 @@ static void *easyjit_allocate_or_null(std::size_t size) noexcept {
     size = 1;
   }
 #if EASYJIT_USE_CUSTOM_NEW_DELETE
-  return XXX_MemAlloc(0U, 0U, static_cast<unsigned long>(size));
+  if (SRE_MemAlloc)
+    return SRE_MemAlloc(0U, 0U, static_cast<unsigned long>(size));
+  if (XXX_MemAlloc)
+    return XXX_MemAlloc(0U, 0U, static_cast<unsigned long>(size));
+  return nullptr;
 #else
   return std::malloc(size);
 #endif
 }
+
+#if EASYJIT_USE_CUSTOM_NEW_DELETE
+static void easyjit_platform_free(void *p, const char *tag) noexcept {
+  if (!p)
+    return;
+  if (SRE_MemFree) {
+    EASYJIT_ALLOC_LOG("%s before SRE_MemFree ptr=%p\n", tag, p);
+    (void)SRE_MemFree(0, p);
+    EASYJIT_ALLOC_LOG("%s after SRE_MemFree ptr=%p\n", tag, p);
+  } else if (XXX_MemFree) {
+    EASYJIT_ALLOC_LOG("%s fallback before XXX_MemFree ptr=%p\n", tag, p);
+    (void)XXX_MemFree(0, p);
+    EASYJIT_ALLOC_LOG("%s fallback after XXX_MemFree ptr=%p\n", tag, p);
+  } else {
+    EASYJIT_ALLOC_LOG("%s no platform free hook ptr=%p\n", tag, p);
+  }
+}
+#endif
 
 void *operator new(std::size_t size) {
   EASYJIT_ALLOC_LOG("operator new begin size=%zu\n", size);
@@ -103,11 +130,7 @@ void *operator new[](std::size_t size, const std::nothrow_t &) noexcept {
 void operator delete(void *p) noexcept {
   EASYJIT_ALLOC_LOG("operator delete ptr=%p\n", p);
 #if EASYJIT_USE_CUSTOM_NEW_DELETE
-  if (p) {
-    EASYJIT_ALLOC_LOG("operator delete before XXX_MemFree ptr=%p\n", p);
-    (void)XXX_MemFree(0, p);
-    EASYJIT_ALLOC_LOG("operator delete after XXX_MemFree ptr=%p\n", p);
-  }
+  easyjit_platform_free(p, "operator delete");
 #else
   std::free(p);
 #endif
@@ -153,9 +176,9 @@ void *operator new(std::size_t size, std::align_val_t alignment) {
     // Replace this with the platform aligned allocation hook if the board
     // requires over-aligned C++ objects. The current custom API has no
     // alignment argument, so it is only safe when it guarantees align bytes.
-    EASYJIT_ALLOC_LOG("operator new aligned before XXX_MemAlloc size=%zu align=%zu\n",
+    EASYJIT_ALLOC_LOG("operator new aligned before platform alloc size=%zu align=%zu\n",
                       size, align);
-    p = XXX_MemAlloc(0U, 0U, static_cast<unsigned long>(size));
+    p = easyjit_allocate_or_null(size);
     if (p && reinterpret_cast<std::uintptr_t>(p) % align == 0) {
 #else
     EASYJIT_ALLOC_LOG("operator new aligned before posix_memalign size=%zu align=%zu\n",
@@ -173,7 +196,7 @@ void *operator new(std::size_t size, std::align_val_t alignment) {
     if (p) {
       EASYJIT_ALLOC_LOG("operator new aligned free misaligned ptr=%p align=%zu mod=%zu\n",
                         p, align, reinterpret_cast<std::uintptr_t>(p) % align);
-      (void)XXX_MemFree(0, p);
+      easyjit_platform_free(p, "operator new aligned misaligned");
     }
 #endif
 
@@ -206,7 +229,7 @@ void *operator new(std::size_t size, std::align_val_t alignment,
   p = easyjit_allocate_or_null(size);
   if (p && reinterpret_cast<std::uintptr_t>(p) %
                static_cast<std::size_t>(alignment) != 0) {
-    (void)XXX_MemFree(0, p);
+    easyjit_platform_free(p, "operator new aligned nothrow misaligned");
     p = nullptr;
   }
 #else

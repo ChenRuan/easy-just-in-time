@@ -65,6 +65,9 @@ extern "C" __attribute__((weak)) unsigned int SRE_MmuMap(unsigned int,
                                                          unsigned int,
                                                          unsigned int *,
                                                          unsigned int);
+extern "C" __attribute__((weak)) void *SRE_MemAlloc(unsigned int, unsigned char,
+                                                    unsigned long);
+extern "C" __attribute__((weak)) unsigned int SRE_MemFree(unsigned int, void *);
 extern "C" __attribute__((weak)) void *XXX_MemAlloc(unsigned int, unsigned char,
                                                     unsigned long);
 extern "C" __attribute__((weak)) unsigned int XXX_MemFree(unsigned int, void *);
@@ -3371,10 +3374,15 @@ void *light::compile(const Function &Fn, Result &out,
     if (rc == 0U && va != 0U)
       page = reinterpret_cast<void *>(static_cast<uintptr_t>(va));
   }
+  if (!page && SRE_MemAlloc) {
+    LIGHT_SRE_LOG("compile: before SRE_MemAlloc codeSize=%zu\n", codeSize);
+    page = SRE_MemAlloc(0U, 0U, (unsigned long)codeSize);
+    LIGHT_SRE_LOG("compile: after SRE_MemAlloc page=%p\n", page);
+  }
   if (!page && XXX_MemAlloc) {
-    LIGHT_SRE_LOG("compile: before XXX_MemAlloc codeSize=%zu\n", codeSize);
+    LIGHT_SRE_LOG("compile: fallback before XXX_MemAlloc codeSize=%zu\n", codeSize);
     page = XXX_MemAlloc(0U, 0U, (unsigned long)codeSize);
-    LIGHT_SRE_LOG("compile: after XXX_MemAlloc page=%p\n", page);
+    LIGHT_SRE_LOG("compile: fallback after XXX_MemAlloc page=%p\n", page);
   }
   if (!page) {
     LIGHT_SRE_LOG("compile: no code allocation interface succeeded\n");
@@ -3389,7 +3397,10 @@ void *light::compile(const Function &Fn, Result &out,
                 (int)out.status, out.codeBytes, out.reason.c_str());
   if (out.status != Status::Ok) {
     LIGHT_SRE_LOG("compile: before free reject page=%p codeSize=%zu\n", page, codeSize);
-    if (XXX_MemFree) (void)XXX_MemFree(0U, page);
+    if (SRE_MemFree)
+      (void)SRE_MemFree(0U, page);
+    else if (XXX_MemFree)
+      (void)XXX_MemFree(0U, page);
     LIGHT_SRE_LOG("compile: after free reject\n");
     return nullptr;
   }

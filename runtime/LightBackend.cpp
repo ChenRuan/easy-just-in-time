@@ -38,6 +38,7 @@
 
 #define EASYJIT_RT_LOG(...) EASYJIT_SRE_LOG("[runtime] " __VA_ARGS__)
 
+extern "C" __attribute__((weak)) unsigned int SRE_MemFree(unsigned int, void *);
 extern "C" __attribute__((weak)) unsigned int XXX_MemFree(unsigned int, void *);
 
 namespace easy {
