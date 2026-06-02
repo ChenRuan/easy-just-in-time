@@ -3362,7 +3362,7 @@ void *light::compile(const Function &Fn, Result &out,
   const size_t codeSize = 4096u * 4u;
   LIGHT_SRE_LOG("compile: before code allocation codeSize=%zu\n", codeSize);
   void *page = nullptr;
-  if (SRE_MmuMap) {
+  if (false && SRE_MmuMap) {
     unsigned int va = 0;
     LIGHT_SRE_LOG("compile: before SRE_MmuMap phy=0 len=%zu cache=1\n",
                   codeSize);
@@ -3393,9 +3393,9 @@ void *light::compile(const Function &Fn, Result &out,
     LIGHT_SRE_LOG("compile: after free reject\n");
     return nullptr;
   }
-  LIGHT_SRE_LOG("compile: before clear_cache bytes=%zu\n", out.codeBytes);
-  __builtin___clear_cache((char *)page, (char *)page + out.codeBytes);
-  LIGHT_SRE_LOG("compile: after clear_cache skip mprotect page=%p codeSize=%zu\n",
+  LIGHT_SRE_LOG("compile: skip clear_cache for malloc-only debug bytes=%zu\n",
+                out.codeBytes);
+  LIGHT_SRE_LOG("compile: after skipped clear_cache skip mprotect page=%p codeSize=%zu\n",
                 page, codeSize);
   // Debug/SRE path: avoid mprotect for the same reason we avoid mmap.  Whether
   // the returned memory is executable depends on the platform allocator; the
