@@ -44,27 +44,18 @@ namespace light_backend {
 // ----------------------------------------------------------------- policy
 
 Policy GetPolicyFromEnv() {
-  const char *v = std::getenv("EASYJIT_LIGHT");
-  EASYJIT_RT_LOG("[light] GetPolicyFromEnv EASYJIT_LIGHT=%s\n", v ? v : "<null>");
-  if (!v || !*v) return Policy::Off;
-  if (std::strcmp(v, "off")   == 0 || std::strcmp(v, "0") == 0) return Policy::Off;
-  if (std::strcmp(v, "try")   == 0 ||
-      std::strcmp(v, "auto")  == 0 ||
-      std::strcmp(v, "1")     == 0) return Policy::Try;
-  if (std::strcmp(v, "force") == 0) return Policy::Force;
-  // Unknown values: conservative default. Do NOT silently engage.
-  std::fprintf(stderr,
-               "[easyjit/light] unknown EASYJIT_LIGHT='%s' (expected off|try|force); "
-               "treating as 'off'\n", v);
-  return Policy::Off;
+  EASYJIT_RT_LOG("[light] GetPolicyFromEnv: debug/SRE path forces light backend\n");
+  // Debug branch only: avoid std::getenv on the target SRE platform.  The
+  // board has crashed in libc environment handling; this branch is used to
+  // validate the light backend specifically, so force it directly.
+  return Policy::Force;
 }
 
 // Runtime-observable trace, gated by EASYJIT_LIGHT_VERBOSE=1. This does
 // NOT require rebuilding with EASYJIT_RUNTIME_DEBUG=1, so users can
 // verify which backend served their call without a dev-mode runtime.
 static bool VerboseEnabled() {
-  const char *v = std::getenv("EASYJIT_LIGHT_VERBOSE");
-  return v && *v && std::strcmp(v, "0") != 0;
+  return false;
 }
 #define LIGHT_TRACE(...)                                                           \
   do {                                                                             \
@@ -318,6 +309,12 @@ static bool EnsureDumpDir(const char *dir) {
 // Best-effort dump. Never throws, never aborts.
 static void MaybeDumpLightCode(const char *Name, const void *Code,
                                size_t Bytes) {
+  (void)Name;
+  (void)Code;
+  (void)Bytes;
+  EASYJIT_RT_LOG("[light] MaybeDumpLightCode: skipped on debug/SRE path\n");
+  return;
+#if 0
   const char *dir = std::getenv("EASYJIT_LIGHT_DUMP_CODE_DIR");
   if (!dir || !*dir || !Code || Bytes == 0) return;
 
@@ -381,6 +378,7 @@ static void MaybeDumpLightCode(const char *Name, const void *Code,
                  Name ? Name : "<null>", Bytes, filename);
     std::fflush(stderr);
   }
+#endif
 }
 
 // Convert easy::GlobalMapping (Name, Address) <-> light::GlobalSymbol
@@ -489,17 +487,7 @@ Report TryLightCompile(const char *Name,
     // EASYJIT_LIGHT_VERBOSE=2 additionally dumps the rejected function
     // IR to stderr. Useful when diagnosing why a given case is not
     // accepted (e.g. comparing C++ front-end vs C API lowering).
-    if (const char *v = std::getenv("EASYJIT_LIGHT_VERBOSE");
-        v && std::strcmp(v, "2") == 0) {
-      std::fprintf(stderr, "---- [easyjit/light] rejected IR (%s) ----\n", Name);
-      std::fflush(stderr);
-      std::string buf;
-      llvm::raw_string_ostream os(buf);
-      F->print(os);
-      os.flush();
-      std::fputs(buf.c_str(), stderr);
-      std::fputs("---- end IR ----\n", stderr);
-    }
+    EASYJIT_RT_LOG("[light] rejected IR dump skipped on debug/SRE path\n");
     rep.reason = r.reason.empty() ? std::string("light emitter rejected function")
                                   : r.reason;
     rep.outcome = (policy == Policy::Force) ? Outcome::FailedForce

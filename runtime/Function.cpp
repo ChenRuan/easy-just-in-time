@@ -966,11 +966,7 @@ static std::unique_ptr<easy::Function>
 MakeOriginalFunctionFallback(void *Addr, std::string Reason) {
   EASYJIT_RT_LOG("Function::Compile: using original function fallback: %s\n",
                  Reason.c_str());
-  if (const char *Verbose = std::getenv("EASYJIT_LIGHT_VERBOSE");
-      Verbose && Verbose[0] != '\0' && Verbose[0] != '0') {
-    std::fprintf(stderr, "[easyjit/light] fallback: %s\n", Reason.c_str());
-    std::fflush(stderr);
-  }
+  EASYJIT_RT_LOG("Function::Compile: skip fallback getenv/stderr on debug/SRE path\n");
   std::unique_ptr<easy::LLVMHolder> Holder(
       new OriginalFunctionHolder(std::move(Reason)));
   return std::unique_ptr<easy::Function>(
