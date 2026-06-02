@@ -52,6 +52,15 @@
 #include <cstdlib>
 
 #define EASYJIT_RT_LOG(...) EASYJIT_SRE_LOG("[runtime] " __VA_ARGS__)
+#define EASYJIT_RT_RAW(...)                                                    \
+  do {                                                                         \
+    if (SRE_printf) {                                                          \
+      SRE_printf(__VA_ARGS__);                                                 \
+    } else {                                                                   \
+      std::fprintf(stderr, __VA_ARGS__);                                       \
+      std::fflush(stderr);                                                     \
+    }                                                                          \
+  } while (0)
 
 
 using namespace easy;
@@ -239,6 +248,250 @@ static void LogPseudoLlValue(const char *Tag, llvm::Value *V) {
   }
 }
 
+static const char *PredicateName(llvm::CmpInst::Predicate P) {
+  switch (P) {
+  case llvm::CmpInst::ICMP_EQ: return "eq";
+  case llvm::CmpInst::ICMP_NE: return "ne";
+  case llvm::CmpInst::ICMP_UGT: return "ugt";
+  case llvm::CmpInst::ICMP_UGE: return "uge";
+  case llvm::CmpInst::ICMP_ULT: return "ult";
+  case llvm::CmpInst::ICMP_ULE: return "ule";
+  case llvm::CmpInst::ICMP_SGT: return "sgt";
+  case llvm::CmpInst::ICMP_SGE: return "sge";
+  case llvm::CmpInst::ICMP_SLT: return "slt";
+  case llvm::CmpInst::ICMP_SLE: return "sle";
+  case llvm::CmpInst::FCMP_FALSE: return "false";
+  case llvm::CmpInst::FCMP_OEQ: return "oeq";
+  case llvm::CmpInst::FCMP_OGT: return "ogt";
+  case llvm::CmpInst::FCMP_OGE: return "oge";
+  case llvm::CmpInst::FCMP_OLT: return "olt";
+  case llvm::CmpInst::FCMP_OLE: return "ole";
+  case llvm::CmpInst::FCMP_ONE: return "one";
+  case llvm::CmpInst::FCMP_ORD: return "ord";
+  case llvm::CmpInst::FCMP_UNO: return "uno";
+  case llvm::CmpInst::FCMP_UEQ: return "ueq";
+  case llvm::CmpInst::FCMP_UGT: return "ugt";
+  case llvm::CmpInst::FCMP_UGE: return "uge";
+  case llvm::CmpInst::FCMP_ULT: return "ult";
+  case llvm::CmpInst::FCMP_ULE: return "ule";
+  case llvm::CmpInst::FCMP_UNE: return "une";
+  case llvm::CmpInst::FCMP_TRUE: return "true";
+  default: return "pred";
+  }
+}
+
+static void PrintTypeFrag(llvm::Type *T, unsigned Depth = 0) {
+  if (!T) {
+    EASYJIT_RT_RAW("<nullty>");
+    return;
+  }
+  if (Depth > 2) {
+    EASYJIT_RT_RAW("<deep>");
+    return;
+  }
+  if (T->isVoidTy()) {
+    EASYJIT_RT_RAW("void");
+  } else if (auto *IT = llvm::dyn_cast<llvm::IntegerType>(T)) {
+    EASYJIT_RT_RAW("i%u", IT->getBitWidth());
+  } else if (T->isPointerTy()) {
+    EASYJIT_RT_RAW("ptr");
+  } else if (T->isFloatTy()) {
+    EASYJIT_RT_RAW("float");
+  } else if (T->isDoubleTy()) {
+    EASYJIT_RT_RAW("double");
+  } else if (auto *AT = llvm::dyn_cast<llvm::ArrayType>(T)) {
+    EASYJIT_RT_RAW("[%llu x ", (unsigned long long)AT->getNumElements());
+    PrintTypeFrag(AT->getElementType(), Depth + 1);
+    EASYJIT_RT_RAW("]");
+  } else if (auto *ST = llvm::dyn_cast<llvm::StructType>(T)) {
+    if (ST->hasName()) {
+      llvm::StringRef N = ST->getName();
+      EASYJIT_RT_RAW("%%\"%.*s\"", (int)N.size(), N.data());
+    } else {
+      EASYJIT_RT_RAW("struct");
+    }
+  } else if (T->isFunctionTy()) {
+    EASYJIT_RT_RAW("fn");
+  } else if (T->isVectorTy()) {
+    EASYJIT_RT_RAW("vector");
+  } else if (T->isLabelTy()) {
+    EASYJIT_RT_RAW("label");
+  } else if (T->isMetadataTy()) {
+    EASYJIT_RT_RAW("metadata");
+  } else {
+    EASYJIT_RT_RAW("type");
+  }
+}
+
+static void PrintValueFrag(llvm::Value *V) {
+  if (!V) {
+    EASYJIT_RT_RAW("<null>");
+    return;
+  }
+  if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(V)) {
+    if (CI->getBitWidth() == 1) {
+      EASYJIT_RT_RAW("%s", CI->isOne() ? "true" : "false");
+    } else if (CI->getBitWidth() <= 64) {
+      if (CI->getValue().isNegative())
+        EASYJIT_RT_RAW("%lld", (long long)CI->getSExtValue());
+      else
+        EASYJIT_RT_RAW("%llu", (unsigned long long)CI->getZExtValue());
+    } else {
+      EASYJIT_RT_RAW("constint%p", (void *)CI);
+    }
+  } else if (llvm::isa<llvm::ConstantPointerNull>(V)) {
+    EASYJIT_RT_RAW("null");
+  } else if (llvm::isa<llvm::UndefValue>(V)) {
+    EASYJIT_RT_RAW("undef");
+  } else if (auto *BB = llvm::dyn_cast<llvm::BasicBlock>(V)) {
+    llvm::StringRef N = BB->hasName() ? BB->getName() : llvm::StringRef();
+    if (!N.empty())
+      EASYJIT_RT_RAW("%%%.*s", (int)N.size(), N.data());
+    else
+      EASYJIT_RT_RAW("%%bb%p", (void *)BB);
+  } else if (auto *F = llvm::dyn_cast<llvm::Function>(V)) {
+    llvm::StringRef N = F->hasName() ? F->getName() : llvm::StringRef();
+    if (!N.empty())
+      EASYJIT_RT_RAW("@%.*s", (int)N.size(), N.data());
+    else
+      EASYJIT_RT_RAW("@fn%p", (void *)F);
+  } else if (auto *GV = llvm::dyn_cast<llvm::GlobalValue>(V)) {
+    llvm::StringRef N = GV->hasName() ? GV->getName() : llvm::StringRef();
+    if (!N.empty())
+      EASYJIT_RT_RAW("@%.*s", (int)N.size(), N.data());
+    else
+      EASYJIT_RT_RAW("@g%p", (void *)GV);
+  } else if (llvm::isa<llvm::ConstantFP>(V)) {
+    EASYJIT_RT_RAW("constfp%p", (void *)V);
+  } else if (llvm::isa<llvm::ConstantExpr>(V)) {
+    EASYJIT_RT_RAW("constexpr%p", (void *)V);
+  } else if (llvm::isa<llvm::Constant>(V)) {
+    EASYJIT_RT_RAW("const%p", (void *)V);
+  } else {
+    EASYJIT_RT_RAW("%%v%p", (void *)V);
+  }
+}
+
+static void PrintTypedValueFrag(llvm::Value *V) {
+  if (!V) {
+    EASYJIT_RT_RAW("<nullty> <null>");
+    return;
+  }
+  PrintTypeFrag(V->getType());
+  EASYJIT_RT_RAW(" ");
+  PrintValueFrag(V);
+}
+
+static void PrintLlTextInst(llvm::Instruction &I) {
+  EASYJIT_RT_RAW("[easyjit][sre] [runtime] PSEUDO_LL_TEXT:   ");
+  if (!I.getType()->isVoidTy()) {
+    PrintValueFrag(&I);
+    EASYJIT_RT_RAW(" = ");
+  }
+
+  if (auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(&I)) {
+    EASYJIT_RT_RAW("%s ", BO->getOpcodeName());
+    PrintTypeFrag(BO->getType());
+    EASYJIT_RT_RAW(" ");
+    PrintValueFrag(BO->getOperand(0));
+    EASYJIT_RT_RAW(", ");
+    PrintValueFrag(BO->getOperand(1));
+  } else if (auto *CI = llvm::dyn_cast<llvm::CmpInst>(&I)) {
+    EASYJIT_RT_RAW("%s %s ", CI->getOpcodeName(),
+                   PredicateName(CI->getPredicate()));
+    PrintTypeFrag(CI->getOperand(0)->getType());
+    EASYJIT_RT_RAW(" ");
+    PrintValueFrag(CI->getOperand(0));
+    EASYJIT_RT_RAW(", ");
+    PrintValueFrag(CI->getOperand(1));
+  } else if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I)) {
+    EASYJIT_RT_RAW("load ");
+    PrintTypeFrag(LI->getType());
+    EASYJIT_RT_RAW(", ");
+    PrintTypedValueFrag(LI->getPointerOperand());
+  } else if (auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+    EASYJIT_RT_RAW("store ");
+    PrintTypedValueFrag(SI->getValueOperand());
+    EASYJIT_RT_RAW(", ");
+    PrintTypedValueFrag(SI->getPointerOperand());
+  } else if (auto *RI = llvm::dyn_cast<llvm::ReturnInst>(&I)) {
+    if (llvm::Value *RV = RI->getReturnValue()) {
+      EASYJIT_RT_RAW("ret ");
+      PrintTypedValueFrag(RV);
+    } else {
+      EASYJIT_RT_RAW("ret void");
+    }
+  } else if (auto *BR = llvm::dyn_cast<llvm::BranchInst>(&I)) {
+    if (BR->isConditional()) {
+      EASYJIT_RT_RAW("br ");
+      PrintTypedValueFrag(BR->getCondition());
+      EASYJIT_RT_RAW(", label ");
+      PrintValueFrag(BR->getSuccessor(0));
+      EASYJIT_RT_RAW(", label ");
+      PrintValueFrag(BR->getSuccessor(1));
+    } else {
+      EASYJIT_RT_RAW("br label ");
+      PrintValueFrag(BR->getSuccessor(0));
+    }
+  } else if (auto *PN = llvm::dyn_cast<llvm::PHINode>(&I)) {
+    EASYJIT_RT_RAW("phi ");
+    PrintTypeFrag(PN->getType());
+    for (unsigned P = 0, E = PN->getNumIncomingValues(); P != E; ++P) {
+      EASYJIT_RT_RAW("%s[ ", P ? ", " : " ");
+      PrintValueFrag(PN->getIncomingValue(P));
+      EASYJIT_RT_RAW(", ");
+      PrintValueFrag(PN->getIncomingBlock(P));
+      EASYJIT_RT_RAW(" ]");
+    }
+  } else if (auto *CB = llvm::dyn_cast<llvm::CallBase>(&I)) {
+    EASYJIT_RT_RAW("call ");
+    PrintTypeFrag(CB->getType());
+    EASYJIT_RT_RAW(" ");
+    if (llvm::Function *CF = CB->getCalledFunction())
+      PrintValueFrag(CF);
+    else
+      PrintValueFrag(CB->getCalledOperand());
+    EASYJIT_RT_RAW("(");
+    for (unsigned A = 0, E = CB->arg_size(); A != E; ++A) {
+      if (A)
+        EASYJIT_RT_RAW(", ");
+      PrintTypedValueFrag(CB->getArgOperand(A));
+    }
+    EASYJIT_RT_RAW(")");
+  } else if (auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(&I)) {
+    EASYJIT_RT_RAW("getelementptr ");
+    PrintTypeFrag(GEP->getSourceElementType());
+    EASYJIT_RT_RAW(", ");
+    PrintTypedValueFrag(GEP->getPointerOperand());
+    for (auto Idx = GEP->idx_begin(), End = GEP->idx_end(); Idx != End; ++Idx) {
+      EASYJIT_RT_RAW(", ");
+      PrintTypedValueFrag(*Idx);
+    }
+  } else if (auto *AI = llvm::dyn_cast<llvm::AllocaInst>(&I)) {
+    EASYJIT_RT_RAW("alloca ");
+    PrintTypeFrag(AI->getAllocatedType());
+  } else if (auto *Sel = llvm::dyn_cast<llvm::SelectInst>(&I)) {
+    EASYJIT_RT_RAW("select ");
+    PrintTypedValueFrag(Sel->getCondition());
+    EASYJIT_RT_RAW(", ");
+    PrintTypedValueFrag(Sel->getTrueValue());
+    EASYJIT_RT_RAW(", ");
+    PrintTypedValueFrag(Sel->getFalseValue());
+  } else if (auto *Cast = llvm::dyn_cast<llvm::CastInst>(&I)) {
+    EASYJIT_RT_RAW("%s ", Cast->getOpcodeName());
+    PrintTypedValueFrag(Cast->getOperand(0));
+    EASYJIT_RT_RAW(" to ");
+    PrintTypeFrag(Cast->getType());
+  } else {
+    EASYJIT_RT_RAW("%s", I.getOpcodeName());
+    for (unsigned Op = 0, E = I.getNumOperands(); Op != E; ++Op) {
+      EASYJIT_RT_RAW("%s", Op ? ", " : " ");
+      PrintTypedValueFrag(I.getOperand(Op));
+    }
+  }
+  EASYJIT_RT_RAW("\n");
+}
+
 static void LogPseudoLlInst(llvm::Instruction &I, unsigned BBIndex,
                             unsigned InstIndex) {
   llvm::StringRef IN = I.hasName() ? I.getName() : llvm::StringRef();
@@ -246,6 +499,7 @@ static void LogPseudoLlInst(llvm::Instruction &I, unsigned BBIndex,
                  BBIndex, InstIndex, (void *)&I, (int)IN.size(), IN.data(),
                  I.getOpcodeName(), TypeKindName(I.getType()),
                  TypeBitHint(I.getType()), I.getNumOperands());
+  PrintLlTextInst(I);
 
   if (auto *BO = llvm::dyn_cast<llvm::BinaryOperator>(&I)) {
     EASYJIT_RT_LOG("PSEUDO_LL_BINOP: result=%p op=%s lhs=%p rhs=%p ty=%s hint=%u\n",
@@ -357,6 +611,18 @@ static void DumpFunctionPseudoIRToSre(llvm::Module &M, const char *Name,
                  TypeKindName(F->getReturnType()), TypeBitHint(F->getReturnType()),
                  (int)FN.size(), FN.data(), (void *)F,
                  (unsigned)F->arg_size());
+  EASYJIT_RT_RAW("[easyjit][sre] [runtime] PSEUDO_LL_TEXT: define ");
+  PrintTypeFrag(F->getReturnType());
+  EASYJIT_RT_RAW(" @%.*s(", (int)FN.size(), FN.data());
+  unsigned TextArgIndex = 0;
+  for (llvm::Argument &Arg : F->args()) {
+    if (TextArgIndex)
+      EASYJIT_RT_RAW(", ");
+    PrintTypedValueFrag(&Arg);
+    ++TextArgIndex;
+  }
+  EASYJIT_RT_RAW(") {\n");
+
   EASYJIT_RT_LOG("PSEUDOIR_FUNC: name=%.*s fn=%p decl=%d broken=%d ret_kind=%s ret_hint=%u args=%u bbs=%zu attrs_sets=%u cc=%u linkage=%u\n",
                  (int)FN.size(), FN.data(), (void *)F, (int)F->isDeclaration(),
                  (int)llvm::verifyFunction(*F, nullptr),
@@ -388,6 +654,12 @@ static void DumpFunctionPseudoIRToSre(llvm::Module &M, const char *Name,
     EASYJIT_RT_LOG("PSEUDO_LL_BB: bb=%p index=%u name=%.*s preds=%u insts=%zu\n",
                    (void *)&BB, BBIndex, (int)BBN.size(), BBN.data(),
                    PredCount, (size_t)BB.size());
+    EASYJIT_RT_RAW("[easyjit][sre] [runtime] PSEUDO_LL_TEXT: ");
+    if (!BBN.empty())
+      EASYJIT_RT_RAW("%.*s", (int)BBN.size(), BBN.data());
+    else
+      EASYJIT_RT_RAW("bb%p", (void *)&BB);
+    EASYJIT_RT_RAW(":\n");
 
     unsigned InstIndex = 0;
     for (llvm::Instruction &I : BB) {
@@ -440,6 +712,7 @@ static void DumpFunctionPseudoIRToSre(llvm::Module &M, const char *Name,
   }
 
   EASYJIT_RT_LOG("PSEUDO_LL_FUNC_END: fn=%p\n", (void *)F);
+  EASYJIT_RT_RAW("[easyjit][sre] [runtime] PSEUDO_LL_TEXT: }\n");
   EASYJIT_RT_LOG("PSEUDOIR: end\n");
 }
 
