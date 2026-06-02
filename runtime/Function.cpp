@@ -1091,7 +1091,13 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
   // LLJIT/ORC backend (CreateJIT, CompileAndWrap, MapGlobals) is
   // unchanged.
 
-  llvm::legacy::PassManager MPM;
+  // Debug branch only: keep the legacy PM off the stack.  The target SRE
+  // platform has repeatedly crashed in LLVM/container destruction paths after
+  // the actual optimization work had completed.  Leaking this pass manager lets
+  // us distinguish "PM.run failed" from "PM/pass cleanup failed" on-board.
+  llvm::legacy::PassManager *MPM = new llvm::legacy::PassManager();
+  EASYJIT_RT_LOG("Optimize: created leaked legacy PassManager MPM=%p\n",
+                 (void *)MPM);
   EASYJIT_RT_LOG("Optimize: skip TargetTransformInfo pass\n");
   // Do not install TargetTransformInfo here.  The target SDK used by the
   // embedded light-runtime path has an unstable libc++ std::function
@@ -1109,7 +1115,7 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
                    (void *)EasyJitOptPass);                                   \
     EASYJIT_RT_LOG("Optimize: before add %s pass=%p\n", Label,               \
                    (void *)EasyJitOptPass);                                   \
-    MPM.add(EasyJitOptPass);                                                  \
+    MPM->add(EasyJitOptPass);                                                 \
     EASYJIT_RT_LOG("Optimize: after add %s pass=%p\n", Label,                \
                    (void *)EasyJitOptPass);                                   \
   } while (false)
@@ -1209,15 +1215,22 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
 #undef EASYJIT_ADD_OPT_PASS
 
   EASYJIT_RT_LOG("Optimize: running pass manager for %s\n", Name ? Name : "<null>");
-  MPM.run(M);
+  EASYJIT_RT_LOG("Optimize: before MPM->run MPM=%p module=%p\n",
+                 (void *)MPM, (void *)&M);
+  MPM->run(M);
   EASYJIT_RT_LOG("Optimize: finished for %s\n", Name ? Name : "<null>");
+  EASYJIT_RT_LOG("Optimize: leaving MPM leaked MPM=%p\n", (void *)MPM);
 
   // Optional IR dump for benchmarking / debugging the pass pipeline.
   if (const char *DumpPath = std::getenv("EASYJIT_DUMP_IR")) {
+    EASYJIT_RT_LOG("Optimize: EASYJIT_DUMP_IR path=%s begin\n", DumpPath);
     std::error_code EC;
     llvm::raw_fd_ostream OS(DumpPath, EC);
     if (!EC) M.print(OS, nullptr);
+    EASYJIT_RT_LOG("Optimize: EASYJIT_DUMP_IR path=%s end ec=%d\n",
+                   DumpPath, (int)EC.value());
   }
+  EASYJIT_RT_LOG("Optimize: return name=%s\n", Name ? Name : "<null>");
 }
 
 static void DisableRecursiveJit(llvm::Module &M, const char *EntryName) {
