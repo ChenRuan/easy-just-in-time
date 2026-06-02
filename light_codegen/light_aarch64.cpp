@@ -61,6 +61,9 @@ using namespace light;
 using namespace llvm;
 
 extern "C" __attribute__((weak)) int SRE_printf(const char *, ...);
+extern "C" __attribute__((weak)) void *XXX_MemAlloc(unsigned int, unsigned char,
+                                                    unsigned long);
+extern "C" __attribute__((weak)) unsigned int XXX_MemFree(unsigned int, void *);
 
 #define LIGHT_SRE_LOG(...)                 \
   do {                                     \
@@ -3354,29 +3357,35 @@ void *light::compile(const Function &Fn, Result &out,
   // 16KiB size directly here.
   const size_t codeSize = 4096u * 4u;
   LIGHT_SRE_LOG("compile: before mmap codeSize=%zu\n", codeSize);
-  void *page = ::mmap(nullptr, codeSize, PROT_READ | PROT_WRITE,
-                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  LIGHT_SRE_LOG("compile: after mmap page=%p\n", page);
-  if (page == MAP_FAILED) { out.status = Status::TooLarge; out.reason = "mmap"; return nullptr; }
+  void *page = nullptr;
+  if (XXX_MemAlloc) {
+    LIGHT_SRE_LOG("compile: before XXX_MemAlloc codeSize=%zu\n", codeSize);
+    page = XXX_MemAlloc(0U, 0U, (unsigned long)codeSize);
+    LIGHT_SRE_LOG("compile: after XXX_MemAlloc page=%p\n", page);
+  } else {
+    LIGHT_SRE_LOG("compile: XXX_MemAlloc unavailable, rejecting before mmap\n");
+    out.status = Status::TooLarge;
+    out.reason = "XXX_MemAlloc unavailable";
+    return nullptr;
+  }
+  if (!page) { out.status = Status::TooLarge; out.reason = "code alloc"; return nullptr; }
   LIGHT_SRE_LOG("compile: before emit page=%p codeSize=%zu\n", page, codeSize);
   out = emit(Fn, (uint8_t *)page, codeSize, globals, nglobals);
   LIGHT_SRE_LOG("compile: after emit status=%d bytes=%zu reason=%s\n",
                 (int)out.status, out.codeBytes, out.reason.c_str());
   if (out.status != Status::Ok) {
-    LIGHT_SRE_LOG("compile: before munmap reject page=%p codeSize=%zu\n", page, codeSize);
-    ::munmap(page, codeSize);
-    LIGHT_SRE_LOG("compile: after munmap reject\n");
+    LIGHT_SRE_LOG("compile: before free reject page=%p codeSize=%zu\n", page, codeSize);
+    if (XXX_MemFree) (void)XXX_MemFree(0U, page);
+    LIGHT_SRE_LOG("compile: after free reject\n");
     return nullptr;
   }
   LIGHT_SRE_LOG("compile: before clear_cache bytes=%zu\n", out.codeBytes);
   __builtin___clear_cache((char *)page, (char *)page + out.codeBytes);
-  LIGHT_SRE_LOG("compile: after clear_cache before mprotect page=%p codeSize=%zu\n",
+  LIGHT_SRE_LOG("compile: after clear_cache skip mprotect page=%p codeSize=%zu\n",
                 page, codeSize);
-  if (::mprotect(page, codeSize, PROT_READ | PROT_EXEC) != 0) {
-    LIGHT_SRE_LOG("compile: mprotect failed before munmap page=%p\n", page);
-    ::munmap(page, codeSize);
-    out.status = Status::TooLarge; out.reason = "mprotect"; return nullptr;
-  }
+  // Debug/SRE path: avoid mprotect for the same reason we avoid mmap.  Whether
+  // the returned memory is executable depends on the platform allocator; the
+  // next board run will tell us if an executable-code allocation hook is needed.
   LIGHT_SRE_LOG("compile: return page=%p bytes=%zu\n", page, out.codeBytes);
   return page;
 }

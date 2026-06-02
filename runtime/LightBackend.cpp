@@ -38,6 +38,8 @@
 
 #define EASYJIT_RT_LOG(...) EASYJIT_SRE_LOG("[runtime] " __VA_ARGS__)
 
+extern "C" __attribute__((weak)) unsigned int XXX_MemFree(unsigned int, void *);
+
 namespace easy {
 namespace light_backend {
 
@@ -92,6 +94,7 @@ class LightCodeHolder : public ::easy::LLVMHolder {
 public:
   void  *page;
   size_t pageSize;
+  bool ownedByPlatformAlloc = true;
 
   // Keep the source context + optimized module alive *in addition to* the
   // code page. The EasyJIT public API (easy::FunctionWrapper::getLLVMModule)
@@ -121,7 +124,14 @@ public:
   llvm::Module* getModule() const override { return M_.get(); }
 
   ~LightCodeHolder() override {
-    if (page && page != MAP_FAILED) {
+    if (!page || page == MAP_FAILED)
+      return;
+    if (ownedByPlatformAlloc) {
+      EASYJIT_RT_LOG("[light] LightCodeHolder dtor: platform free page=%p size=%zu\n",
+                     page, pageSize);
+      if (XXX_MemFree)
+        (void)XXX_MemFree(0U, page);
+    } else {
       ::munmap(page, pageSize);
     }
   }
