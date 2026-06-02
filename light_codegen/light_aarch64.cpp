@@ -61,6 +61,10 @@ using namespace light;
 using namespace llvm;
 
 extern "C" __attribute__((weak)) int SRE_printf(const char *, ...);
+extern "C" __attribute__((weak)) unsigned int SRE_MmuMap(unsigned int,
+                                                         unsigned int,
+                                                         unsigned int *,
+                                                         unsigned int);
 extern "C" __attribute__((weak)) void *XXX_MemAlloc(unsigned int, unsigned char,
                                                     unsigned long);
 extern "C" __attribute__((weak)) unsigned int XXX_MemFree(unsigned int, void *);
@@ -3356,16 +3360,26 @@ void *light::compile(const Function &Fn, Result &out,
   // light backend always emits into a fixed 4-page buffer; use the same
   // 16KiB size directly here.
   const size_t codeSize = 4096u * 4u;
-  LIGHT_SRE_LOG("compile: before mmap codeSize=%zu\n", codeSize);
+  LIGHT_SRE_LOG("compile: before code allocation codeSize=%zu\n", codeSize);
   void *page = nullptr;
-  if (XXX_MemAlloc) {
+  if (SRE_MmuMap) {
+    unsigned int va = 0;
+    LIGHT_SRE_LOG("compile: before SRE_MmuMap phy=0 len=%zu cache=1\n",
+                  codeSize);
+    unsigned int rc = SRE_MmuMap(0U, (unsigned int)codeSize, &va, 1U);
+    LIGHT_SRE_LOG("compile: after SRE_MmuMap rc=%u va=0x%x\n", rc, va);
+    if (rc == 0U && va != 0U)
+      page = reinterpret_cast<void *>(static_cast<uintptr_t>(va));
+  }
+  if (!page && XXX_MemAlloc) {
     LIGHT_SRE_LOG("compile: before XXX_MemAlloc codeSize=%zu\n", codeSize);
     page = XXX_MemAlloc(0U, 0U, (unsigned long)codeSize);
     LIGHT_SRE_LOG("compile: after XXX_MemAlloc page=%p\n", page);
-  } else {
-    LIGHT_SRE_LOG("compile: XXX_MemAlloc unavailable, rejecting before mmap\n");
+  }
+  if (!page) {
+    LIGHT_SRE_LOG("compile: no code allocation interface succeeded\n");
     out.status = Status::TooLarge;
-    out.reason = "XXX_MemAlloc unavailable";
+    out.reason = "code allocation unavailable";
     return nullptr;
   }
   if (!page) { out.status = Status::TooLarge; out.reason = "code alloc"; return nullptr; }

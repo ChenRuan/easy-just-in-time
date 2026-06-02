@@ -94,7 +94,6 @@ class LightCodeHolder : public ::easy::LLVMHolder {
 public:
   void  *page;
   size_t pageSize;
-  bool ownedByPlatformAlloc = true;
 
   // Keep the source context + optimized module alive *in addition to* the
   // code page. The EasyJIT public API (easy::FunctionWrapper::getLLVMModule)
@@ -126,14 +125,11 @@ public:
   ~LightCodeHolder() override {
     if (!page || page == MAP_FAILED)
       return;
-    if (ownedByPlatformAlloc) {
-      EASYJIT_RT_LOG("[light] LightCodeHolder dtor: platform free page=%p size=%zu\n",
-                     page, pageSize);
-      if (XXX_MemFree)
-        (void)XXX_MemFree(0U, page);
-    } else {
-      ::munmap(page, pageSize);
-    }
+    EASYJIT_RT_LOG("[light] LightCodeHolder dtor: leak code page on debug/SRE path page=%p size=%zu\n",
+                   page, pageSize);
+    // Debug/SRE path: light::compile may use SRE_MmuMap, and we do not have a
+    // matching unmap API in the current platform notes.  Do not call munmap or
+    // XXX_MemFree here; leaking a tiny code page is safer while validating.
   }
 };
 } // anonymous namespace
