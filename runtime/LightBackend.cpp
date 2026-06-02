@@ -506,7 +506,10 @@ Report TryLightCompile(const char *Name,
   MaybeDumpLightCode(Name, code, r.codeBytes);
 
   // Transfer ownership of the code page + module into the holder.
-  const size_t codeSize = (size_t)sysconf(_SC_PAGESIZE) * 4;
+  // Must match light::compile's debug/SRE fixed allocation size.  Avoid
+  // sysconf(_SC_PAGESIZE) on the target platform; it has crashed through
+  // libc relocation paths.
+  const size_t codeSize = 4096u * 4u;
   auto *holderRaw = new LightCodeHolder(code, codeSize, std::move(Ctx), std::move(M));
   EASYJIT_RT_LOG("[light] TryLightCompile: holder=%p codeSize=%zu dataBufs=%zu nameBufs=%zu\n",
                  (void*)holderRaw, codeSize, dataBufs.size(), nameBufs.size());

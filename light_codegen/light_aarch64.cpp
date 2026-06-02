@@ -60,6 +60,14 @@
 using namespace light;
 using namespace llvm;
 
+extern "C" __attribute__((weak)) int SRE_printf(const char *, ...);
+
+#define LIGHT_SRE_LOG(...)                 \
+  do {                                     \
+    if (SRE_printf)                        \
+      SRE_printf("[easyjit][sre] [light_codegen] " __VA_ARGS__); \
+  } while (0)
+
 namespace {
 
 // ----------------------------- encoders -----------------------------
@@ -3337,17 +3345,38 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
 
 void *light::compile(const Function &Fn, Result &out,
                      const GlobalSymbol *globals, size_t nglobals) {
-  const size_t pageSize = (size_t)sysconf(_SC_PAGESIZE);
-  const size_t codeSize = pageSize * 4;
+  LIGHT_SRE_LOG("compile: enter fn=%.*s globals=%p nglobals=%zu\n",
+                (int)Fn.getName().size(), Fn.getName().data(),
+                (const void *)globals, nglobals);
+  // Debug/SRE path: avoid sysconf(_SC_PAGESIZE).  The target runtime has
+  // already crashed in libc entry points reached through relocations.  The
+  // light backend always emits into a fixed 4-page buffer; use the same
+  // 16KiB size directly here.
+  const size_t codeSize = 4096u * 4u;
+  LIGHT_SRE_LOG("compile: before mmap codeSize=%zu\n", codeSize);
   void *page = ::mmap(nullptr, codeSize, PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  LIGHT_SRE_LOG("compile: after mmap page=%p\n", page);
   if (page == MAP_FAILED) { out.status = Status::TooLarge; out.reason = "mmap"; return nullptr; }
+  LIGHT_SRE_LOG("compile: before emit page=%p codeSize=%zu\n", page, codeSize);
   out = emit(Fn, (uint8_t *)page, codeSize, globals, nglobals);
-  if (out.status != Status::Ok) { ::munmap(page, codeSize); return nullptr; }
+  LIGHT_SRE_LOG("compile: after emit status=%d bytes=%zu reason=%s\n",
+                (int)out.status, out.codeBytes, out.reason.c_str());
+  if (out.status != Status::Ok) {
+    LIGHT_SRE_LOG("compile: before munmap reject page=%p codeSize=%zu\n", page, codeSize);
+    ::munmap(page, codeSize);
+    LIGHT_SRE_LOG("compile: after munmap reject\n");
+    return nullptr;
+  }
+  LIGHT_SRE_LOG("compile: before clear_cache bytes=%zu\n", out.codeBytes);
   __builtin___clear_cache((char *)page, (char *)page + out.codeBytes);
+  LIGHT_SRE_LOG("compile: after clear_cache before mprotect page=%p codeSize=%zu\n",
+                page, codeSize);
   if (::mprotect(page, codeSize, PROT_READ | PROT_EXEC) != 0) {
+    LIGHT_SRE_LOG("compile: mprotect failed before munmap page=%p\n", page);
     ::munmap(page, codeSize);
     out.status = Status::TooLarge; out.reason = "mprotect"; return nullptr;
   }
+  LIGHT_SRE_LOG("compile: return page=%p bytes=%zu\n", page, out.codeBytes);
   return page;
 }
