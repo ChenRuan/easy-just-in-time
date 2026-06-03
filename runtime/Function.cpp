@@ -53,6 +53,11 @@
 
 #define EASYJIT_RT_LOG(...) EASYJIT_SRE_LOG("[runtime] " __VA_ARGS__)
 #define EASYJIT_RT_RAW(...) do { } while (0)
+#define EASYJIT_MPM_DIAG(...)                                                 \
+  do {                                                                        \
+    if (SRE_printf)                                                           \
+      SRE_printf("[easyjit][mpm] " __VA_ARGS__);                              \
+  } while (0)
 
 
 using namespace easy;
@@ -1079,13 +1084,11 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
   // LLJIT/ORC backend (CreateJIT, CompileAndWrap, MapGlobals) is
   // unchanged.
 
-  // Debug branch only: keep the legacy PM off the stack.  The target SRE
-  // platform has repeatedly crashed in LLVM/container destruction paths after
-  // the actual optimization work had completed.  Leaking this pass manager lets
-  // us distinguish "PM.run failed" from "PM/pass cleanup failed" on-board.
+  // Debug branch only: keep the legacy PM off the stack while still allowing
+  // us to probe its cleanup path with a small, focused log below.
   llvm::legacy::PassManager *MPM = new llvm::legacy::PassManager();
-  EASYJIT_RT_LOG("Optimize: created leaked legacy PassManager MPM=%p\n",
-                 (void *)MPM);
+  EASYJIT_MPM_DIAG("created legacy PassManager MPM=%p module=%p name=%s\n",
+                   (void *)MPM, (void *)&M, Name ? Name : "<null>");
   EASYJIT_RT_LOG("Optimize: skip TargetTransformInfo pass\n");
   // Do not install TargetTransformInfo here.  The target SDK used by the
   // embedded light-runtime path has an unstable libc++ std::function
@@ -1202,12 +1205,14 @@ static void Optimize(llvm::Module& M, const char* Name, const easy::Context& C, 
 
 #undef EASYJIT_ADD_OPT_PASS
 
-  EASYJIT_RT_LOG("Optimize: running pass manager for %s\n", Name ? Name : "<null>");
-  EASYJIT_RT_LOG("Optimize: before MPM->run MPM=%p module=%p\n",
-                 (void *)MPM, (void *)&M);
+  EASYJIT_MPM_DIAG("before run MPM=%p module=%p name=%s\n",
+                   (void *)MPM, (void *)&M, Name ? Name : "<null>");
   MPM->run(M);
-  EASYJIT_RT_LOG("Optimize: finished for %s\n", Name ? Name : "<null>");
-  EASYJIT_RT_LOG("Optimize: leaving MPM leaked MPM=%p\n", (void *)MPM);
+  EASYJIT_MPM_DIAG("after run MPM=%p module=%p name=%s\n",
+                   (void *)MPM, (void *)&M, Name ? Name : "<null>");
+  EASYJIT_MPM_DIAG("before delete MPM=%p\n", (void *)MPM);
+  delete MPM;
+  EASYJIT_MPM_DIAG("after delete MPM=%p\n", (void *)MPM);
 
   EASYJIT_RT_LOG("Optimize: skip EASYJIT_DUMP_IR block on debug/SRE path\n");
   // Debug branch only: do not call getenv/raw_fd_ostream/Module::print here.
