@@ -18,22 +18,13 @@
 
 #if EASYJIT_DEFINE_GLOBAL_NEW_DELETE
 
-#define EASYJIT_ALLOC_LOG(...) EASYJIT_SRE_LOG("[alloc] " __VA_ARGS__)
+#define EASYJIT_ALLOC_LOG(...) do { } while (0)
 
 static void easyjit_debug_probe_allocation(void *p, std::size_t size,
                                            const char *tag) {
-  EASYJIT_ALLOC_LOG("%s probe begin ptr=%p size=%zu\n", tag, p, size);
-  if (!p || size == 0) {
-    EASYJIT_ALLOC_LOG("%s probe skip ptr=%p size=%zu\n", tag, p, size);
-    return;
-  }
-  volatile unsigned char *bytes = static_cast<volatile unsigned char *>(p);
-  volatile unsigned char first = bytes[0];
-  volatile unsigned char last = bytes[size - 1];
-  bytes[0] = first;
-  bytes[size - 1] = last;
-  EASYJIT_ALLOC_LOG("%s probe ok ptr=%p size=%zu first=%02x last=%02x\n",
-                    tag, p, size, (unsigned)first, (unsigned)last);
+  (void)p;
+  (void)size;
+  (void)tag;
 }
 
 #if EASYJIT_USE_CUSTOM_NEW_DELETE
