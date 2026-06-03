@@ -57,13 +57,7 @@ Policy GetPolicyFromEnv() {
 static bool VerboseEnabled() {
   return false;
 }
-#define LIGHT_TRACE(...)                                                           \
-  do {                                                                             \
-    if (VerboseEnabled()) {                                                        \
-      std::fprintf(stderr, "[easyjit/light] " __VA_ARGS__);                        \
-      std::fflush(stderr);                                                         \
-    }                                                                              \
-  } while (0)
+#define LIGHT_TRACE(...) do { } while (0)
 
 const char *PolicyName(Policy p) {
   switch (p) {
@@ -316,73 +310,6 @@ static void MaybeDumpLightCode(const char *Name, const void *Code,
   (void)Name;
   (void)Code;
   (void)Bytes;
-  EASYJIT_RT_LOG("[light] MaybeDumpLightCode: skipped on debug/SRE path\n");
-  return;
-#if 0
-  const char *dir = std::getenv("EASYJIT_LIGHT_DUMP_CODE_DIR");
-  if (!dir || !*dir || !Code || Bytes == 0) return;
-
-  if (!EnsureDumpDir(dir)) {
-    std::fprintf(stderr,
-                 "[easyjit][light] warning: cannot create dump dir '%s'"
-                 " (errno=%d), skipping code dump for %s\n",
-                 dir, errno, Name ? Name : "<null>");
-    return;
-  }
-
-  // Atomic counter so multiple threads producing dumps don't clobber.
-  static std::atomic<unsigned> Counter{0};
-  unsigned idx = Counter.fetch_add(1, std::memory_order_relaxed) + 1;
-
-  const char *basePrefix = std::getenv("EASYJIT_LIGHT_DUMP_CODE_BASENAME");
-  char filename[512];
-  std::snprintf(filename, sizeof(filename), "%s/%s%04u_%s.bin",
-                dir,
-                (basePrefix && *basePrefix) ? basePrefix : "",
-                idx,
-                SanitizeForFilename(Name).c_str());
-
-  int fd = ::open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  if (fd < 0) {
-    std::fprintf(stderr,
-                 "[easyjit][light] warning: open('%s') failed errno=%d,"
-                 " skipping code dump for %s\n",
-                 filename, errno, Name ? Name : "<null>");
-    return;
-  }
-
-  const uint8_t *p = (const uint8_t *)Code;
-  size_t left = Bytes;
-  bool wrote_ok = true;
-  while (left > 0) {
-    ssize_t n = ::write(fd, p, left);
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      wrote_ok = false;
-      break;
-    }
-    if (n == 0) { wrote_ok = false; break; }
-    p += (size_t)n;
-    left -= (size_t)n;
-  }
-  ::close(fd);
-
-  if (!wrote_ok) {
-    std::fprintf(stderr,
-                 "[easyjit][light] warning: write('%s') failed (errno=%d,"
-                 " %zu/%zu bytes), dump may be truncated\n",
-                 filename, errno, Bytes - left, Bytes);
-    return;
-  }
-
-  if (const char *meta = std::getenv("EASYJIT_LIGHT_DUMP_META");
-      meta && *meta && std::strcmp(meta, "0") != 0) {
-    std::fprintf(stderr,
-                 "[easyjit][light] code name=%s bytes=%zu file=%s\n",
-                 Name ? Name : "<null>", Bytes, filename);
-    std::fflush(stderr);
-  }
-#endif
 }
 
 // Convert easy::GlobalMapping (Name, Address) <-> light::GlobalSymbol

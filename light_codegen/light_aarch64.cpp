@@ -75,11 +75,7 @@ extern "C" __attribute__((weak)) unsigned int SRE_MemDbgFree(unsigned int,
                                                              const char *,
                                                              unsigned int);
 
-#define LIGHT_SRE_LOG(...)                 \
-  do {                                     \
-    if (SRE_printf)                        \
-      SRE_printf("[easyjit][sre] [light_codegen] " __VA_ARGS__); \
-  } while (0)
+#define LIGHT_SRE_LOG(...) do { } while (0)
 
 namespace {
 
@@ -2843,10 +2839,6 @@ Result light::emit(const Function &Fn, uint8_t *buf, size_t cap,
 
         int rd = assignReg(&I);
         if (rd < 0) {
-          if (getenv("EASYJIT_LIGHT_DIAG")) {
-            fprintf(stderr, "[diag] OOM(binop) op0Reload=%d nextReg=%u useSavedGpr=%d regOf.size=%zu freeRegs=%zu inst='", (int)op0Reload, nextReg, (int)useSavedGprScratch, regOf.size(), freeRegs.size());
-            I.print(llvm::errs(), false); fprintf(stderr, "'\n");
-          }
           r.status=Status::Unsupported; r.reason="scratch OOM (binop)"; return r;
         }
 

@@ -52,15 +52,7 @@
 #include <cstdlib>
 
 #define EASYJIT_RT_LOG(...) EASYJIT_SRE_LOG("[runtime] " __VA_ARGS__)
-#define EASYJIT_RT_RAW(...)                                                    \
-  do {                                                                         \
-    if (SRE_printf) {                                                          \
-      SRE_printf(__VA_ARGS__);                                                 \
-    } else {                                                                   \
-      std::fprintf(stderr, __VA_ARGS__);                                       \
-      std::fflush(stderr);                                                     \
-    }                                                                          \
-  } while (0)
+#define EASYJIT_RT_RAW(...) do { } while (0)
 
 
 using namespace easy;
