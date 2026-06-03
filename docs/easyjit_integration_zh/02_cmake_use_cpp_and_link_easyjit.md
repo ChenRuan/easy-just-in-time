@@ -62,7 +62,7 @@ set_target_properties(their_app PROPERTIES
 # 只定义全局 operator new/delete，内部仍走 malloc/free
 -DEASYJIT_DEFINE_GLOBAL_NEW_DELETE=ON
 
-# 定义全局 operator new/delete，并改走平台 SRE_MemAlloc/SRE_MemFree
+# 定义全局 operator new/delete，并改走平台 SRE_MemDbgAlloc/SRE_MemDbgFree
 # 这个选项会自动打开 EASYJIT_DEFINE_GLOBAL_NEW_DELETE
 -DEASYJIT_USE_CUSTOM_NEW_DELETE=ON
 ```

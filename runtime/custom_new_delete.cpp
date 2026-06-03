@@ -37,10 +37,12 @@ static void easyjit_debug_probe_allocation(void *p, std::size_t size,
 }
 
 #if EASYJIT_USE_CUSTOM_NEW_DELETE
-extern "C" void *SRE_MemAlloc(unsigned int ulSidPid, unsigned char ucptNo,
-                              unsigned long ulSize) __attribute__((weak));
-extern "C" unsigned int SRE_MemFree(unsigned int ulSidPid,
-                                    void *pAddr) __attribute__((weak));
+extern "C" void *SRE_MemDbgAlloc(unsigned int ulSidPid, unsigned char ucptNo,
+                                 unsigned int ulSize, const char *func,
+                                 unsigned int line) __attribute__((weak));
+extern "C" unsigned int SRE_MemDbgFree(unsigned int ulSidPid, void *pAddr,
+                                       const char *func,
+                                       unsigned int line) __attribute__((weak));
 #endif
 
 static void *easyjit_allocate_or_null(std::size_t size) noexcept {
@@ -48,8 +50,9 @@ static void *easyjit_allocate_or_null(std::size_t size) noexcept {
     size = 1;
   }
 #if EASYJIT_USE_CUSTOM_NEW_DELETE
-  if (SRE_MemAlloc)
-    return SRE_MemAlloc(0U, 0U, static_cast<unsigned long>(size));
+  if (SRE_MemDbgAlloc)
+    return SRE_MemDbgAlloc(0U, 0U, static_cast<unsigned int>(size),
+                           __func__, __LINE__);
   return nullptr;
 #else
   return std::malloc(size);
@@ -60,10 +63,10 @@ static void *easyjit_allocate_or_null(std::size_t size) noexcept {
 static void easyjit_platform_free(void *p, const char *tag) noexcept {
   if (!p)
     return;
-  if (SRE_MemFree) {
-    EASYJIT_ALLOC_LOG("%s before SRE_MemFree ptr=%p\n", tag, p);
-    (void)SRE_MemFree(0, p);
-    EASYJIT_ALLOC_LOG("%s after SRE_MemFree ptr=%p\n", tag, p);
+  if (SRE_MemDbgFree) {
+    EASYJIT_ALLOC_LOG("%s before SRE_MemDbgFree ptr=%p\n", tag, p);
+    (void)SRE_MemDbgFree(0, p, tag, __LINE__);
+    EASYJIT_ALLOC_LOG("%s after SRE_MemDbgFree ptr=%p\n", tag, p);
   } else {
     EASYJIT_ALLOC_LOG("%s no platform free hook ptr=%p\n", tag, p);
   }
