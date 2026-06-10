@@ -65,6 +65,11 @@ extern "C" __attribute__((weak)) unsigned int SRE_MmuMap(unsigned int,
                                                          unsigned int,
                                                          unsigned int *,
                                                          unsigned int);
+extern "C" __attribute__((weak)) void *SRE_MemAlloc(unsigned int,
+                                                    unsigned char,
+                                                    unsigned long);
+extern "C" __attribute__((weak)) unsigned int enable_ex(unsigned int,
+                                                        unsigned long long);
 extern "C" __attribute__((weak)) void *SRE_MemDbgAlloc(unsigned int,
                                                        unsigned char,
                                                        unsigned int,
@@ -75,7 +80,11 @@ extern "C" __attribute__((weak)) unsigned int SRE_MemDbgFree(unsigned int,
                                                              const char *,
                                                              unsigned int);
 
-#define LIGHT_SRE_LOG(...) do { } while (0)
+#define LIGHT_SRE_LOG(...)                                                     \
+  do {                                                                         \
+    if (SRE_printf)                                                            \
+      SRE_printf("[easyjit][light] " __VA_ARGS__);                             \
+  } while (0)
 
 namespace {
 
@@ -3353,52 +3362,87 @@ void *light::compile(const Function &Fn, Result &out,
   LIGHT_SRE_LOG("compile: enter fn=%.*s globals=%p nglobals=%zu\n",
                 (int)Fn.getName().size(), Fn.getName().data(),
                 (const void *)globals, nglobals);
-  // Debug/SRE path: avoid sysconf(_SC_PAGESIZE).  The target runtime has
-  // already crashed in libc entry points reached through relocations.  The
-  // light backend always emits into a fixed 4-page buffer; use the same
-  // 16KiB size directly here.
-  const size_t codeSize = 4096u * 4u;
-  LIGHT_SRE_LOG("compile: before code allocation codeSize=%zu\n", codeSize);
-  void *page = nullptr;
-  if (false && SRE_MmuMap) {
-    unsigned int va = 0;
-    LIGHT_SRE_LOG("compile: before SRE_MmuMap phy=0 len=%zu cache=1\n",
-                  codeSize);
-    unsigned int rc = SRE_MmuMap(0U, (unsigned int)codeSize, &va, 1U);
-    LIGHT_SRE_LOG("compile: after SRE_MmuMap rc=%u va=0x%x\n", rc, va);
-    if (rc == 0U && va != 0U)
-      page = reinterpret_cast<void *>(static_cast<uintptr_t>(va));
-  }
-  if (!page && SRE_MemDbgAlloc) {
-    LIGHT_SRE_LOG("compile: before SRE_MemDbgAlloc codeSize=%zu\n", codeSize);
-    page = SRE_MemDbgAlloc(0U, 0U, (unsigned int)codeSize, __func__, __LINE__);
-    LIGHT_SRE_LOG("compile: after SRE_MemDbgAlloc page=%p\n", page);
-  }
-  if (!page) {
-    LIGHT_SRE_LOG("compile: no code allocation interface succeeded\n");
+  // SRE executable-memory path:
+  //   1. allocate a 6 MiB normal memory block;
+  //   2. carve out a 2 MiB-aligned window;
+  //   3. emit code into that aligned VA;
+  //   4. ask the platform to make the VA executable.
+  //
+  // The original POSIX path used mmap + mprotect.  The target SRE runtime does
+  // not provide that interface reliably, so keep the allocation deliberately
+  // simple and leak it just like the old PoC mmap page.
+  static constexpr unsigned long long Align2M = 2ull * 1024ull * 1024ull;
+  static constexpr unsigned int ExecAllocSize = 6u * 1024u * 1024u;
+  static constexpr unsigned char PtNO = 0u;
+
+  LIGHT_SRE_LOG("compile: before SRE_MemAlloc request=%u align=%llu ptno=%u\n",
+                ExecAllocSize, Align2M, (unsigned)PtNO);
+  void *base = nullptr;
+  if (SRE_MemAlloc)
+    base = SRE_MemAlloc(0U, PtNO, (unsigned long)ExecAllocSize);
+  LIGHT_SRE_LOG("compile: after SRE_MemAlloc base=%p\n", base);
+
+  if (!base) {
+    LIGHT_SRE_LOG("compile: SRE_MemAlloc unavailable or failed\n");
     out.status = Status::TooLarge;
-    out.reason = "code allocation unavailable";
+    out.reason = "SRE_MemAlloc";
     return nullptr;
   }
-  if (!page) { out.status = Status::TooLarge; out.reason = "code alloc"; return nullptr; }
-  LIGHT_SRE_LOG("compile: before emit page=%p codeSize=%zu\n", page, codeSize);
+
+  const unsigned long long baseAddr =
+      static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(base));
+  const unsigned long long alignedAddr =
+      (baseAddr + Align2M - 1ull) & ~(Align2M - 1ull);
+  const unsigned long long skip = alignedAddr - baseAddr;
+  const unsigned long long usable =
+      (skip < ExecAllocSize) ? (ExecAllocSize - skip) : 0ull;
+  void *page = reinterpret_cast<void *>(static_cast<uintptr_t>(alignedAddr));
+
+  LIGHT_SRE_LOG("compile: aligned base=%p page=%p skip=%llu usable=%llu\n",
+                base, page, skip, usable);
+
+  if (usable < Align2M) {
+    LIGHT_SRE_LOG("compile: insufficient usable aligned window usable=%llu\n",
+                  usable);
+    out.status = Status::TooLarge;
+    out.reason = "2M align usable";
+    return nullptr;
+  }
+
+  const size_t codeSize = static_cast<size_t>(Align2M);
+  LIGHT_SRE_LOG("compile: before emit page=%p codeCap=%zu\n", page, codeSize);
   out = emit(Fn, (uint8_t *)page, codeSize, globals, nglobals);
-  LIGHT_SRE_LOG("compile: after emit status=%d bytes=%zu reason=%s\n",
-                (int)out.status, out.codeBytes, out.reason.c_str());
+  LIGHT_SRE_LOG("compile: after emit status=%d bytes=%zu\n",
+                (int)out.status, out.codeBytes);
   if (out.status != Status::Ok) {
-    LIGHT_SRE_LOG("compile: before free reject page=%p codeSize=%zu\n", page, codeSize);
-    if (SRE_MemDbgFree)
-      (void)SRE_MemDbgFree(0U, page, __func__, __LINE__);
-    LIGHT_SRE_LOG("compile: after free reject\n");
+    LIGHT_SRE_LOG("compile: emit failed, leaving allocation leaked base=%p page=%p\n",
+                  base, page);
     return nullptr;
   }
-  LIGHT_SRE_LOG("compile: skip clear_cache for malloc-only debug bytes=%zu\n",
-                out.codeBytes);
-  LIGHT_SRE_LOG("compile: after skipped clear_cache skip mprotect page=%p codeSize=%zu\n",
-                page, codeSize);
-  // Debug/SRE path: avoid mprotect for the same reason we avoid mmap.  Whether
-  // the returned memory is executable depends on the platform allocator; the
-  // next board run will tell us if an executable-code allocation hook is needed.
-  LIGHT_SRE_LOG("compile: return page=%p bytes=%zu\n", page, out.codeBytes);
+
+  LIGHT_SRE_LOG("compile: before clear_cache page=%p bytes=%zu\n",
+                page, out.codeBytes);
+  __builtin___clear_cache((char *)page, (char *)page + out.codeBytes);
+  LIGHT_SRE_LOG("compile: after clear_cache page=%p bytes=%zu\n",
+                page, out.codeBytes);
+
+  if (!enable_ex) {
+    LIGHT_SRE_LOG("compile: enable_ex symbol unavailable\n");
+    out.status = Status::TooLarge;
+    out.reason = "enable_ex unavailable";
+    return nullptr;
+  }
+
+  LIGHT_SRE_LOG("compile: before enable_ex level=1 va=%p\n", page);
+  unsigned int rc = enable_ex(1U, alignedAddr);
+  LIGHT_SRE_LOG("compile: after enable_ex rc=%u va=%p\n", rc, page);
+  if (rc != 0U) {
+    out.status = Status::TooLarge;
+    out.reason = "enable_ex";
+    return nullptr;
+  }
+
+  LIGHT_SRE_LOG("compile: return executable page=%p bytes=%zu\n",
+                page, out.codeBytes);
   return page;
 }
