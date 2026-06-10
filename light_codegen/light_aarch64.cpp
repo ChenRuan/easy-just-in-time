@@ -3370,7 +3370,7 @@ void *light::compile(const Function &Fn, Result &out,
   // simple and leak it just like the old PoC mmap page.
   static constexpr unsigned long long Align2M = 2ull * 1024ull * 1024ull;
   static constexpr unsigned int ExecAllocSize = 6u * 1024u * 1024u;
-  static constexpr unsigned char PtNO = 0u;
+  static constexpr unsigned char PtNO = 8u;
 
   LIGHT_SRE_LOG("compile: before SRE_MemDbgAlloc request=%u align=%llu ptno=%u\n",
                 ExecAllocSize, Align2M, (unsigned)PtNO);
