@@ -65,9 +65,6 @@ extern "C" __attribute__((weak)) unsigned int SRE_MmuMap(unsigned int,
                                                          unsigned int,
                                                          unsigned int *,
                                                          unsigned int);
-extern "C" __attribute__((weak)) void *
-easyjit_sre_mem_alloc(unsigned int, unsigned char, unsigned long)
-    asm("SRE_MemAlloc");
 extern "C" __attribute__((weak)) unsigned int
 easyjit_sre_enable_ex(unsigned int, unsigned long long) asm("enable_ex");
 extern "C" __attribute__((weak)) void *SRE_MemDbgAlloc(unsigned int,
@@ -3375,17 +3372,17 @@ void *light::compile(const Function &Fn, Result &out,
   static constexpr unsigned int ExecAllocSize = 6u * 1024u * 1024u;
   static constexpr unsigned char PtNO = 0u;
 
-  LIGHT_SRE_LOG("compile: before SRE_MemAlloc request=%u align=%llu ptno=%u\n",
+  LIGHT_SRE_LOG("compile: before SRE_MemDbgAlloc request=%u align=%llu ptno=%u\n",
                 ExecAllocSize, Align2M, (unsigned)PtNO);
   void *base = nullptr;
-  if (easyjit_sre_mem_alloc)
-    base = easyjit_sre_mem_alloc(0U, PtNO, (unsigned long)ExecAllocSize);
-  LIGHT_SRE_LOG("compile: after SRE_MemAlloc base=%p\n", base);
+  if (SRE_MemDbgAlloc)
+    base = SRE_MemDbgAlloc(0U, PtNO, ExecAllocSize, __func__, __LINE__);
+  LIGHT_SRE_LOG("compile: after SRE_MemDbgAlloc base=%p\n", base);
 
   if (!base) {
-    LIGHT_SRE_LOG("compile: SRE_MemAlloc unavailable or failed\n");
+    LIGHT_SRE_LOG("compile: SRE_MemDbgAlloc unavailable or failed\n");
     out.status = Status::TooLarge;
-    out.reason = "SRE_MemAlloc";
+    out.reason = "SRE_MemDbgAlloc";
     return nullptr;
   }
 
