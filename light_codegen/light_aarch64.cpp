@@ -3417,10 +3417,7 @@ void *light::compile(const Function &Fn, Result &out,
     return nullptr;
   }
 
-  LIGHT_SRE_LOG("compile: before clear_cache page=%p bytes=%zu\n",
-                page, out.codeBytes);
-  __builtin___clear_cache((char *)page, (char *)page + out.codeBytes);
-  LIGHT_SRE_LOG("compile: after clear_cache page=%p bytes=%zu\n",
+  LIGHT_SRE_LOG("compile: skip compiler clear_cache; enable_ex handles cache sync page=%p bytes=%zu\n",
                 page, out.codeBytes);
 
   if (!easyjit_sre_enable_ex) {
