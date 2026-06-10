@@ -65,11 +65,11 @@ extern "C" __attribute__((weak)) unsigned int SRE_MmuMap(unsigned int,
                                                          unsigned int,
                                                          unsigned int *,
                                                          unsigned int);
-extern "C" __attribute__((weak)) void *SRE_MemAlloc(unsigned int,
-                                                    unsigned char,
-                                                    unsigned long);
-extern "C" __attribute__((weak)) unsigned int enable_ex(unsigned int,
-                                                        unsigned long long);
+extern "C" __attribute__((weak)) void *
+easyjit_sre_mem_alloc(unsigned int, unsigned char, unsigned long)
+    asm("SRE_MemAlloc");
+extern "C" __attribute__((weak)) unsigned int
+easyjit_sre_enable_ex(unsigned int, unsigned long long) asm("enable_ex");
 extern "C" __attribute__((weak)) void *SRE_MemDbgAlloc(unsigned int,
                                                        unsigned char,
                                                        unsigned int,
@@ -3378,8 +3378,8 @@ void *light::compile(const Function &Fn, Result &out,
   LIGHT_SRE_LOG("compile: before SRE_MemAlloc request=%u align=%llu ptno=%u\n",
                 ExecAllocSize, Align2M, (unsigned)PtNO);
   void *base = nullptr;
-  if (SRE_MemAlloc)
-    base = SRE_MemAlloc(0U, PtNO, (unsigned long)ExecAllocSize);
+  if (easyjit_sre_mem_alloc)
+    base = easyjit_sre_mem_alloc(0U, PtNO, (unsigned long)ExecAllocSize);
   LIGHT_SRE_LOG("compile: after SRE_MemAlloc base=%p\n", base);
 
   if (!base) {
@@ -3426,7 +3426,7 @@ void *light::compile(const Function &Fn, Result &out,
   LIGHT_SRE_LOG("compile: after clear_cache page=%p bytes=%zu\n",
                 page, out.codeBytes);
 
-  if (!enable_ex) {
+  if (!easyjit_sre_enable_ex) {
     LIGHT_SRE_LOG("compile: enable_ex symbol unavailable\n");
     out.status = Status::TooLarge;
     out.reason = "enable_ex unavailable";
@@ -3434,7 +3434,7 @@ void *light::compile(const Function &Fn, Result &out,
   }
 
   LIGHT_SRE_LOG("compile: before enable_ex level=1 va=%p\n", page);
-  unsigned int rc = enable_ex(1U, alignedAddr);
+  unsigned int rc = easyjit_sre_enable_ex(1U, alignedAddr);
   LIGHT_SRE_LOG("compile: after enable_ex rc=%u va=%p\n", rc, page);
   if (rc != 0U) {
     out.status = Status::TooLarge;
